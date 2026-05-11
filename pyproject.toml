@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shopsystem-messaging"
+version = "0.1.0"
+description = "Messaging bounded context of the shopsystem product: Pydantic schemas for the eight inter-shop message types and the `shop-msg` CLI for reading/writing them."
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "David Stenglein"}]
+dependencies = [
+    "pydantic>=2",
+    "pyyaml",
+    "scenarios @ git+https://github.com/dstengle/shopsystem-scenarios@v0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-bdd>=7",
+]
+
+[project.urls]
+Homepage = "https://github.com/dstengle/shopsystem-product"
+Repository = "https://github.com/dstengle/shopsystem-messaging"
+
+[project.scripts]
+shop-msg = "shop_msg.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
