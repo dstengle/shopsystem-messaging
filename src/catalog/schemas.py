@@ -1,7 +1,26 @@
-import hashlib
 import re
 from typing import Annotated, Literal, Union
 from pydantic import BaseModel, Field, model_validator
+
+# Delegate the canonical scenario-hash to the scenarios package. The
+# rule's true home is `scenarios.hash.compute_scenario_hash`; we re-
+# export it under the local name `_canonical_scenario_hash` because
+# (a) ScenarioPayload's validator below still calls it under that
+# name and (b) the cross-package agreement test in
+# tests/integration/test_catalog_scenarios_agreement.py imports it
+# from `catalog.schemas` and asserts it matches the `scenarios hash`
+# CLI output. Keeping the export name stable lets that test continue
+# to pin the catalog-side contract — what changes is that the
+# implementation is now imported rather than duplicated.
+#
+# History: while messaging and scenarios shared a monorepo, this
+# function was an inline duplicate of the canonicalization rule (five
+# lines of normalization plus a sha256 truncation), to avoid catalog
+# importing from scenarios in the same prototype directory. Per
+# ADR-001, the BC-of-the-shopsystem layout puts the canonicalization
+# rule in the scenarios package and lets messaging depend on it
+# cleanly, so the duplicate is gone.
+from scenarios.hash import compute_scenario_hash as _canonical_scenario_hash
 
 
 # Matches an "@bc:<name>" token where <name> is one or more non-space
@@ -39,46 +58,6 @@ def _gherkin_has_bc_tag_line(gherkin: str) -> bool:
             if _BC_TAG_TOKEN_RE.match(token):
                 return True
     return False
-
-
-# Canonical scenario-hash rule, duplicated from the `scenarios` package
-# on purpose (see `scenarios.hash.compute_scenario_hash`).
-#
-# The catalog enforces ScenarioPayload.hash == canonical_hash(gherkin)
-# at schema construction time. The canonicalization rule itself belongs
-# to the `scenarios` package — but the catalog must NOT import from
-# `scenarios` in normal production code (the `catalog` -> `scenarios`
-# direction would invert the dependency: scenarios already use catalog
-# message shapes when round-tripping). Of the resolution options listed
-# in lead-018, this is option (b): duplicate the (small, stable) rule
-# inside catalog.
-#
-# Duplication is mitigated by:
-# 1. The rule is five lines of normalization plus a sha256 truncation.
-# 2. `scenarios/tests/test_hash.py` pins the rule on the scenarios side
-#    against known bodies (S4: 3f123ba774758ff2, S6: b9ed9c63b8ccb208).
-# 3. The catalog-side test `test_scenario_payload.py::
-#    test_canonical_hash_matches_scenarios_package` pins the same hashes
-#    against `_canonical_scenario_hash` so any drift between the two
-#    implementations surfaces immediately in CI rather than as a silent
-#    schema-vs-CLI disagreement at runtime.
-def _canonical_scenario_hash(gherkin_text: str) -> str:
-    """Catalog-internal copy of the canonical scenario hash.
-
-    Must produce the same output as `scenarios.hash.compute_scenario_hash`
-    for every input. The cross-package agreement is asserted by
-    test_scenario_payload.py::test_canonical_hash_matches_scenarios_package
-    and by the round-trip BDD scenario in shop-msg-bc/features/.
-    """
-    canonical: list[str] = []
-    for line in gherkin_text.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("@scenario_hash:"):
-            continue
-        canonical.append(s)
-    return hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()[:16]
 
 
 class RequestMaintenance(BaseModel):
@@ -123,9 +102,13 @@ class ScenarioPayload(BaseModel):
         # means every construction site (CLI, hand-rolled tests, future
         # automation reading YAML) gets the same guarantee.
         #
-        # The canonicalization rule is duplicated in this package by
-        # design — see `_canonical_scenario_hash` above for why and for
-        # the cross-package agreement pin.
+        # The canonicalization rule is owned by the scenarios package;
+        # `_canonical_scenario_hash` above is a re-export of
+        # `scenarios.hash.compute_scenario_hash`. See the import-site
+        # docstring at the top of this module for why the local name
+        # is kept stable, and the agreement test under
+        # tests/integration/test_catalog_scenarios_agreement.py for
+        # the cross-package contract pin.
         expected = _canonical_scenario_hash(self.gherkin)
         if self.hash != expected:
             raise ValueError(
