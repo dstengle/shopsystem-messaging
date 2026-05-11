@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "shopsystem_messaging",
+  "project_id": "c6ae30ec-75cb-4941-be21-db863e6915b3"
+}
