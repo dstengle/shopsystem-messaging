@@ -9,13 +9,17 @@ Subcommands:
                       [--scenario-hash HASH ...] [--summary TEXT]
         Writes <bc-root>/outbox/<work_id>-work_done.yaml as a valid
         WorkDone message.
-    respond mechanism_observation --bc-root PATH --bd-ref ID --subject TEXT
+    respond mechanism_observation --bc-root PATH --work-id ID --subject TEXT
                                   --body TEXT [--observed-during ID]
                                   [--evidence TEXT ...] [--proposed-action TEXT]
-        Writes <bc-root>/outbox/<bd_ref>-mechanism_observation.yaml as
-        a valid MechanismObservation message. The BC must have already
-        created a beads issue with id <bd_ref> capturing the same
-        subject; this message is the wire carrier referencing it.
+                                  [--provenance-ref REF]
+        Writes <bc-root>/outbox/<work_id>-mechanism_observation.yaml as
+        a valid MechanismObservation message. The optional
+        --provenance-ref names a BC-side record (issue, document,
+        commit) where long-form analysis lives; the wire schema does
+        not constrain that reference to any particular tracker so the
+        catalog stays decoupled from the BC's work-registry choice
+        (lead-231 item C).
     send request_maintenance --bc-root PATH --work-id ID --description TEXT
                              [--acceptance-criterion TEXT ...]
                              [--file-hint TEXT ...]
@@ -42,6 +46,27 @@ Subcommands:
         against the BCResponse union, and dumps the canonical YAML to
         stdout. Exits non-zero (with a stderr message) when no outbox
         file matches the work_id or validation fails.
+    read inbox --bc-root PATH --work-id ID
+        Reads <bc-root>/inbox/<work_id>.yaml, validates it against the
+        LeadMessage union, and dumps the canonical YAML to stdout.
+        Exits non-zero (with a stderr message) when no inbox file
+        matches the work_id or validation fails.
+    pending inbox --bc-root PATH
+        Enumerates inbox messages that have no matching outbox response
+        (a message is "pending" iff no <work_id>-*.yaml exists in the
+        outbox for its work_id). Stdout is one line per pending message
+        of the form "<work_id> <message_type>". Exit zero in both the
+        empty and non-empty cases; this command is a query, not a gate.
+        Lets routers and dispatch wrappers decide when to invoke the
+        implementer/reviewer without inspecting the mailboxes directly.
+    pending outbox --lead-root PATH [--bc NAME]
+        Lead-side counterpart: walks sibling BC clones under
+        <lead-root>/repos/ (one directory per BC) and enumerates outbox
+        responses across them. With --bc NAME, scopes to a single BC
+        directory; without it, every sibling under repos/ is included.
+        A response is "pending" iff an outbox file exists for it (the
+        lead has not yet drained / acted on it). Stdout is one line per
+        pending response of the form "<work_id> <message_type> <bc>".
 """
 from __future__ import annotations
 
@@ -58,6 +83,7 @@ from catalog.schemas import (
     AssignScenarios,
     BCResponse,
     Clarify,
+    LeadMessage,
     MechanismObservation,
     RequestBugfix,
     RequestMaintenance,
@@ -66,6 +92,7 @@ from catalog.schemas import (
 )
 
 _response_adapter = TypeAdapter(BCResponse)
+_lead_adapter = TypeAdapter(LeadMessage)
 
 
 def _compute_scenario_hash(gherkin_body: str) -> str:
@@ -148,10 +175,26 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
     outbox = bc_root / "outbox"
     outbox.mkdir(parents=True, exist_ok=True)
 
-    out_path = outbox / f"{args.bd_ref}-mechanism_observation.yaml"
+    # Path-safety: refuse work_ids that would escape the outbox dir.
+    # The catalog schemas do not pin a pattern on WorkDone.work_id
+    # (only Clarify.work_id is pattern-constrained) so historically the
+    # CLI relied on the bd_ref pattern to keep this command's filename
+    # safe. After lead-231 decoupling, bd_ref is gone; the equivalent
+    # input-safety check has to live here. Use the same alphanumeric-
+    # plus-safe-punctuation shape Clarify.work_id and provenance_ref
+    # accept.
+    if "/" in args.work_id or ".." in args.work_id or not args.work_id:
+        print(
+            f"shop-msg respond mechanism_observation: refusing unsafe "
+            f"work_id {args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    out_path = outbox / f"{args.work_id}-mechanism_observation.yaml"
     if out_path.exists():
         # Refuse to overwrite. Same reasoning as the other respond
-        # collision checks: the bd_ref identifies one observation
+        # collision checks: the work_id identifies one response
         # uniquely, and silently clobbering destroys the prior record.
         print(
             f"shop-msg respond mechanism_observation: refusing to overwrite "
@@ -162,12 +205,12 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
 
     message = MechanismObservation(
         message_type="mechanism_observation",
-        bd_ref=args.bd_ref,
         subject=args.subject,
         observed_during=args.observed_during,
         body=args.body,
         evidence=list(args.evidence) if args.evidence else None,
         proposed_action=args.proposed_action,
+        provenance_ref=args.provenance_ref,
     )
 
     # exclude_none=True: MechanismObservation has optional fields
@@ -365,6 +408,133 @@ def _cmd_read_outbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_read_inbox(args: argparse.Namespace) -> int:
+    bc_root = Path(args.bc_root)
+    inbox = bc_root / "inbox"
+    path = inbox / f"{args.work_id}.yaml"
+    if not path.exists():
+        # Same pattern as `read outbox`: a missing file is the
+        # caller's mistake, not a schema problem; surface a phrase the
+        # step definitions can substring-check ("no inbox message").
+        print(
+            f"shop-msg read inbox: no inbox message found for "
+            f"work_id={args.work_id!r} in {inbox}",
+            file=sys.stderr,
+        )
+        return 1
+    raw = yaml.safe_load(path.read_text())
+    try:
+        message = _lead_adapter.validate_python(raw)
+    except ValidationError as e:
+        # The "validation failed" phrase is load-bearing — the step
+        # definition for the schema-validation scenario substring-checks
+        # it. Keep the wording aligned with `read outbox`'s sibling
+        # branch so a future consolidation doesn't drift one without
+        # the other.
+        print(
+            f"shop-msg read inbox: validation failed for {path.name}:\n{e}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"valid {message.message_type} from {path.name}:")
+    print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
+    return 0
+
+
+def _peek_message_type(path: Path) -> str:
+    """Best-effort `message_type` extraction from a mailbox YAML file.
+
+    Used by the pending-listing subcommands to label each entry without
+    requiring full schema validation — a malformed file should still
+    show up in the listing as pending (the caller will then read it,
+    surface the schema error, and decide what to do). Falls back to
+    "unknown" if the file does not parse as a mapping or omits the
+    discriminator.
+    """
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except yaml.YAMLError:
+        return "unknown"
+    if not isinstance(raw, dict):
+        return "unknown"
+    mt = raw.get("message_type")
+    return mt if isinstance(mt, str) else "unknown"
+
+
+def _cmd_pending_inbox(args: argparse.Namespace) -> int:
+    """Enumerate inbox messages that have no matching outbox response.
+
+    "Pending" iff no <work_id>-*.yaml exists in the outbox for the
+    inbox file's work_id. This is the BC router's discriminator for
+    "is there work to dispatch the implementer onto?". Missing
+    inbox / outbox directories are treated as empty so a freshly-
+    bootstrapped BC produces the empty-result case cleanly rather
+    than an FS error.
+    """
+    bc_root = Path(args.bc_root)
+    inbox = bc_root / "inbox"
+    outbox = bc_root / "outbox"
+    inbox_files = sorted(inbox.glob("*.yaml")) if inbox.exists() else []
+    for path in inbox_files:
+        work_id = path.stem
+        # An outbox file matching <work_id>-*.yaml means the BC has
+        # already responded (clarify, work_done, or other) — so this
+        # inbox is no longer pending. Globbing keeps the rule
+        # response-type-agnostic.
+        if outbox.exists() and any(outbox.glob(f"{work_id}-*.yaml")):
+            continue
+        mt = _peek_message_type(path)
+        print(f"{work_id} {mt}")
+    return 0
+
+
+def _cmd_pending_outbox(args: argparse.Namespace) -> int:
+    """Enumerate pending outbox responses across sibling BC clones.
+
+    Lead-side counterpart to `pending inbox`. Walks <lead-root>/repos/
+    looking for sibling BC directories (each with an outbox/ child) and
+    enumerates the outbox files. With --bc NAME, scopes to one sibling.
+    A response is "pending" iff its file exists — there is no lead-side
+    "consumed" marker yet, so existence is the only signal available.
+    Returns one line per response of the form
+    "<work_id> <message_type> <bc>".
+    """
+    lead_root = Path(args.lead_root)
+    repos_root = lead_root / "repos"
+    if not repos_root.exists():
+        # No sibling BCs visible; cleanly produce the empty case.
+        return 0
+    if args.bc is not None:
+        bc_dirs = [repos_root / args.bc]
+    else:
+        bc_dirs = sorted(p for p in repos_root.iterdir() if p.is_dir())
+    for bc_dir in bc_dirs:
+        outbox = bc_dir / "outbox"
+        if not outbox.exists():
+            continue
+        for path in sorted(outbox.glob("*.yaml")):
+            # Outbox filenames are "<work_id>-<response_type>.yaml" per
+            # the BC respond commands. Split on the last hyphen-before-
+            # ".yaml" to recover work_id; if the filename does not match
+            # that shape (e.g. an old hand-rolled file), fall back to
+            # the stem so the entry still surfaces.
+            stem = path.stem
+            # Response type is the trailing chunk; pre-known set keeps
+            # the parse robust against work_ids that themselves contain
+            # hyphens (e.g. "lead-301").
+            for response_type in ("clarify", "work_done", "mechanism_observation"):
+                suffix = f"-{response_type}"
+                if stem.endswith(suffix):
+                    work_id = stem[: -len(suffix)]
+                    mt = response_type
+                    break
+            else:
+                work_id = stem
+                mt = _peek_message_type(path)
+            print(f"{work_id} {mt} {bc_dir.name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shop-msg")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -406,12 +576,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mech_obs.add_argument("--bc-root", required=True, help="BC root directory")
     mech_obs.add_argument(
-        "--bd-ref", required=True,
-        help="BC-side beads issue id this observation references",
+        "--work-id", required=True,
+        help=(
+            "work_id naming this response in the BC's outbox. Mirrors the "
+            "respond clarify / respond work_done flag of the same name; "
+            "drives the outbox filename <work_id>-mechanism_observation.yaml."
+        ),
     )
     mech_obs.add_argument(
         "--subject", required=True,
-        help="one-line summary; must equal the BC bead's title",
+        help="one-line summary of the mechanism observation",
     )
     mech_obs.add_argument(
         "--body", required=True,
@@ -428,6 +602,15 @@ def build_parser() -> argparse.ArgumentParser:
     mech_obs.add_argument(
         "--proposed-action", default=None,
         help="BC's hypothesis for what to change (optional)",
+    )
+    mech_obs.add_argument(
+        "--provenance-ref", default=None,
+        help=(
+            "optional, tracker-neutral pointer to a BC-side record where "
+            "long-form analysis lives (e.g. an issue id, a doc path). The "
+            "wire schema does not constrain this to any particular "
+            "tracker (lead-231 item C)."
+        ),
     )
     mech_obs.set_defaults(func=_cmd_respond_mechanism_observation)
 
@@ -531,6 +714,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-id", required=True, help="work_id whose response to read"
     )
     read_outbox.set_defaults(func=_cmd_read_outbox)
+
+    read_inbox = read_sub.add_parser(
+        "inbox", help="read and validate a lead message from a BC's inbox"
+    )
+    read_inbox.add_argument("--bc-root", required=True, help="BC root directory")
+    read_inbox.add_argument(
+        "--work-id", required=True, help="work_id whose inbox message to read"
+    )
+    read_inbox.set_defaults(func=_cmd_read_inbox)
+
+    pending = sub.add_parser(
+        "pending", help="enumerate pending mailbox entries (queries, not gates)"
+    )
+    pending_sub = pending.add_subparsers(dest="pending_target", required=True)
+
+    pending_inbox = pending_sub.add_parser(
+        "inbox",
+        help="list inbox messages with no matching outbox response (BC side)",
+    )
+    pending_inbox.add_argument("--bc-root", required=True, help="BC root directory")
+    pending_inbox.set_defaults(func=_cmd_pending_inbox)
+
+    pending_outbox = pending_sub.add_parser(
+        "outbox",
+        help="list pending outbox responses across sibling BC clones (lead side)",
+    )
+    pending_outbox.add_argument(
+        "--lead-root",
+        required=True,
+        help="lead-shop root containing a repos/ directory of sibling BC clones",
+    )
+    pending_outbox.add_argument(
+        "--bc",
+        default=None,
+        help="restrict to a single BC name (must match the directory under repos/)",
+    )
+    pending_outbox.set_defaults(func=_cmd_pending_outbox)
 
     return parser
 

@@ -1,9 +1,9 @@
 Feature: shop-msg respond — refuse on outbox collision for mechanism_observation
 
-  @scenario_hash:67668aaac41d49f0 @bc:shop-msg
-  Scenario: Refuse to overwrite an existing mechanism_observation for the same bd_ref
+  @scenario_hash:dc7c120c5a133bb4 @bc:shop-msg
+  Scenario: Refuse to overwrite an existing mechanism_observation for the same work_id
     Given an empty BC at a temporary path
-    And the BC's outbox already contains a file named "ddd-product-system-abc-mechanism_observation.yaml"
-    When I run shop-msg respond mechanism_observation with bd-ref "ddd-product-system-abc" and subject "second subject" and body "second body"
+    And the BC's outbox already contains a file named "lead-022-mechanism_observation.yaml"
+    When I run shop-msg respond mechanism_observation with work-id "lead-022" and subject "second subject" and body "Body content of at least fifty characters to satisfy the schema's minimum length constraint."
     Then the command exits non-zero
-    And the BC's outbox file "ddd-product-system-abc-mechanism_observation.yaml" is unchanged
+    And the BC's outbox file "lead-022-mechanism_observation.yaml" is unchanged

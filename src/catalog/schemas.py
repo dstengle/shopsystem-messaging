@@ -164,23 +164,32 @@ class MechanismObservation(BaseModel):
     - Implementation block -> `work_done(blocked)`
     - Mechanism-of-the-system -> `mechanism_observation`
 
-    Three-artifact pattern: this message references a BC-side bead via
-    `bd_ref`; the lead's drain creates a corresponding lead-side bead
-    that references back. Long-form analysis lives in the bead's notes
-    or design field, not in this message.
+    Three-artifact pattern: when the BC keeps long-form analysis in its
+    own work-tracker, it can reference that record via the optional
+    `provenance_ref` field; the lead's drain may then create a
+    corresponding lead-side record that references back. The wire
+    message itself does not name any particular tracker — beads,
+    GitHub Issues, or any other — so the catalog stays decoupled from
+    the lead-side and BC-side choices of work registry (per brief 001
+    item C / lead-231). Long-form analysis lives in the referenced
+    record, not in this message.
     """
     message_type: Literal["mechanism_observation"]
-    # bd_ref is constrained to a beads issue-id shape: lowercase
-    # alphanumerics and hyphens, with at least one hyphen separating
-    # prefix (e.g. "ddd-product-system") from suffix (e.g. "abc").
-    # Same path-safety reasoning as Clarify.work_id (lead-008): a CLI
-    # flag is not the gate; the schema is.
-    bd_ref: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9-]*-[a-z0-9]+$")
     subject: str = Field(min_length=5, max_length=120)
     observed_during: str | None = None
     body: str = Field(min_length=50)
     evidence: list[Annotated[str, Field(min_length=1)]] | None = Field(default=None, min_length=1)
     proposed_action: str | None = None
+    # provenance_ref is an optional, tracker-neutral pointer to a BC-side
+    # record where long-form analysis lives. The catalog deliberately does
+    # not constrain its shape to a beads issue-id pattern (lead-231 item
+    # C: schemas must not assume beads participation). The constraint is
+    # only path-safety — no slashes, no path separators — preserving the
+    # same hardening Clarify.work_id (lead-008) and the prior bd_ref
+    # field had, but without the beads-specific shape.
+    provenance_ref: str | None = Field(
+        default=None, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    )
 
 
 LeadMessage = Union[RequestMaintenance, AssignScenarios, RequestBugfix]
