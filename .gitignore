@@ -10,3 +10,7 @@ dist/
 .dolt/
 *.db
 .beads-credential-key
+
+# Inter-shop message runtime artifacts (per-message YAML; not source).
+/inbox/
+/outbox/
