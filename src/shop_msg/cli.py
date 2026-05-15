@@ -2,71 +2,61 @@
 
 Subcommands:
     respond clarify --bc-root PATH --work-id ID --question TEXT
-        Writes <bc-root>/outbox/<work_id>-clarify.yaml as a valid
-        Clarify message (schema from the prototype's shared schemas
-        module).
+        Writes a Clarify message to the Postgres messages table as an
+        outbox row. Raises on collision (duplicate bc/work_id/direction).
     respond work_done --bc-root PATH --work-id ID --status STATUS
                       [--scenario-hash HASH ...] [--summary TEXT]
-        Writes <bc-root>/outbox/<work_id>-work_done.yaml as a valid
-        WorkDone message.
+        Writes a WorkDone message to the Postgres messages table.
     respond mechanism_observation --bc-root PATH --work-id ID --subject TEXT
                                   --body TEXT [--observed-during ID]
                                   [--evidence TEXT ...] [--proposed-action TEXT]
                                   [--provenance-ref REF]
-        Writes <bc-root>/outbox/<work_id>-mechanism_observation.yaml as
-        a valid MechanismObservation message. The optional
-        --provenance-ref names a BC-side record (issue, document,
-        commit) where long-form analysis lives; the wire schema does
-        not constrain that reference to any particular tracker so the
+        Writes a MechanismObservation message to the Postgres messages table.
+        The optional --provenance-ref names a BC-side record (issue, document,
+        commit) where long-form analysis lives; the wire schema does not
+        constrain that reference to any particular tracker so the
         catalog stays decoupled from the BC's work-registry choice
         (lead-231 item C).
     send request_maintenance --bc-root PATH --work-id ID --description TEXT
                              [--acceptance-criterion TEXT ...]
                              [--file-hint TEXT ...]
-        Writes <bc-root>/inbox/<work_id>.yaml as a valid
-        RequestMaintenance message.
+        Writes a RequestMaintenance message to the Postgres messages table
+        as an inbox row.
     send assign_scenarios --bc-root PATH --work-id ID --feature-title TEXT
                           --bc-tag NAME --scenario-file PATH ...
-        Writes <bc-root>/inbox/<work_id>.yaml as a valid
-        AssignScenarios message. Each --scenario-file becomes one
-        ScenarioPayload. The hash for each scenario is computed by
-        shelling out to the `scenarios hash` CLI (the canonicalization
-        rule lives in the scenarios package, not here).
+        Writes an AssignScenarios message to the Postgres messages table.
+        Each --scenario-file becomes one ScenarioPayload. The hash for
+        each scenario is computed by shelling out to the `scenarios hash`
+        CLI (the canonicalization rule lives in the scenarios package,
+        not here).
     send request_bugfix --bc-root PATH --work-id ID --description TEXT
                         [--feature-title TEXT --bc-tag NAME
                          --scenario-file PATH ...]
-        Writes <bc-root>/inbox/<work_id>.yaml as a valid
-        RequestBugfix message. Scenarios are optional: with none the
-        message carries description-only fix instructions. If any
-        --scenario-file is supplied, --feature-title and --bc-tag
-        become required (they wrap each scenario body the same way
-        assign_scenarios does).
+        Writes a RequestBugfix message to the Postgres messages table.
+        Scenarios are optional.
     read outbox --bc-root PATH --work-id ID
-        Reads the latest <bc-root>/outbox/<work_id>-*.yaml, validates it
-        against the BCResponse union, and dumps the canonical YAML to
+        Reads the latest outbox row for a work_id from Postgres, validates
+        it against the BCResponse union, and dumps the canonical YAML to
         stdout. Exits non-zero (with a stderr message) when no outbox
-        file matches the work_id or validation fails.
+        row matches the work_id or validation fails.
     read inbox --bc-root PATH --work-id ID
-        Reads <bc-root>/inbox/<work_id>.yaml, validates it against the
-        LeadMessage union, and dumps the canonical YAML to stdout.
-        Exits non-zero (with a stderr message) when no inbox file
-        matches the work_id or validation fails.
+        Reads the inbox row for a work_id from Postgres, validates it
+        against the LeadMessage union, and dumps the canonical YAML to
+        stdout. Exits non-zero (with a stderr message) when no inbox
+        row matches the work_id or validation fails.
     pending inbox --bc-root PATH
         Enumerates inbox messages that have no matching outbox response
-        (a message is "pending" iff no <work_id>-*.yaml exists in the
-        outbox for its work_id). Stdout is one line per pending message
-        of the form "<work_id> <message_type>". Exit zero in both the
-        empty and non-empty cases; this command is a query, not a gate.
-        Lets routers and dispatch wrappers decide when to invoke the
-        implementer/reviewer without inspecting the mailboxes directly.
+        via a Postgres query. Stdout is one line per pending message of
+        the form "<work_id> <message_type>". Exit zero in both the
+        empty and non-empty cases.
     pending outbox --lead-root PATH [--bc NAME]
-        Lead-side counterpart: walks sibling BC clones under
-        <lead-root>/repos/ (one directory per BC) and enumerates outbox
-        responses across them. With --bc NAME, scopes to a single BC
-        directory; without it, every sibling under repos/ is included.
-        A response is "pending" iff an outbox file exists for it (the
-        lead has not yet drained / acted on it). Stdout is one line per
-        pending response of the form "<work_id> <message_type> <bc>".
+        Lead-side counterpart: queries Postgres for outbox rows across
+        sibling BC clones. With --bc NAME, scopes to a single BC; without
+        it, every BC under repos/ is included.
+    dump [--bc-root PATH] [--direction inbox|outbox] [--limit N]
+        Operator debugging: dumps rows from the messages table to stdout
+        as YAML. With --bc-root, scopes to that BC. With --direction,
+        scopes to inbox or outbox. With --limit, caps the result count.
 """
 from __future__ import annotations
 
@@ -89,6 +79,18 @@ from catalog.schemas import (
     RequestMaintenance,
     ScenarioPayload,
     WorkDone,
+)
+from shop_msg.storage import (
+    CollisionError,
+    delete_bc_messages,
+    inbox_row_exists,
+    insert_message,
+    insert_raw_payload,
+    outbox_row_exists,
+    query_pending_inbox,
+    query_pending_outbox,
+    read_inbox_message,
+    read_outbox_messages,
 )
 
 _response_adapter = TypeAdapter(BCResponse)
@@ -113,18 +115,18 @@ def _compute_scenario_hash(gherkin_body: str) -> str:
 
 
 def _cmd_respond_clarify(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    outbox = bc_root / "outbox"
-    outbox.mkdir(parents=True, exist_ok=True)
+    bc_root = str(Path(args.bc_root).resolve())
 
-    out_path = outbox / f"{args.work_id}-clarify.yaml"
-    if out_path.exists():
-        # Refuse to overwrite an existing outbox file for this work_id.
-        # The §4.4 loop (BC clarify -> lead request_bugfix -> BC may
-        # clarify again on the same work_id) recurs at exactly this
-        # boundary; silent overwrite would destroy the prior clarify.
+    if not args.question:
         print(
-            f"shop-msg respond clarify: refusing to overwrite existing outbox file: {out_path}",
+            "shop-msg respond clarify: question must not be empty",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not args.work_id or "/" in args.work_id or ".." in args.work_id:
+        print(
+            "shop-msg respond clarify: refusing unsafe work_id",
             file=sys.stderr,
         )
         return 1
@@ -135,27 +137,26 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
         question=args.question,
     )
 
-    with out_path.open("w") as f:
-        yaml.safe_dump(message.model_dump(), f, sort_keys=False)
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "outbox",
+            "clarify",
+            message.model_dump(),
+        )
+    except CollisionError:
+        print(
+            f"shop-msg respond clarify: refusing to overwrite existing outbox "
+            f"entry for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
 def _cmd_respond_work_done(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    outbox = bc_root / "outbox"
-    outbox.mkdir(parents=True, exist_ok=True)
-
-    out_path = outbox / f"{args.work_id}-work_done.yaml"
-    if out_path.exists():
-        # Refuse to overwrite an existing work_done file for this work_id.
-        # Same reasoning as the clarify collision check: silently
-        # clobbering a prior reply destroys the lead's reconciliation
-        # record for that work_id.
-        print(
-            f"shop-msg respond work_done: refusing to overwrite existing outbox file: {out_path}",
-            file=sys.stderr,
-        )
-        return 1
+    bc_root = str(Path(args.bc_root).resolve())
 
     message = WorkDone(
         message_type="work_done",
@@ -165,40 +166,32 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
         scenario_hashes=list(args.scenario_hash or []),
     )
 
-    with out_path.open("w") as f:
-        yaml.safe_dump(message.model_dump(), f, sort_keys=False)
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "outbox",
+            "work_done",
+            message.model_dump(),
+        )
+    except CollisionError:
+        print(
+            f"shop-msg respond work_done: refusing to overwrite existing outbox "
+            f"entry for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
 def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    outbox = bc_root / "outbox"
-    outbox.mkdir(parents=True, exist_ok=True)
+    bc_root = str(Path(args.bc_root).resolve())
 
     # Path-safety: refuse work_ids that would escape the outbox dir.
-    # The catalog schemas do not pin a pattern on WorkDone.work_id
-    # (only Clarify.work_id is pattern-constrained) so historically the
-    # CLI relied on the bd_ref pattern to keep this command's filename
-    # safe. After lead-231 decoupling, bd_ref is gone; the equivalent
-    # input-safety check has to live here. Use the same alphanumeric-
-    # plus-safe-punctuation shape Clarify.work_id and provenance_ref
-    # accept.
     if "/" in args.work_id or ".." in args.work_id or not args.work_id:
         print(
             f"shop-msg respond mechanism_observation: refusing unsafe "
             f"work_id {args.work_id!r}",
-            file=sys.stderr,
-        )
-        return 1
-
-    out_path = outbox / f"{args.work_id}-mechanism_observation.yaml"
-    if out_path.exists():
-        # Refuse to overwrite. Same reasoning as the other respond
-        # collision checks: the work_id identifies one response
-        # uniquely, and silently clobbering destroys the prior record.
-        print(
-            f"shop-msg respond mechanism_observation: refusing to overwrite "
-            f"existing outbox file: {out_path}",
             file=sys.stderr,
         )
         return 1
@@ -213,32 +206,26 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
         provenance_ref=args.provenance_ref,
     )
 
-    # exclude_none=True: MechanismObservation has optional fields
-    # (observed_during, evidence, proposed_action); omitting them keeps
-    # the YAML compact and round-trip-safe. model_validate treats absent
-    # keys as None on the receiving side. The respond clarify and respond
-    # work_done handlers predate this convention.
-    with out_path.open("w") as f:
-        yaml.safe_dump(message.model_dump(exclude_none=True), f, sort_keys=False)
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "outbox",
+            "mechanism_observation",
+            message.model_dump(exclude_none=True),
+        )
+    except CollisionError:
+        print(
+            f"shop-msg respond mechanism_observation: refusing to overwrite "
+            f"existing outbox entry for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
 def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    inbox = bc_root / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-
-    out_path = inbox / f"{args.work_id}.yaml"
-    if out_path.exists():
-        # Refuse to overwrite an existing inbox file for this work_id.
-        # Same reasoning as the outbox collision checks: the lead sends one
-        # message per work_id, and silently clobbering a prior message
-        # destroys the BC's record of what was asked.
-        print(
-            f"shop-msg send request_maintenance: refusing to overwrite existing inbox file: {out_path}",
-            file=sys.stderr,
-        )
-        return 1
+    bc_root = str(Path(args.bc_root).resolve())
 
     acceptance_criteria = list(args.acceptance_criterion or []) or None
     file_hints = list(args.file_hint or []) or None
@@ -251,8 +238,22 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
         file_hints=file_hints,
     )
 
-    with out_path.open("w") as f:
-        yaml.safe_dump(message.model_dump(exclude_none=True), f, sort_keys=False)
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "inbox",
+            "request_maintenance",
+            message.model_dump(exclude_none=True),
+            notify=True,
+        )
+    except CollisionError:
+        print(
+            f"shop-msg send request_maintenance: refusing to overwrite existing "
+            f"inbox entry for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -304,20 +305,7 @@ def _build_scenario_payload(
 
 
 def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    inbox = bc_root / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-
-    out_path = inbox / f"{args.work_id}.yaml"
-    if out_path.exists():
-        # Refuse to overwrite an existing inbox file for this work_id.
-        # Same reasoning as the other send-collision checks: silent
-        # clobber would destroy the BC's record of what was asked.
-        print(
-            f"shop-msg send request_bugfix: refusing to overwrite existing inbox file: {out_path}",
-            file=sys.stderr,
-        )
-        return 1
+    bc_root = str(Path(args.bc_root).resolve())
 
     scenario_files = list(args.scenario_file or [])
     # --feature-title and --bc-tag are conditionally required: only when
@@ -343,27 +331,27 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
         scenarios=scenarios_payload,
     )
 
-    with out_path.open("w") as f:
-        yaml.safe_dump(message.model_dump(), f, sort_keys=False)
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "inbox",
+            "request_bugfix",
+            message.model_dump(),
+            notify=True,
+        )
+    except CollisionError:
+        print(
+            f"shop-msg send request_bugfix: refusing to overwrite existing "
+            f"inbox entry for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
 def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    inbox = bc_root / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-
-    out_path = inbox / f"{args.work_id}.yaml"
-    if out_path.exists():
-        # Refuse to overwrite an existing inbox file for this work_id.
-        # Same reasoning as the request_maintenance collision check: the
-        # lead sends one message per work_id; silent clobber would
-        # destroy the BC's record of what was asked.
-        print(
-            f"shop-msg send assign_scenarios: refusing to overwrite existing inbox file: {out_path}",
-            file=sys.stderr,
-        )
-        return 1
+    bc_root = str(Path(args.bc_root).resolve())
 
     scenario_files = list(args.scenario_file or [])
     scenarios_payload: list[ScenarioPayload] = [
@@ -377,52 +365,64 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         scenarios=scenarios_payload,
     )
 
-    with out_path.open("w") as f:
-        yaml.safe_dump(message.model_dump(), f, sort_keys=False)
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "inbox",
+            "assign_scenarios",
+            message.model_dump(),
+            notify=True,
+        )
+    except CollisionError:
+        print(
+            f"shop-msg send assign_scenarios: refusing to overwrite existing "
+            f"inbox entry for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
 def _cmd_read_outbox(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    outbox = bc_root / "outbox"
-    candidates = sorted(outbox.glob(f"{args.work_id}-*.yaml"))
-    if not candidates:
+    bc_root = str(Path(args.bc_root).resolve())
+    rows = read_outbox_messages(bc_root, args.work_id)
+    if not rows:
         print(
             f"shop-msg read outbox: no outbox response found for "
-            f"work_id={args.work_id!r} in {outbox}",
+            f"work_id={args.work_id!r} in bc={bc_root!r}",
             file=sys.stderr,
         )
         return 1
-    path = candidates[-1]
-    raw = yaml.safe_load(path.read_text())
+    # Use the most-recently-inserted row (last in created_at order).
+    raw = rows[-1]
     try:
         message = _response_adapter.validate_python(raw)
     except ValidationError as e:
         print(
-            f"shop-msg read outbox: validation failed for {path.name}:\n{e}",
+            f"shop-msg read outbox: validation failed for "
+            f"work_id={args.work_id!r}:\n{e}",
             file=sys.stderr,
         )
         return 1
-    print(f"valid {message.message_type} from {path.name}:")
+    print(f"valid {message.message_type} from {args.work_id}:")
     print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
     return 0
 
 
 def _cmd_read_inbox(args: argparse.Namespace) -> int:
-    bc_root = Path(args.bc_root)
-    inbox = bc_root / "inbox"
-    path = inbox / f"{args.work_id}.yaml"
-    if not path.exists():
-        # Same pattern as `read outbox`: a missing file is the
+    bc_root = str(Path(args.bc_root).resolve())
+    raw = read_inbox_message(bc_root, args.work_id)
+    if raw is None:
+        # Same pattern as `read outbox`: a missing row is the
         # caller's mistake, not a schema problem; surface a phrase the
         # step definitions can substring-check ("no inbox message").
         print(
             f"shop-msg read inbox: no inbox message found for "
-            f"work_id={args.work_id!r} in {inbox}",
+            f"work_id={args.work_id!r} in bc={bc_root!r}",
             file=sys.stderr,
         )
         return 1
-    raw = yaml.safe_load(path.read_text())
     try:
         message = _lead_adapter.validate_python(raw)
     except ValidationError as e:
@@ -432,106 +432,73 @@ def _cmd_read_inbox(args: argparse.Namespace) -> int:
         # branch so a future consolidation doesn't drift one without
         # the other.
         print(
-            f"shop-msg read inbox: validation failed for {path.name}:\n{e}",
+            f"shop-msg read inbox: validation failed for "
+            f"work_id={args.work_id!r}:\n{e}",
             file=sys.stderr,
         )
         return 1
-    print(f"valid {message.message_type} from {path.name}:")
+    print(f"valid {message.message_type} from {args.work_id}.yaml:")
     print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
     return 0
-
-
-def _peek_message_type(path: Path) -> str:
-    """Best-effort `message_type` extraction from a mailbox YAML file.
-
-    Used by the pending-listing subcommands to label each entry without
-    requiring full schema validation — a malformed file should still
-    show up in the listing as pending (the caller will then read it,
-    surface the schema error, and decide what to do). Falls back to
-    "unknown" if the file does not parse as a mapping or omits the
-    discriminator.
-    """
-    try:
-        raw = yaml.safe_load(path.read_text())
-    except yaml.YAMLError:
-        return "unknown"
-    if not isinstance(raw, dict):
-        return "unknown"
-    mt = raw.get("message_type")
-    return mt if isinstance(mt, str) else "unknown"
 
 
 def _cmd_pending_inbox(args: argparse.Namespace) -> int:
     """Enumerate inbox messages that have no matching outbox response.
 
-    "Pending" iff no <work_id>-*.yaml exists in the outbox for the
-    inbox file's work_id. This is the BC router's discriminator for
-    "is there work to dispatch the implementer onto?". Missing
-    inbox / outbox directories are treated as empty so a freshly-
-    bootstrapped BC produces the empty-result case cleanly rather
-    than an FS error.
+    Queries Postgres using the pending-query SQL that replaces the old
+    directory-glob walk. Missing bc_root directories are no longer
+    relevant — the database is the store.
     """
-    bc_root = Path(args.bc_root)
-    inbox = bc_root / "inbox"
-    outbox = bc_root / "outbox"
-    inbox_files = sorted(inbox.glob("*.yaml")) if inbox.exists() else []
-    for path in inbox_files:
-        work_id = path.stem
-        # An outbox file matching <work_id>-*.yaml means the BC has
-        # already responded (clarify, work_done, or other) — so this
-        # inbox is no longer pending. Globbing keeps the rule
-        # response-type-agnostic.
-        if outbox.exists() and any(outbox.glob(f"{work_id}-*.yaml")):
-            continue
-        mt = _peek_message_type(path)
-        print(f"{work_id} {mt}")
+    bc_root = str(Path(args.bc_root).resolve())
+    rows = query_pending_inbox(bc_root)
+    for work_id, message_type in rows:
+        print(f"{work_id} {message_type}")
     return 0
 
 
 def _cmd_pending_outbox(args: argparse.Namespace) -> int:
     """Enumerate pending outbox responses across sibling BC clones.
 
-    Lead-side counterpart to `pending inbox`. Walks <lead-root>/repos/
-    looking for sibling BC directories (each with an outbox/ child) and
-    enumerates the outbox files. With --bc NAME, scopes to one sibling.
-    A response is "pending" iff its file exists — there is no lead-side
-    "consumed" marker yet, so existence is the only signal available.
-    Returns one line per response of the form
-    "<work_id> <message_type> <bc>".
+    Lead-side counterpart to `pending inbox`. Queries Postgres for
+    outbox rows whose bc path sits under <lead-root>/repos/.
     """
-    lead_root = Path(args.lead_root)
-    repos_root = lead_root / "repos"
-    if not repos_root.exists():
-        # No sibling BCs visible; cleanly produce the empty case.
-        return 0
-    if args.bc is not None:
-        bc_dirs = [repos_root / args.bc]
-    else:
-        bc_dirs = sorted(p for p in repos_root.iterdir() if p.is_dir())
-    for bc_dir in bc_dirs:
-        outbox = bc_dir / "outbox"
-        if not outbox.exists():
-            continue
-        for path in sorted(outbox.glob("*.yaml")):
-            # Outbox filenames are "<work_id>-<response_type>.yaml" per
-            # the BC respond commands. Split on the last hyphen-before-
-            # ".yaml" to recover work_id; if the filename does not match
-            # that shape (e.g. an old hand-rolled file), fall back to
-            # the stem so the entry still surfaces.
-            stem = path.stem
-            # Response type is the trailing chunk; pre-known set keeps
-            # the parse robust against work_ids that themselves contain
-            # hyphens (e.g. "lead-301").
-            for response_type in ("clarify", "work_done", "mechanism_observation"):
-                suffix = f"-{response_type}"
-                if stem.endswith(suffix):
-                    work_id = stem[: -len(suffix)]
-                    mt = response_type
-                    break
-            else:
-                work_id = stem
-                mt = _peek_message_type(path)
-            print(f"{work_id} {mt} {bc_dir.name}")
+    lead_root = str(Path(args.lead_root).resolve())
+    rows = query_pending_outbox(lead_root, bc_filter=args.bc)
+    for work_id, message_type, bc_name in rows:
+        print(f"{work_id} {message_type} {bc_name}")
+    return 0
+
+
+def _cmd_dump(args: argparse.Namespace) -> int:
+    """Operator debugging: dump rows from the messages table."""
+    import json as _json
+    from shop_msg.storage import _connect, _bc_id
+
+    bc_root = str(Path(args.bc_root).resolve()) if args.bc_root else None
+    direction = args.direction
+    limit = args.limit or 100
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            conditions = []
+            params: list = []
+            if bc_root is not None:
+                conditions.append("bc = %s")
+                params.append(_bc_id(bc_root))
+            if direction is not None:
+                conditions.append("direction = %s")
+                params.append(direction)
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            cur.execute(
+                f"SELECT id, bc, work_id, direction, message_type, payload, created_at "
+                f"FROM messages {where} ORDER BY created_at LIMIT %s",
+                params + [limit],
+            )
+            rows = cur.fetchall()
+
+    for row in rows:
+        print(yaml.safe_dump(dict(row), sort_keys=False, default_flow_style=False))
+        print("---")
     return 0
 
 
@@ -579,8 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-id", required=True,
         help=(
             "work_id naming this response in the BC's outbox. Mirrors the "
-            "respond clarify / respond work_done flag of the same name; "
-            "drives the outbox filename <work_id>-mechanism_observation.yaml."
+            "respond clarify / respond work_done flag of the same name."
         ),
     )
     mech_obs.add_argument(
@@ -751,6 +717,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="restrict to a single BC name (must match the directory under repos/)",
     )
     pending_outbox.set_defaults(func=_cmd_pending_outbox)
+
+    dump = sub.add_parser(
+        "dump",
+        help="operator debugging: dump messages table rows to stdout as YAML",
+    )
+    dump.add_argument("--bc-root", default=None, help="restrict to this BC root path")
+    dump.add_argument(
+        "--direction",
+        default=None,
+        choices=["inbox", "outbox"],
+        help="restrict to inbox or outbox rows",
+    )
+    dump.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="maximum number of rows to return (default 100)",
+    )
+    dump.set_defaults(func=_cmd_dump)
 
     return parser
 
