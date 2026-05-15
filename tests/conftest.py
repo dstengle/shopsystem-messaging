@@ -12,9 +12,20 @@ gets its own bc_root (a unique tmp_path), which acts as the Postgres
 namespace key so tests are isolated without any extra cleanup.
 """
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
+
+# Point the test suite at the local dev Postgres cluster (/tmp/pgrun socket,
+# port 5433) rather than the Docker Compose service name.  The compose
+# service is production infra; during development and CI the cluster is
+# managed by the devcontainer init scripts at host=/tmp/pgrun port=5433.
+# This override must be set before any storage module is imported so the
+# module-level _DEFAULT_DSN is bypassed uniformly for all tests.
+os.environ.setdefault(
+    "SHOPMSG_DSN", "host=/tmp/pgrun port=5433 dbname=shopsystem user=vscode"
+)
 
 import psycopg
 import pytest

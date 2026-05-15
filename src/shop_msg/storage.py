@@ -11,7 +11,7 @@ Configuration — connection DSN:
   development and the BDD test suite). In production, operators set
   SHOPMSG_DSN to point at the real Postgres instance.
 
-  Default DSN: host=/tmp/pgrun port=5433 dbname=shopsystem user=vscode
+  Default DSN: postgresql://postgres:postgres@postgres:5432/shopsystem
 
 Schema (DDL emitted once per connect):
   CREATE TABLE IF NOT EXISTS messages (
@@ -52,7 +52,7 @@ from psycopg.rows import dict_row
 # DSN / connection
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DSN = "host=/tmp/pgrun port=5433 dbname=shopsystem user=vscode"
+_DEFAULT_DSN = "postgresql://postgres:postgres@postgres:5432/shopsystem"
 
 
 def _get_dsn() -> str:
@@ -61,8 +61,20 @@ def _get_dsn() -> str:
 
 
 def _connect() -> psycopg.Connection:
-    """Open a new connection and ensure the schema exists."""
-    conn = psycopg.connect(_get_dsn(), row_factory=dict_row)
+    """Open a new connection and ensure the schema exists.
+
+    Raises a clear, descriptive error if the DSN is unreachable so the
+    operator knows which endpoint to check.
+    """
+    dsn = _get_dsn()
+    try:
+        conn = psycopg.connect(dsn, row_factory=dict_row)
+    except psycopg.OperationalError as exc:
+        raise RuntimeError(
+            f"shop-msg: cannot connect to Postgres at DSN {dsn!r}.\n"
+            f"Check that the service is running (e.g. 'docker compose up -d').\n"
+            f"Original error: {exc}"
+        ) from exc
     _ensure_schema(conn)
     return conn
 

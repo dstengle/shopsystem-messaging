@@ -1,0 +1,4 @@
+{
+  "name": "shopsystem-messaging",
+  "postStartCommand": "docker compose up -d"
+}
