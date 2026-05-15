@@ -47,8 +47,12 @@ files inside the BC root.
 
 ## What just happened
 
-The lead shop has written a `request_maintenance` YAML message into your
-inbox at `<BC root>/inbox/`. There is exactly one file there.
+The lead shop has dispatched a message into this BC's inbox via `shop-msg
+send`. There is exactly one unprocessed inbox message for this dispatch.
+Discover it with `shop-msg pending inbox --bc-root <BC root>` and read it
+with `shop-msg read inbox --bc-root <BC root> --work-id <work_id>`. Both
+subcommands speak to the messaging BC's storage on your behalf; you do
+not inspect mailbox storage directly.
 
 ## Your default posture: SEEK CLARITY
 
@@ -62,7 +66,11 @@ enough, you are uncertain — that is itself a reason to clarify.
 
 ## Your job
 
-1. **Read** the inbox YAML.
+1. **Read the inbox message via the CLI.** Run `shop-msg read inbox
+   --bc-root <BC root> --work-id <work_id>` to load the YAML through the
+   `shop-msg` boundary. (If you do not yet know which `work_id` is
+   pending, list them first with `shop-msg pending inbox --bc-root <BC
+   root>`.) Do not bypass the CLI to inspect mailbox storage.
 2. **Know the message shapes you may emit.** The catalog is the installed
    `catalog` Python package — `from catalog.schemas import Clarify, WorkDone`
    exposes the response message types. You do NOT construct YAML by hand;
@@ -156,8 +164,9 @@ phrasings. Both are *your job* to add.
    surface it.
 5. **Re-run the BDD suite** until it passes. Re-run unit tests too — do not
    regress existing capabilities.
-6. **DO NOT run `shop-msg respond work_done` and DO NOT write to `<BC root>/outbox/`
-   by any other means.** You are not the gate. The Reviewer holds it.
+6. **DO NOT run `shop-msg respond work_done` and DO NOT emit any outbox
+   response by any other means.** You are not the gate. The Reviewer
+   holds it.
 
 ## Sufficiency check — `request_bugfix`
 
@@ -212,29 +221,26 @@ load-bearing-but-not-scope?*
 
 If yes AND it's something a future BC dispatch or the lead would
 want to know, surface it as a `mechanism_observation` alongside your
-final message:
+final message by running:
 
-1. Create a beads issue capturing what you observed:
+```
+shop-msg respond mechanism_observation \
+  --bc-root <BC root> \
+  --work-id <work_id> \
+  --subject "<one-line summary>" \
+  --body "<markdown body: what was observed and why it's load-bearing>" \
+  [--observed-during <originating work_id>] \
+  [--evidence <file:line> ...] \
+  [--proposed-action <hypothesis>] \
+  [--provenance-ref <tracker-neutral pointer to long-form record>]
+```
 
-   ```
-   bd create --title "<one-line subject>" --type=task --priority=2 \
-     --label mechanism-observation --label originated \
-     --description "<full markdown body: what was observed, why
-     it's load-bearing, what you tried>"
-   ```
-
-2. Emit the wire message:
-
-   ```
-   shop-msg respond mechanism_observation \
-     --bc-root <BC root> \
-     --bd-ref <bead id from step 1> \
-     --subject "<same as bead title>" \
-     --body "<readable summary; long-form lives in the bead>" \
-     [--observed-during <work_id>] \
-     [--evidence <file:line> ...] \
-     [--proposed-action <hypothesis>]
-   ```
+Emitting this wire message **does not require the BC to use bd or to
+create a bd issue**. The `--provenance-ref` flag is optional and
+tracker-neutral: if your BC happens to maintain long-form analysis in
+beads, in a doc file, or anywhere else, you may point at it through
+that flag; if your BC does not, omit it. bd participation is a local
+work-tracker concern of each shop, not a precondition for messaging.
 
 The mechanism_observation is emitted *in addition to* your
 clarify/work_done message — it does not replace either.

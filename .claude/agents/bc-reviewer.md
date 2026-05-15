@@ -56,7 +56,11 @@ gate.** No `work_done` reaches the lead shop without your sign-off.
 
 ## What you read
 
-1. The assigned scenarios in `<BC root>/inbox/`.
+1. The assigned scenarios — read them via `shop-msg read inbox --bc-root
+   <BC root> --work-id <work_id>`. If you do not yet know which work_id
+   to read, list pending inbox messages with `shop-msg pending inbox
+   --bc-root <BC root>`. You do not inspect mailbox storage directly;
+   the `shop-msg` CLI is the boundary the messaging BC exposes for that.
 2. The BC's current state — `src/`, `tests/`, `features/`.
 3. Whatever the Implementer left as a summary in their final message
    (provided to you via dispatch context if available; otherwise infer
