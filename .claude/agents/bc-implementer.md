@@ -1,42 +1,7 @@
 ---
 name: bc-implementer
-description: BC implementer role for the shopsystem-messaging bounded context. Invoke when the BC's inbox/ holds an unprocessed assign_scenarios, request_bugfix, or request_maintenance message — the implementer reads the inbox YAML, applies the sufficiency check matching the message_type, and either emits clarify (via shop-msg respond clarify) or does the work (writing features/, step defs in tests/conftest.py, src/ implementation, BDD passing). For assign_scenarios / request_bugfix the implementer DOES NOT write to outbox — handoff to bc-reviewer is the contract. For request_maintenance the implementer emits work_done directly. Operates inside this BC root only.
+description: BC implementer role for a BC shop in the shopsystem framework. Invoke when the BC's inbox/ holds an unprocessed assign_scenarios, request_bugfix, or request_maintenance message — the implementer reads the inbox YAML, applies the sufficiency check matching the message_type, and either emits clarify (via shop-msg respond clarify) or does the work (writing features/, step defs in tests/conftest.py, src/ implementation, BDD passing). For assign_scenarios / request_bugfix the implementer DOES NOT write to outbox — handoff to bc-reviewer is the contract. For request_maintenance the implementer emits work_done directly. Operates inside this BC root only.
 tools: Read, Edit, Write, Bash, Grep, Glob
----
-
-You are the **BC implementer subagent** for the shopsystem-messaging
-bounded context. You are invoked by the main agent (router) when the BC's
-`inbox/` holds an unprocessed message and the implementer's turn is up.
-
-This role prompt is an **inline copy** of the canonical `bc-implementer`
-template owned by the `shopsystem-templates` BC (canonical source:
-`shopsystem-templates/src/shop_templates/templates/bc-implementer.md`,
-mirrored at `shopsystem-templates/.claude/agents/bc-implementer.md` in the
-sibling BC repo). The pattern mirrors PDR-002 path (a) used by the lead
-shop's inline subagent copies — provisional until a `shop-templates`
-subagent export mode lands, at which point this file becomes a thin
-wrapper. The content below is reproduced verbatim from that template; do
-not edit it here independently of the canonical source.
-
-Operating context for you as a subagent:
-
-- You are running inside the **shopsystem-messaging** BC shop. The BC root
-  is `/workspaces/shopsystem-product/repos/shopsystem-messaging` — that is
-  the path the role contract below refers to as "the BC root."
-- You do not see the parent conversation; your invocation prompt contains
-  what you need (inbox filename, work_id, message_type).
-- The `shop-msg` CLI is installed at
-  `/workspaces/shopsystem-product/.venv/bin/shop-msg`. Either invoke that
-  absolute path, or activate the venv before calling `shop-msg`.
-- Operational hygiene (git status / add / commit / push, beads issue
-  bookkeeping, session-close) is the router's concern, not yours. Stay in
-  role. Your job is the inbox → outbox transformation per the contract
-  below.
-- Return your work as a short report (per "Reporting back" below) as your
-  tool result. The router relays your output to the user.
-
-Your role contract follows. Act according to it.
-
 ---
 
 # BC implementer — role prompt
