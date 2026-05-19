@@ -57,6 +57,10 @@ Subcommands:
         Operator debugging: dumps rows from the messages table to stdout
         as YAML. With --bc-root, scopes to that BC. With --direction,
         scopes to inbox or outbox. With --limit, caps the result count.
+    prime --bc-root PATH
+        Session-start orientation. Prints the current DSN, DB reachability,
+        count and list of pending inbox messages, and a brief CLI reminder.
+        Exits 0 when the DB is reachable; non-zero when unreachable.
 """
 from __future__ import annotations
 
@@ -469,6 +473,58 @@ def _cmd_pending_outbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prime(args: argparse.Namespace) -> int:
+    """Session-start orientation for BC agents.
+
+    Prints:
+      1. Current DSN
+      2. DB reachability (yes / no — <error>)
+      3. Count of unprocessed inbox messages
+      4. Each pending work_id + message_type
+      5. A brief reminder block about the CLI
+
+    Exit 0 when DB is reachable; non-zero when unreachable.
+    """
+    from shop_msg.storage import _get_dsn, query_pending_inbox
+
+    bc_root = str(Path(args.bc_root).resolve())
+    dsn = _get_dsn()
+
+    print(f"DSN: {dsn}")
+
+    # Probe connectivity.
+    try:
+        pending_rows = query_pending_inbox(bc_root)
+        db_reachable = True
+    except Exception as exc:
+        print(f"DB reachable: no — {exc}")
+        print()
+        _print_prime_reminder(bc_root)
+        return 1
+
+    print("DB reachable: yes")
+    print()
+
+    count = len(pending_rows)
+    print(f"Pending inbox messages: {count}")
+    for work_id, message_type in pending_rows:
+        print(f"  {work_id}  {message_type}")
+    print()
+
+    _print_prime_reminder(bc_root)
+    return 0
+
+
+def _print_prime_reminder(bc_root: str) -> None:
+    print(
+        "Use shop-msg CLI commands — inbox/outbox are in postgres, not on the filesystem.\n"
+        "Key commands:\n"
+        f"  shop-msg pending inbox --bc-root {bc_root}\n"
+        f"  shop-msg read inbox --bc-root {bc_root} --work-id <id>\n"
+        "  shop-msg respond clarify | work_done | mechanism_observation ..."
+    )
+
+
 def _cmd_dump(args: argparse.Namespace) -> int:
     """Operator debugging: dump rows from the messages table."""
     import json as _json
@@ -717,6 +773,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="restrict to a single BC name (must match the directory under repos/)",
     )
     pending_outbox.set_defaults(func=_cmd_pending_outbox)
+
+    prime = sub.add_parser(
+        "prime",
+        help="session-start orientation: DSN, DB health, pending inbox, and CLI reminder",
+    )
+    prime.add_argument("--bc-root", required=True, help="BC root directory")
+    prime.set_defaults(func=_cmd_prime)
 
     dump = sub.add_parser(
         "dump",
