@@ -403,3 +403,107 @@ def insert_raw_payload(
     Does NOT fire NOTIFY. Raises CollisionError on duplicate.
     """
     insert_message(bc_root, work_id, direction, message_type, payload, notify=False)
+
+
+def watch_inbox(bc_root: str) -> None:
+    """Drain pending inbox messages then LISTEN for new ones, printing one line
+    per event to stdout.
+
+    Each output line is of the form:
+        <work_id> <message_type>
+
+    This is the Monitor-compatible format: the harness can wake agent
+    processes by reading these lines from stdout.
+
+    Startup sequence:
+      1. Connect to Postgres (raises RuntimeError via _connect if unreachable).
+      2. LISTEN on the BC's inbox channel.
+      3. Drain: query pending inbox rows and print each one.
+      4. Emit a sentinel READY line so callers can detect drain completion.
+      5. Block on NOTIFY, printing one line per notification received.
+
+    The function never returns under normal operation; it loops forever
+    waiting for notifications.
+    """
+    import sys
+    from psycopg import sql
+
+    bc = _bc_id(bc_root)
+    channel = _bc_slug(bc_root)
+
+    # Step 1 & 2: connect and LISTEN before draining so we cannot miss a
+    # notification that fires between the drain query and the LISTEN.
+    # We use autocommit=True for the LISTEN connection; LISTEN requires it.
+    dsn = _get_dsn()
+    try:
+        conn = psycopg.connect(dsn, autocommit=True)
+    except psycopg.OperationalError as exc:
+        raise RuntimeError(
+            f"shop-msg watch: cannot connect to Postgres at DSN {dsn!r}.\n"
+            f"Check that the service is running (e.g. 'docker compose up -d').\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    try:
+        # Force line-buffering on stdout so each print() reaches the pipe
+        # immediately even when stdout is not a TTY (e.g. when a subprocess
+        # Popen captures it).  Python switches to block-buffering for
+        # non-TTY stdout; `flush=True` on print() only flushes Python's
+        # internal layer, not the underlying C-level buffer.  Reconfiguring
+        # to line_buffering=True ensures every newline flushes through.
+        sys.stdout.reconfigure(line_buffering=True)
+
+        _ensure_schema(conn)
+
+        conn.execute(
+            sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel))
+        )
+
+        # Step 3: drain pending inbox messages.
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT i.work_id, i.message_type
+                FROM messages i
+                WHERE i.bc = %s AND i.direction = 'inbox'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM messages o
+                    WHERE o.bc = i.bc
+                      AND o.work_id = i.work_id
+                      AND o.direction = 'outbox'
+                  )
+                ORDER BY i.created_at
+                """,
+                (bc,),
+            )
+            for row in cur.fetchall():
+                print(f"{row['work_id']} {row['message_type']}")
+
+        # Step 4: sentinel so callers can detect drain completion.
+        print("READY")
+
+        # Step 5: block indefinitely on NOTIFY, printing one line per event.
+        for notify in conn.notifies():
+            # The notification payload is the work_id.
+            work_id = notify.payload
+            # Look up the message_type from the DB using a separate connection.
+            # We MUST NOT use the LISTEN connection (conn) here because
+            # conn.notifies() holds conn.lock for the duration of the generator.
+            # Calling conn.cursor().execute() inside the loop body would try to
+            # re-acquire the same non-reentrant lock, causing a deadlock.
+            with _connect() as lookup_conn:
+                with lookup_conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        """
+                        SELECT message_type FROM messages
+                        WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (bc, work_id),
+                    )
+                    row = cur.fetchone()
+            message_type = row["message_type"] if row else "unknown"
+            print(f"{work_id} {message_type}")
+    finally:
+        conn.close()

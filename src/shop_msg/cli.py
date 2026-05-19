@@ -61,6 +61,13 @@ Subcommands:
         Session-start orientation. Prints the current DSN, DB reachability,
         count and list of pending inbox messages, and a brief CLI reminder.
         Exits 0 when the DB is reachable; non-zero when unreachable.
+    watch --bc-root PATH
+        Monitor-compatible inbox watcher. Drains unprocessed inbox messages
+        on startup (one '<work_id> <message_type>' line per pending item),
+        emits a 'READY' sentinel line, then blocks on Postgres LISTEN waiting
+        for new inbox inserts. Each NOTIFY produces one output line. Never
+        exits under normal operation. Exits non-zero with a message naming
+        the DSN when the database is unreachable at startup.
 """
 from __future__ import annotations
 
@@ -95,6 +102,7 @@ from shop_msg.storage import (
     query_pending_outbox,
     read_inbox_message,
     read_outbox_messages,
+    watch_inbox,
 )
 
 _response_adapter = TypeAdapter(BCResponse)
@@ -558,6 +566,28 @@ def _cmd_dump(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """Drain pending inbox messages then LISTEN for new ones.
+
+    Each line emitted to stdout is of the form:
+        <work_id> <message_type>
+
+    A special "READY" sentinel line is emitted after the startup drain and
+    before entering the LISTEN loop so that callers (e.g. the Monitor harness
+    or BDD step definitions) can reliably detect when the drain phase is done.
+
+    Exits non-zero with a descriptive message to stderr if the database is
+    unreachable at startup.
+    """
+    bc_root = str(Path(args.bc_root).resolve())
+    try:
+        watch_inbox(bc_root)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shop-msg")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -799,6 +829,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum number of rows to return (default 100)",
     )
     dump.set_defaults(func=_cmd_dump)
+
+    watch = sub.add_parser(
+        "watch",
+        help=(
+            "Monitor-compatible inbox watcher: drain pending messages then "
+            "LISTEN for new ones, printing one '<work_id> <message_type>' "
+            "line per event to stdout. Never exits unless the DB is unreachable."
+        ),
+    )
+    watch.add_argument("--bc-root", required=True, help="BC root directory")
+    watch.set_defaults(func=_cmd_watch)
 
     return parser
 

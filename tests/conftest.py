@@ -1938,6 +1938,7 @@ def then_no_validation_error(context: dict) -> None:
 def then_no_required_field_names_beads(
     bd_decoupling_schema_name: str,
 ) -> None:
+
     cls = _schema_class_for(bd_decoupling_schema_name)
     for name, field in cls.model_fields.items():
         if not field.is_required():
@@ -1964,3 +1965,382 @@ def then_no_required_field_names_beads(
                 f"matches the beads issue-id shape; violates lead-231 "
                 f"item C decoupling invariant"
             )
+
+
+# -----------------------------------------------------------------------
+# lead-k98: shop-msg watch — Monitor-compatible inbox watcher
+# -----------------------------------------------------------------------
+
+import select
+import signal
+import threading
+import time
+
+
+def _watch_raw_fd(proc: subprocess.Popen):
+    """Return the raw file descriptor (FileIO) for proc.stdout.
+
+    When Popen is created with text=True, proc.stdout is a TextIOWrapper
+    around a BufferedReader around a FileIO.  select.select on the
+    TextIOWrapper fd checks the underlying kernel fd, but BufferedReader
+    may have already consumed data from the kernel fd into its internal
+    buffer.  select.select would then report "not readable" even though
+    data is available in the BufferedReader buffer.
+
+    We bypass the BufferedReader by going straight to the FileIO layer
+    (proc.stdout.buffer.raw), which has no internal buffer.  This means
+    select.select correctly reflects whether unread data remains.
+    """
+    assert proc.stdout is not None
+    # proc.stdout            → TextIOWrapper
+    # proc.stdout.buffer     → BufferedReader
+    # proc.stdout.buffer.raw → FileIO (or underlying raw stream)
+    return proc.stdout.buffer.raw
+
+
+def _read_watch_lines_until_ready(
+    proc: subprocess.Popen, timeout: float = 15.0
+) -> list[str]:
+    """Read lines from proc.stdout until the 'READY' sentinel appears or
+    timeout is reached. Returns all non-READY lines emitted before READY.
+
+    Raises AssertionError if READY is not seen within the timeout.
+
+    Implementation note: we use the raw FileIO layer (proc.stdout.buffer.raw)
+    rather than the BufferedReader (proc.stdout.buffer) or the TextIOWrapper
+    (proc.stdout).  BufferedReader.read1() drains data from the kernel pipe
+    into its internal buffer, so subsequent select.select() calls on the
+    underlying fd report "not readable" even when BufferedReader has data
+    in its buffer.  Going straight to FileIO avoids that hazard because
+    FileIO has no internal buffer of its own.
+    """
+    lines: list[str] = []
+    pending = b""
+    deadline = time.monotonic() + timeout
+    raw = _watch_raw_fd(proc)
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([raw], [], [], min(remaining, 1.0))
+        if ready:
+            chunk = raw.read(4096)  # FileIO.read() is non-blocking when data available
+            if not chunk:
+                break
+            pending += chunk
+            while b"\n" in pending:
+                line_bytes, pending = pending.split(b"\n", 1)
+                stripped = line_bytes.decode("utf-8").rstrip("\r")
+                if stripped == "READY":
+                    return lines
+                if stripped:
+                    lines.append(stripped)
+    raise AssertionError(
+        f"shop-msg watch did not emit READY sentinel within {timeout}s; "
+        f"lines so far: {lines!r}"
+    )
+
+
+def _read_next_watch_line(
+    proc: subprocess.Popen, timeout: float = 10.0
+) -> str | None:
+    """Read the next non-empty line from proc.stdout, with a timeout.
+
+    Returns the line (stripped of trailing newline) or None if no line
+    arrived before the timeout.
+
+    Uses the raw FileIO layer (see _watch_raw_fd) to avoid the
+    select.select + BufferedReader internal-buffer hazard described in
+    _read_watch_lines_until_ready's docstring.
+    """
+    raw = _watch_raw_fd(proc)
+    pending = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([raw], [], [], min(remaining, 1.0))
+        if ready:
+            chunk = raw.read(4096)
+            if not chunk:
+                break
+            pending += chunk
+            while b"\n" in pending:
+                line_bytes, pending = pending.split(b"\n", 1)
+                stripped = line_bytes.decode("utf-8").rstrip("\r")
+                if stripped:
+                    return stripped
+    return None
+
+
+@pytest.fixture(autouse=False)
+def watch_process_cleanup(context: dict):
+    """Fixture that terminates any background watch process after each test."""
+    yield
+    proc = context.get("watch_proc")
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+@given("an empty BC at a temporary path with no unprocessed inbox messages")
+def empty_bc_no_pending(tmp_path: Path) -> Path:
+    """An empty BC with no inbox messages at all — guaranteed no pending items."""
+    (tmp_path / "inbox").mkdir()
+    (tmp_path / "outbox").mkdir()
+    return tmp_path
+
+
+# Override: pytest-bdd uses fixture injection by name, so we need target_fixture.
+@given(
+    "an empty BC at a temporary path with no unprocessed inbox messages",
+    target_fixture="bc_root",
+)
+def empty_bc_no_pending_fixture(tmp_path: Path) -> Path:
+    (tmp_path / "inbox").mkdir()
+    (tmp_path / "outbox").mkdir()
+    return tmp_path
+
+
+@given("a BC at a temporary path", target_fixture="bc_root")
+def bc_at_temporary_path(tmp_path: Path) -> Path:
+    (tmp_path / "inbox").mkdir()
+    (tmp_path / "outbox").mkdir()
+    return tmp_path
+
+
+@given(
+    "the environment variable SHOPMSG_DSN is set to an address where no "
+    "Postgres instance is listening"
+)
+def set_dsn_to_unreachable(context: dict) -> None:
+    # Use a port that is extremely unlikely to have a Postgres listener.
+    unreachable_dsn = "postgresql://nobody:nobody@127.0.0.1:19999/nonexistent"
+    context["override_dsn"] = unreachable_dsn
+
+
+@when("I run shop-msg watch in the background")
+def run_watch_in_background(bc_root: Path, context: dict) -> None:
+    """Launch shop-msg watch as a background process, then read until READY."""
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    # Drain startup lines (all lines before READY sentinel).
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg watch in the background and it outputs the startup '
+        'drain line for "{work_id}"'
+    )
+)
+def run_watch_in_background_and_collect_drain_line(
+    bc_root: Path, work_id: str, context: dict
+) -> None:
+    """Launch shop-msg watch, collect drain lines, store the line for work_id."""
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+    # Find the line containing the expected work_id.
+    matching = [l for l in drain_lines if work_id in l]
+    assert matching, (
+        f"expected drain to include a line for work_id={work_id!r}; "
+        f"drain lines: {drain_lines!r}"
+    )
+    context["watch_target_line"] = matching[0]
+
+
+@when(
+    "I run shop-msg watch in the background and wait for startup drain to complete"
+)
+def run_watch_wait_for_drain(bc_root: Path, context: dict) -> None:
+    """Launch watch, wait for READY, record the time and drain lines."""
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+    context["watch_ready_time"] = time.monotonic()
+
+
+@given(
+    "shop-msg watch is running in the background and has completed its startup drain"
+)
+def given_watch_running_after_drain(bc_root: Path, context: dict) -> None:
+    """Start watch and wait for READY before proceeding."""
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+
+
+@when(
+    parsers.parse(
+        'a new assign_scenarios message with work-id "{work_id}" is '
+        'inserted into the inbox'
+    )
+)
+def insert_new_assign_scenarios_message(bc_root: Path, work_id: str, context: dict) -> None:
+    """Insert a new inbox message so the NOTIFY fires and watch emits a line."""
+    _shop_msg_send_inbox(bc_root, "assign_scenarios", work_id)
+
+
+@when("I run shop-msg watch")
+def run_watch_synchronously(bc_root: Path, context: dict) -> None:
+    """Run shop-msg watch synchronously (for the failure case)."""
+    env = os.environ.copy()
+    override_dsn = context.get("override_dsn")
+    if override_dsn:
+        env["SHOPMSG_DSN"] = override_dsn
+    result = subprocess.run(
+        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    context["override_dsn_used"] = override_dsn
+
+
+@then(
+    parsers.parse(
+        'before the process enters the LISTEN loop, it outputs one line for '
+        'work_id "{work_id}"'
+    )
+)
+def watch_drain_includes_line_for_work_id(context: dict, work_id: str) -> None:
+    drain_lines = context.get("watch_drain_lines", [])
+    matching = [l for l in drain_lines if work_id in l.split()]
+    assert matching, (
+        f"expected drain output to include a line containing work_id={work_id!r}; "
+        f"drain lines: {drain_lines!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'it outputs one line for work_id "{work_id}"'
+    )
+)
+def watch_output_includes_line_for_work_id(context: dict, work_id: str) -> None:
+    drain_lines = context.get("watch_drain_lines", [])
+    matching = [l for l in drain_lines if work_id in l.split()]
+    assert matching, (
+        f"expected output to include a line containing work_id={work_id!r}; "
+        f"lines: {drain_lines!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'shop-msg watch outputs exactly one line to stdout for work_id "{work_id}"'
+    )
+)
+def watch_outputs_exactly_one_line_for_work_id(
+    context: dict, work_id: str
+) -> None:
+    proc = context["watch_proc"]
+    # Read the next line emitted after the new message was inserted.
+    line = _read_next_watch_line(proc, timeout=10.0)
+    assert line is not None, (
+        f"expected shop-msg watch to emit a line for work_id={work_id!r} "
+        f"after inbox insert; no line received within timeout"
+    )
+    assert work_id in line, (
+        f"expected line to contain work_id={work_id!r}; got: {line!r}"
+    )
+    context["watch_live_line"] = line
+
+
+@then(
+    parsers.parse('that output line contains the text "{text}"')
+)
+def watch_line_contains_text(context: dict, text: str) -> None:
+    line = context.get("watch_target_line", "")
+    assert text in line, (
+        f"expected output line to contain {text!r}; got: {line!r}"
+    )
+
+
+@then("the entire event is contained on a single line of stdout")
+def watch_event_is_single_line(context: dict) -> None:
+    line = context.get("watch_target_line", "")
+    assert "\n" not in line, (
+        f"expected the event to be a single line (no embedded newline); "
+        f"got: {line!r}"
+    )
+    assert line.strip() != "", (
+        "expected the event line to be non-empty"
+    )
+
+
+@then("the process has not exited after 2 seconds of inactivity")
+def watch_process_still_alive_after_idle(context: dict) -> None:
+    proc: subprocess.Popen = context["watch_proc"]
+    # Sleep 2 seconds from the point watch reached READY.
+    ready_time = context.get("watch_ready_time", time.monotonic())
+    elapsed = time.monotonic() - ready_time
+    remaining = 2.0 - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+    rc = proc.poll()
+    assert rc is None, (
+        f"expected shop-msg watch to still be running after 2 seconds of "
+        f"inactivity; process exited with code {rc}"
+    )
+
+
+@then("no output lines have been written to stdout during that idle period")
+def no_watch_output_during_idle(context: dict) -> None:
+    proc: subprocess.Popen = context["watch_proc"]
+    # Try reading from the raw fd; expect nothing within 0.5s.
+    raw = _watch_raw_fd(proc)
+    ready, _, _ = select.select([raw], [], [], 0.5)
+    if ready:
+        # There might be a buffered partial read — check if it's non-empty.
+        chunk = raw.read(4096)
+        stripped = chunk.decode("utf-8").strip() if chunk else ""
+        assert stripped == "" or stripped == "READY", (
+            f"expected no output during idle period; got: {stripped!r}"
+        )
+
+
+@then("stderr contains the DSN value from SHOPMSG_DSN")
+def stderr_contains_dsn_value(context: dict) -> None:
+    dsn = context.get("override_dsn_used") or os.environ.get("SHOPMSG_DSN", "")
+    stderr = context.get("cli_stderr", "")
+    assert dsn in stderr, (
+        f"expected stderr to contain the DSN value {dsn!r}; "
+        f"stderr was:\n{stderr}"
+    )
