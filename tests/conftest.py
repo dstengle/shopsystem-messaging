@@ -2283,6 +2283,23 @@ def watch_outputs_exactly_one_line_for_work_id(
     context["watch_live_line"] = line
 
 
+@then("no additional output line arrives within 2 seconds")
+def no_additional_output_line_within_2_seconds(context: dict) -> None:
+    """Assert that no second line arrives from the watch process within 2 seconds.
+
+    This step tightens scenario 6b5910b7b30777d8: a buggy implementation
+    that emits the same work_id twice would have passed the 'exactly one
+    line' check alone, but will fail here because a second line would be
+    detected.
+    """
+    proc = context["watch_proc"]
+    second_line = _read_next_watch_line(proc, timeout=2.0)
+    assert second_line is None, (
+        f"expected no additional output line within 2 seconds; "
+        f"got: {second_line!r}"
+    )
+
+
 @then(
     parsers.parse('that output line contains the text "{text}"')
 )
