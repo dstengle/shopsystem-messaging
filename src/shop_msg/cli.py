@@ -68,6 +68,11 @@ Subcommands:
         for new inbox inserts. Each NOTIFY produces one output line. Never
         exits under normal operation. Exits non-zero with a message naming
         the DSN when the database is unreachable at startup.
+    watch --lead-root PATH
+        Lead-side outbox watcher. Discovers BC repos under <lead-root>/repos/,
+        drains existing outbox rows on startup, emits a 'READY' sentinel line,
+        then blocks on Postgres LISTEN for new outbox inserts across all BCs.
+        Each NOTIFY produces one '<work_id> <message_type>' output line.
 """
 from __future__ import annotations
 
@@ -103,6 +108,7 @@ from shop_msg.storage import (
     read_inbox_message,
     read_outbox_messages,
     watch_inbox,
+    watch_outbox_for_lead,
 )
 
 _response_adapter = TypeAdapter(BCResponse)
@@ -156,6 +162,7 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
             "outbox",
             "clarify",
             message.model_dump(),
+            notify=True,
         )
     except CollisionError:
         print(
@@ -185,6 +192,7 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
             "outbox",
             "work_done",
             message.model_dump(),
+            notify=True,
         )
     except CollisionError:
         print(
@@ -225,6 +233,7 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
             "outbox",
             "mechanism_observation",
             message.model_dump(exclude_none=True),
+            notify=True,
         )
     except CollisionError:
         print(
@@ -567,7 +576,7 @@ def _cmd_dump(args: argparse.Namespace) -> int:
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
-    """Drain pending inbox messages then LISTEN for new ones.
+    """Drain pending messages then LISTEN for new ones.
 
     Each line emitted to stdout is of the form:
         <work_id> <message_type>
@@ -578,7 +587,20 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
     Exits non-zero with a descriptive message to stderr if the database is
     unreachable at startup.
+
+    Modes:
+      --bc-root PATH   Inbox watcher for a single BC.
+      --lead-root PATH Outbox watcher across all BCs under <lead-root>/repos/.
     """
+    if args.lead_root is not None:
+        lead_root = str(Path(args.lead_root).resolve())
+        try:
+            watch_outbox_for_lead(lead_root)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
     bc_root = str(Path(args.bc_root).resolve())
     try:
         watch_inbox(bc_root)
@@ -833,12 +855,20 @@ def build_parser() -> argparse.ArgumentParser:
     watch = sub.add_parser(
         "watch",
         help=(
-            "Monitor-compatible inbox watcher: drain pending messages then "
+            "Monitor-compatible watcher: drain pending messages then "
             "LISTEN for new ones, printing one '<work_id> <message_type>' "
-            "line per event to stdout. Never exits unless the DB is unreachable."
+            "line per event to stdout. Never exits unless the DB is unreachable. "
+            "Use --bc-root for inbox watching (BC mode) or --lead-root for "
+            "outbox watching across all BCs (lead mode)."
         ),
     )
-    watch.add_argument("--bc-root", required=True, help="BC root directory")
+    _watch_mode = watch.add_mutually_exclusive_group(required=True)
+    _watch_mode.add_argument("--bc-root", default=None, help="BC root directory (inbox watch mode)")
+    _watch_mode.add_argument(
+        "--lead-root",
+        default=None,
+        help="lead-shop root containing a repos/ directory (outbox watch mode)",
+    )
     watch.set_defaults(func=_cmd_watch)
 
     return parser

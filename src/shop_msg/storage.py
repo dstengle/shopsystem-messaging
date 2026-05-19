@@ -33,8 +33,10 @@ Collision handling:
 LISTEN/NOTIFY:
   After every inbox INSERT, NOTIFY is fired on the channel
   `inbox_<bc_slug>` (with the bc path slug-encoded) carrying the
-  work_id as the payload. This is a fire-and-forget from the storage
-  layer's perspective; agents hold a long-lived LISTEN connection
+  work_id as the payload. After every outbox INSERT (from the respond
+  commands), NOTIFY is fired on the channel `outbox_<bc_slug>` carrying
+  the work_id as the payload. These are fire-and-forget from the storage
+  layer's perspective; agents hold long-lived LISTEN connections
   separately.
 """
 from __future__ import annotations
@@ -134,6 +136,16 @@ def _bc_slug(bc_root: str) -> str:
     return f"inbox_{slug}"[:63]
 
 
+def _bc_outbox_slug(bc_root: str) -> str:
+    """Return a PostgreSQL identifier-safe slug for the outbox NOTIFY channel.
+
+    Mirrors _bc_slug but prefixed with 'outbox_' so lead-side watchers can
+    LISTEN for outbox events without colliding with inbox channels.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]", "_", bc_root)
+    return f"outbox_{slug}"[:63]
+
+
 # ---------------------------------------------------------------------------
 # Public storage API
 # ---------------------------------------------------------------------------
@@ -156,8 +168,10 @@ def insert_message(
     - For outbox direction: a row with the same (bc, work_id, 'outbox',
       message_type) already exists. The UNIQUE constraint handles this.
 
-    When `notify=True` (inbox inserts), fires NOTIFY after the commit
-    so agents listening on the channel wake up.
+    When `notify=True` and direction='inbox', fires NOTIFY on the inbox
+    channel after the commit so BC-side watchers wake up.
+    When `notify=True` and direction='outbox', fires NOTIFY on the outbox
+    channel after the commit so lead-side watchers wake up.
     """
     bc = _bc_id(bc_root)
     payload_json = json.dumps(payload)
@@ -208,6 +222,21 @@ def insert_message(
         # injection while keeping the syntax valid.
         from psycopg import sql
         channel = _bc_slug(bc_root)
+        with psycopg.connect(_get_dsn(), autocommit=True) as nconn:
+            nconn.execute(
+                sql.SQL("NOTIFY {channel}, {payload}").format(
+                    channel=sql.Identifier(channel),
+                    payload=sql.Literal(work_id),
+                )
+            )
+
+    if notify and direction == "outbox":
+        # Fire NOTIFY on the outbox channel so lead-side watchers
+        # (shop-msg watch --lead-root) can observe BC responses in
+        # real time without polling.  The channel name is the outbox
+        # slug; the payload is the work_id.
+        from psycopg import sql
+        channel = _bc_outbox_slug(bc_root)
         with psycopg.connect(_get_dsn(), autocommit=True) as nconn:
             nconn.execute(
                 sql.SQL("NOTIFY {channel}, {payload}").format(
@@ -403,6 +432,142 @@ def insert_raw_payload(
     Does NOT fire NOTIFY. Raises CollisionError on duplicate.
     """
     insert_message(bc_root, work_id, direction, message_type, payload, notify=False)
+
+
+def list_bc_roots_for_lead(lead_root: str) -> list[str]:
+    """Return the list of BC root paths under <lead_root>/repos/.
+
+    Each subdirectory of <lead_root>/repos/ that exists is treated as a BC.
+    Returns full absolute paths suitable for use as bc identifiers.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    repos_dir = _Path(lead_root) / "repos"
+    if not repos_dir.is_dir():
+        return []
+    return sorted(
+        str(p.resolve())
+        for p in repos_dir.iterdir()
+        if p.is_dir()
+    )
+
+
+def watch_outbox_for_lead(lead_root: str) -> None:
+    """Lead-side outbox watcher: drain pending outbox rows then LISTEN for new ones.
+
+    Each output line is of the form:
+        <work_id> <message_type>
+
+    Startup sequence:
+      1. Connect to Postgres (raises RuntimeError if unreachable).
+      2. Discover BC roots under <lead_root>/repos/.
+      3. LISTEN on each BC's outbox channel.
+      4. Drain: query pending outbox rows across all known BCs and print each.
+      5. Emit a sentinel READY line.
+      6. Block on NOTIFY, printing one line per notification received.
+
+    The function never returns under normal operation.
+    """
+    import sys
+    from psycopg import sql
+
+    bc_roots = list_bc_roots_for_lead(lead_root)
+    # channel_to_bc maps each outbox channel name back to the bc_root path
+    # so we can look up the message_type on notification.
+    channel_to_bc: dict[str, str] = {
+        _bc_outbox_slug(bc): bc for bc in bc_roots
+    }
+
+    dsn = _get_dsn()
+    try:
+        conn = psycopg.connect(dsn, autocommit=True)
+    except psycopg.OperationalError as exc:
+        raise RuntimeError(
+            f"shop-msg watch: cannot connect to Postgres at DSN {dsn!r}.\n"
+            f"Check that the service is running (e.g. 'docker compose up -d').\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+
+        _ensure_schema(conn)
+
+        # LISTEN on all known BC outbox channels.
+        for channel in channel_to_bc:
+            conn.execute(
+                sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel))
+            )
+
+        # Drain existing outbox rows across all known BCs.
+        if bc_roots:
+            bc_ids = [_bc_id(bc) for bc in bc_roots]
+            placeholders = ", ".join(["%s"] * len(bc_ids))
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT bc, work_id, message_type
+                    FROM messages
+                    WHERE bc IN ({placeholders}) AND direction = 'outbox'
+                    ORDER BY created_at
+                    """,
+                    bc_ids,
+                )
+                for row in cur.fetchall():
+                    print(f"{row['work_id']} {row['message_type']}")
+
+        print("READY")
+
+        # Block indefinitely on NOTIFY.
+        for notify in conn.notifies():
+            work_id = notify.payload
+            bc_root_for_notify = channel_to_bc.get(notify.channel)
+            if bc_root_for_notify is None:
+                continue
+            bc_for_notify = _bc_id(bc_root_for_notify)
+            with _connect() as lookup_conn:
+                with lookup_conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        """
+                        SELECT message_type FROM messages
+                        WHERE bc = %s AND work_id = %s AND direction = 'outbox'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (bc_for_notify, work_id),
+                    )
+                    row = cur.fetchone()
+            message_type = row["message_type"] if row else "unknown"
+            print(f"{work_id} {message_type}")
+    finally:
+        conn.close()
+
+
+def listen_on_outbox_channel(bc_root: str, timeout: float = 5.0) -> list[str]:
+    """LISTEN on the outbox channel for bc_root and return received payloads.
+
+    Used by BDD test step definitions to verify that an outbox NOTIFY is fired.
+    Connects, LISTENs, waits up to `timeout` seconds for any notification,
+    and returns a list of payload strings received.
+
+    This is a test-support helper and not part of the production CLI surface.
+    """
+    from psycopg import sql
+
+    channel = _bc_outbox_slug(bc_root)
+    dsn = _get_dsn()
+    payloads: list[str] = []
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(
+            sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel))
+        )
+        for notify in conn.notifies(timeout=timeout):
+            payloads.append(notify.payload)
+            break  # return after first notification
+
+    return payloads
 
 
 def watch_inbox(bc_root: str) -> None:

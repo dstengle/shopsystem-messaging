@@ -45,10 +45,13 @@ from catalog.schemas import (
 )
 from shop_msg.storage import (
     _bc_id,
+    _bc_outbox_slug,
     _connect,
     delete_bc_messages,
     inbox_row_exists,
+    insert_message,
     insert_raw_payload,
+    listen_on_outbox_channel,
     outbox_row_exists,
     read_inbox_message,
     read_outbox_messages,
@@ -2407,3 +2410,256 @@ def stderr_contains_dsn_value(context: dict) -> None:
         f"expected stderr to contain the DSN value {dsn!r}; "
         f"stderr was:\n{stderr}"
     )
+
+
+# -----------------------------------------------------------------------
+# lead-mlq: Outbox NOTIFY and shop-msg watch --lead-root mode
+# -----------------------------------------------------------------------
+
+
+@given(
+    "a shop-msg watch --lead-root session is LISTEN-ing on the outbox channel for that BC"
+)
+def given_listen_on_outbox_channel(bc_root: Path, context: dict) -> None:
+    """Start a background thread that LISTENs on the outbox NOTIFY channel
+    for bc_root. The thread waits up to 10 seconds for a notification, then
+    records the payload and arrival time in context.
+
+    The thread is started before the respond call fires so we cannot miss
+    the NOTIFY even if it arrives very quickly.
+    """
+    import threading as _threading
+
+    payloads_received: list[str] = []
+    arrival_times: list[float] = []
+    listen_ready = _threading.Event()
+
+    def _listener():
+        # Use a direct psycopg connection so we can signal readiness after LISTEN.
+        import psycopg as _pg
+        from psycopg import sql as _sql
+
+        channel = _bc_outbox_slug(str(bc_root.resolve()))
+        dsn = os.environ.get("SHOPMSG_DSN", "host=/tmp/pgrun port=5433 dbname=shopsystem user=vscode")
+        with _pg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                _sql.SQL("LISTEN {channel}").format(channel=_sql.Identifier(channel))
+            )
+            listen_ready.set()  # signal that LISTEN is active
+            for notify in conn.notifies(timeout=10.0):
+                payloads_received.append(notify.payload)
+                arrival_times.append(time.monotonic())
+                break  # we only need the first notification
+
+    t = _threading.Thread(target=_listener, daemon=True)
+    t.start()
+    # Wait until the thread has issued LISTEN before proceeding.
+    assert listen_ready.wait(timeout=10.0), (
+        "LISTEN thread did not become ready within 10 seconds"
+    )
+    context["outbox_listen_thread"] = t
+    context["outbox_listen_payloads"] = payloads_received
+    context["outbox_listen_arrival_times"] = arrival_times
+
+
+@given(
+    parsers.parse(
+        'an inbox message with work-id "{work_id}" has been sent to that BC'
+    )
+)
+def given_inbox_message_sent_to_bc(bc_root: Path, work_id: str) -> None:
+    """Set up an inbox message for the BC so that respond work_done is valid."""
+    _shop_msg_send_inbox(bc_root, "request_maintenance", work_id)
+
+
+@when(
+    parsers.parse(
+        'shop-msg respond work_done is called for work-id "{work_id}" at that BC root'
+    )
+)
+def when_respond_work_done_at_bc_root(
+    bc_root: Path, work_id: str, context: dict
+) -> None:
+    """Call shop-msg respond work_done for the given work_id at bc_root."""
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc-root", str(bc_root),
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    context["respond_call_time"] = time.monotonic()
+
+
+@then(
+    parsers.parse(
+        'the LISTEN session receives a NOTIFY with payload "{expected_payload}" '
+        'on the outbox channel'
+    )
+)
+def then_listen_session_receives_notify(
+    context: dict, expected_payload: str
+) -> None:
+    """Assert that the background LISTEN thread received a NOTIFY with the expected payload."""
+    thread = context["outbox_listen_thread"]
+    payloads = context["outbox_listen_payloads"]
+    # Wait for the thread to receive the notification (up to 5 seconds).
+    thread.join(timeout=5.0)
+    assert payloads, (
+        f"expected the LISTEN thread to receive a NOTIFY with payload "
+        f"{expected_payload!r} on the outbox channel; no notification received"
+    )
+    assert expected_payload in payloads, (
+        f"expected NOTIFY payload {expected_payload!r}; got {payloads!r}"
+    )
+
+
+@then(
+    "the NOTIFY arrives within 3 seconds of the respond call"
+)
+def then_notify_arrives_within_3_seconds(context: dict) -> None:
+    """Assert that the NOTIFY arrival time was within 3 seconds of the respond call."""
+    arrival_times = context["outbox_listen_arrival_times"]
+    respond_call_time = context.get("respond_call_time")
+    assert respond_call_time is not None, (
+        "expected the respond call to have been recorded in context"
+    )
+    assert arrival_times, (
+        "expected at least one NOTIFY arrival time to be recorded"
+    )
+    elapsed = arrival_times[0] - respond_call_time
+    assert elapsed <= 3.0, (
+        f"expected NOTIFY to arrive within 3 seconds of the respond call; "
+        f"elapsed: {elapsed:.2f}s"
+    )
+
+
+@given(
+    "a lead root directory containing two empty BCs at temporary paths",
+    target_fixture="lead_root_with_bcs",
+)
+def given_lead_root_with_two_bcs(tmp_path: Path) -> dict:
+    """Create a lead root with two BC sub-directories under repos/."""
+    lead_root = tmp_path / "lead_root"
+    repos_dir = lead_root / "repos"
+    repos_dir.mkdir(parents=True)
+    bc_a = repos_dir / "bc-alpha"
+    bc_b = repos_dir / "bc-beta"
+    for bc in (bc_a, bc_b):
+        (bc / "inbox").mkdir(parents=True)
+        (bc / "outbox").mkdir()
+    return {
+        "lead_root": lead_root,
+        "bc_a": bc_a,
+        "bc_b": bc_b,
+    }
+
+
+@given(
+    "shop-msg watch --lead-root is running in the background and has completed its startup drain"
+)
+def given_watch_lead_root_running_after_drain(
+    lead_root_with_bcs: dict, context: dict
+) -> None:
+    """Start shop-msg watch --lead-root and wait for the READY sentinel."""
+    lead_root = lead_root_with_bcs["lead_root"]
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--lead-root", str(lead_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+    context["lead_root_with_bcs"] = lead_root_with_bcs
+
+
+@when(
+    parsers.parse(
+        'a shop-msg respond work_done message with work-id "{work_id}" is '
+        "inserted into the first BC's outbox"
+    )
+)
+def when_respond_work_done_into_first_bc_outbox(
+    context: dict, work_id: str
+) -> None:
+    """Insert a work_done respond into the first BC's outbox via the CLI."""
+    lead_root_with_bcs = context["lead_root_with_bcs"]
+    bc_a = lead_root_with_bcs["bc_a"]
+    # First insert an inbox message so respond work_done doesn't fail.
+    _shop_msg_send_inbox(bc_a, "request_maintenance", work_id)
+    # Now respond work_done.
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc-root", str(bc_a),
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@then(
+    parsers.parse(
+        "shop-msg watch --lead-root outputs exactly one line to stdout "
+        'for work_id "{work_id}"'
+    )
+)
+def then_watch_lead_root_outputs_one_line(context: dict, work_id: str) -> None:
+    """Assert that the --lead-root watch process emits exactly one line for work_id."""
+    proc = context["watch_proc"]
+    line = _read_next_watch_line(proc, timeout=10.0)
+    assert line is not None, (
+        f"expected shop-msg watch --lead-root to emit a line for work_id={work_id!r}; "
+        f"no line received within timeout"
+    )
+    assert work_id in line, (
+        f"expected line to contain work_id={work_id!r}; got: {line!r}"
+    )
+    context["watch_live_line"] = line
+
+
+@given(
+    "shop-msg watch --bc-root is running in the background and has completed its startup drain"
+)
+def given_watch_bc_root_running_after_drain(bc_root: Path, context: dict) -> None:
+    """Alias for the existing bc-root watch startup step (scenario b4083b5ff38638f7)."""
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+
+
+@then(
+    parsers.parse(
+        "shop-msg watch --bc-root outputs exactly one line to stdout "
+        'for work_id "{work_id}"'
+    )
+)
+def then_watch_bc_root_outputs_one_line(context: dict, work_id: str) -> None:
+    """Assert that the --bc-root watch process emits exactly one line for work_id."""
+    proc = context["watch_proc"]
+    line = _read_next_watch_line(proc, timeout=10.0)
+    assert line is not None, (
+        f"expected shop-msg watch --bc-root to emit a line for work_id={work_id!r}; "
+        f"no line received within timeout"
+    )
+    assert work_id in line, (
+        f"expected line to contain work_id={work_id!r}; got: {line!r}"
+    )
+    context["watch_live_line"] = line
