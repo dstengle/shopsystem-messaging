@@ -1641,6 +1641,52 @@ def given_prior_outbox_clarify_in_bc(
     )
 
 
+@given(
+    parsers.parse(
+        'shop-msg send request_bugfix was previously used inside "{bc}" to '
+        'write an inbox message with work-id "{work_id}"'
+    )
+)
+def given_prior_inbox_request_bugfix_in_bc(
+    lead_root: Path, bc: str, work_id: str
+) -> None:
+    bc_root = lead_root / "repos" / bc
+    subprocess.run(
+        [
+            "shop-msg", "send", "request_bugfix",
+            "--bc-root", str(bc_root),
+            "--work-id", work_id,
+            "--description", "pending-outbox-test setup payload",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'shop-msg send request_maintenance was previously used inside "{bc}" to '
+        'write an inbox message with work-id "{work_id}"'
+    )
+)
+def given_prior_inbox_request_maintenance_in_bc(
+    lead_root: Path, bc: str, work_id: str
+) -> None:
+    bc_root = lead_root / "repos" / bc
+    subprocess.run(
+        [
+            "shop-msg", "send", "request_maintenance",
+            "--bc-root", str(bc_root),
+            "--work-id", work_id,
+            "--description", "pending-outbox-test setup payload",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
 @when(
     "I run the shop-msg subcommand that enumerates pending unprocessed "
     "inbox messages, with no filter"
