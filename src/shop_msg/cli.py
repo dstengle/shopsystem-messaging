@@ -73,6 +73,11 @@ Subcommands:
         drains existing outbox rows on startup, emits a 'READY' sentinel line,
         then blocks on Postgres LISTEN for new outbox inserts across all BCs.
         Each NOTIFY produces one '<work_id> <message_type>' output line.
+    consume outbox --bc-root PATH --work-id ID --message-type TYPE
+        Lead-side consumption: marks a specific outbox row (identified by BC,
+        work_id, and message_type) as consumed so it no longer appears in
+        'pending outbox' output. Exits zero on success; exits non-zero with a
+        descriptive stderr message when no matching unconsumed outbox row exists.
 """
 from __future__ import annotations
 
@@ -98,6 +103,7 @@ from catalog.schemas import (
 )
 from shop_msg.storage import (
     CollisionError,
+    consume_outbox_message,
     delete_bc_messages,
     inbox_row_exists,
     insert_message,
@@ -490,6 +496,25 @@ def _cmd_pending_outbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_consume_outbox(args: argparse.Namespace) -> int:
+    """Mark a specific outbox row as consumed (lead side).
+
+    After consumption the row no longer appears in 'pending outbox' output.
+    Exits non-zero if no matching unconsumed outbox row exists.
+    """
+    bc_root = str(Path(args.bc_root).resolve())
+    found = consume_outbox_message(bc_root, args.work_id, args.message_type)
+    if not found:
+        print(
+            f"shop-msg consume outbox: no unconsumed outbox row found for "
+            f"work_id={args.work_id!r} message_type={args.message_type!r} "
+            f"in bc={bc_root!r}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _cmd_prime(args: argparse.Namespace) -> int:
     """Session-start orientation for BC agents.
 
@@ -825,6 +850,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="restrict to a single BC name (must match the directory under repos/)",
     )
     pending_outbox.set_defaults(func=_cmd_pending_outbox)
+
+    consume = sub.add_parser(
+        "consume",
+        help="mark a mailbox entry as consumed (lead side)",
+    )
+    consume_sub = consume.add_subparsers(dest="consume_target", required=True)
+
+    consume_outbox = consume_sub.add_parser(
+        "outbox",
+        help=(
+            "mark a specific outbox row as consumed so it no longer appears "
+            "in 'pending outbox' output"
+        ),
+    )
+    consume_outbox.add_argument(
+        "--bc-root",
+        required=True,
+        help="BC root directory whose outbox contains the row to consume",
+    )
+    consume_outbox.add_argument(
+        "--work-id",
+        required=True,
+        help="work_id of the outbox row to consume",
+    )
+    consume_outbox.add_argument(
+        "--message-type",
+        required=True,
+        choices=["clarify", "work_done", "mechanism_observation"],
+        help="message_type of the outbox row to consume",
+    )
+    consume_outbox.set_defaults(func=_cmd_consume_outbox)
 
     prime = sub.add_parser(
         "prime",

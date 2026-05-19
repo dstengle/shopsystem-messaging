@@ -94,10 +94,16 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 """
 
+_DDL_CONSUMED_COL = """
+ALTER TABLE messages
+  ADD COLUMN IF NOT EXISTS consumed BOOLEAN NOT NULL DEFAULT FALSE;
+"""
+
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(_DDL)
+        cur.execute(_DDL_CONSUMED_COL)
     conn.commit()
 
 
@@ -300,6 +306,7 @@ def query_pending_outbox(
                     SELECT work_id, message_type, bc
                     FROM messages
                     WHERE direction = 'outbox'
+                      AND consumed = FALSE
                       AND bc LIKE %s
                     ORDER BY created_at
                     """,
@@ -311,6 +318,7 @@ def query_pending_outbox(
                     SELECT work_id, message_type, bc
                     FROM messages
                     WHERE direction = 'outbox'
+                      AND consumed = FALSE
                     ORDER BY bc, created_at
                     """,
                 )
@@ -409,6 +417,31 @@ def inbox_row_exists(bc_root: str, work_id: str) -> bool:
                 (bc, work_id),
             )
             return cur.fetchone() is not None
+
+
+def consume_outbox_message(bc_root: str, work_id: str, message_type: str) -> bool:
+    """Mark a specific outbox row as consumed so it no longer appears in pending output.
+
+    Returns True if the row was found and marked consumed, False if no matching
+    unconsumed outbox row exists. Does not raise on missing rows; the CLI layer
+    translates False into a non-zero exit with a descriptive error.
+    """
+    bc = _bc_id(bc_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE messages
+                SET consumed = TRUE
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'outbox' AND message_type = %s
+                  AND consumed = FALSE
+                """,
+                (bc, work_id, message_type),
+            )
+            rows_affected = cur.rowcount
+        conn.commit()
+    return rows_affected > 0
 
 
 def delete_bc_messages(bc_root: str) -> None:

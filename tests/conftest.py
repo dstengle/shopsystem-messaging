@@ -47,6 +47,7 @@ from shop_msg.storage import (
     _bc_id,
     _bc_outbox_slug,
     _connect,
+    consume_outbox_message,
     delete_bc_messages,
     inbox_row_exists,
     insert_message,
@@ -2627,6 +2628,219 @@ def then_watch_lead_root_outputs_one_line(context: dict, work_id: str) -> None:
         f"expected line to contain work_id={work_id!r}; got: {line!r}"
     )
     context["watch_live_line"] = line
+
+
+# -----------------------------------------------------------------------
+# lead-38w: shop-msg consume outbox
+# -----------------------------------------------------------------------
+
+
+@given(
+    parsers.parse(
+        'a lead shop at a temporary path with BC clone "{bc_a}" present as a sibling directory'
+    ),
+    target_fixture="lead_root",
+)
+def given_lead_shop_with_one_bc(tmp_path: Path, bc_a: str) -> Path:
+    """Lead-side layout with a single BC under repos/."""
+    lead_root = tmp_path / "lead"
+    repos = lead_root / "repos"
+    repos.mkdir(parents=True)
+    bc = repos / bc_a
+    (bc / "inbox").mkdir(parents=True)
+    (bc / "outbox").mkdir()
+    return lead_root
+
+
+@given(
+    parsers.parse(
+        'no outbox message exists for work-id "{work_id}" in "{bc}"'
+    )
+)
+def given_no_outbox_message(lead_root: Path, work_id: str, bc: str) -> None:
+    """Assert (and ensure) that no outbox row exists for the given work_id in bc."""
+    bc_root = lead_root / "repos" / bc
+    bc_root_str = str(bc_root.resolve())
+    bc_id = _bc_id(bc_root_str)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'outbox'
+                """,
+                (bc_id, work_id),
+            )
+        conn.commit()
+
+
+@given(
+    parsers.parse(
+        'shop-msg consume outbox has been run with --bc-root pointing at "{bc}", '
+        '--work-id "{work_id}", and --message-type "{message_type}"'
+    )
+)
+def given_consume_outbox_already_run(
+    lead_root: Path, bc: str, work_id: str, message_type: str
+) -> None:
+    """Pre-condition: consume the specified outbox row (already ran before the When step)."""
+    bc_root = lead_root / "repos" / bc
+    result = subprocess.run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc-root", str(bc_root),
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg consume outbox with --bc-root pointing at "{bc}", '
+        '--work-id "{work_id}", and --message-type "{message_type}"'
+    )
+)
+def run_consume_outbox(
+    lead_root: Path, bc: str, work_id: str, message_type: str, context: dict
+) -> None:
+    bc_root = lead_root / "repos" / bc
+    result = subprocess.run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc-root", str(bc_root),
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@when(
+    "I run the shop-msg subcommand that enumerates pending unprocessed outbox responses, with no filter"
+)
+def run_pending_outbox_no_filter(lead_root: Path, context: dict) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead-root", str(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    parsers.parse(
+        'running shop-msg pending outbox --lead-root at the lead path '
+        'contains no entry for work_id "{work_id}"'
+    )
+)
+def pending_outbox_contains_no_entry_for_work_id(
+    lead_root: Path, work_id: str
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead-root", str(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    for line in lines:
+        tokens = line.split()
+        assert work_id not in tokens, (
+            f"expected no pending outbox entry for work_id={work_id!r}; "
+            f"found line: {line!r}"
+        )
+
+
+@then(
+    parsers.re(
+        r'running shop-msg pending outbox --lead-root at the lead path '
+        r'includes an entry for work_id "(?P<work_id>[^"]*)" with message_type '
+        r'"(?P<message_type>[^"]*)" originating from BC "(?P<bc>[^"]*)"'
+    )
+)
+def pending_outbox_includes_entry(
+    lead_root: Path, work_id: str, message_type: str, bc: str
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead-root", str(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    for line in lines:
+        tokens = line.split()
+        if work_id in tokens and message_type in tokens and bc in tokens:
+            return
+    raise AssertionError(
+        f"expected pending outbox to include work_id={work_id!r} "
+        f"message_type={message_type!r} bc={bc!r}; lines:\n{lines}"
+    )
+
+
+@then(
+    parsers.re(
+        r'running shop-msg pending outbox --lead-root at the lead path '
+        r'contains no entry for work_id "(?P<work_id>[^"]*)" with message_type '
+        r'"(?P<message_type>[^"]*)"'
+    )
+)
+def pending_outbox_contains_no_entry_for_work_id_and_type(
+    lead_root: Path, work_id: str, message_type: str
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead-root", str(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    for line in lines:
+        tokens = line.split()
+        if work_id in tokens and message_type in tokens:
+            raise AssertionError(
+                f"expected no pending outbox entry for work_id={work_id!r} "
+                f"message_type={message_type!r}; found line: {line!r}"
+            )
+
+
+@then(
+    parsers.re(
+        r'stderr includes work_id "(?P<work_id>[^"]*)" and message_type "(?P<message_type>[^"]*)"'
+    )
+)
+def stderr_includes_work_id_and_message_type(
+    context: dict, work_id: str, message_type: str
+) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert work_id in stderr, (
+        f"expected stderr to contain work_id={work_id!r}; stderr:\n{stderr}"
+    )
+    assert message_type in stderr, (
+        f"expected stderr to contain message_type={message_type!r}; stderr:\n{stderr}"
+    )
 
 
 @given(
