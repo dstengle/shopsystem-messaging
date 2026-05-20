@@ -106,19 +106,24 @@ from shop_msg.storage import (
     consume_outbox_message,
     delete_bc_messages,
     inbox_row_exists,
+    insert_bc_response,
     insert_message,
     insert_raw_payload,
     outbox_row_exists,
     query_pending_inbox,
+    query_pending_lead_inbox,
     query_pending_outbox,
     read_inbox_message,
+    read_lead_inbox_message,
     read_outbox_messages,
     registry_add,
     registry_list,
     registry_remove,
     registry_sync,
+    resolve_lead_shop,
     resolve_shop_name,
     watch_inbox,
+    watch_lead_inbox,
     watch_outbox_for_lead,
 )
 
@@ -194,6 +199,17 @@ def _resolve_lead(args: argparse.Namespace) -> str:
     return str(Path(path).resolve())
 
 
+def _resolve_registered_lead() -> str | None:
+    """Return the shop_root for the registered lead shop, or None.
+
+    Used by ``respond`` commands to route responses to the lead's inbox.
+    """
+    path = resolve_lead_shop()
+    if path is None:
+        return None
+    return str(Path(path).resolve())
+
+
 def _compute_scenario_hash(gherkin_body: str) -> str:
     """Shell out to `scenarios hash` to canonicalize and hash a scenario body.
 
@@ -228,6 +244,15 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
         )
         return 1
 
+    lead_root = _resolve_registered_lead()
+    if lead_root is None:
+        print(
+            "shop-msg respond clarify: no lead shop is registered in the registry. "
+            "Run 'shop-msg registry add --lead-shop' to register the lead first.",
+            file=sys.stderr,
+        )
+        return 1
+
     message = Clarify(
         message_type="clarify",
         work_id=args.work_id,
@@ -235,18 +260,17 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
     )
 
     try:
-        insert_message(
+        insert_bc_response(
+            lead_root,
             bc_root,
             args.work_id,
-            "outbox",
             "clarify",
             message.model_dump(),
-            notify=True,
         )
     except CollisionError:
         print(
-            f"shop-msg respond clarify: refusing to overwrite existing outbox "
-            f"entry for work_id={args.work_id!r}",
+            f"shop-msg respond clarify: refusing to overwrite existing response "
+            f"for work_id={args.work_id!r}",
             file=sys.stderr,
         )
         return 1
@@ -255,6 +279,15 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
 
 def _cmd_respond_work_done(args: argparse.Namespace) -> int:
     bc_root = _resolve_bc(args)
+
+    lead_root = _resolve_registered_lead()
+    if lead_root is None:
+        print(
+            "shop-msg respond work_done: no lead shop is registered in the registry. "
+            "Run 'shop-msg registry add --lead-shop' to register the lead first.",
+            file=sys.stderr,
+        )
+        return 1
 
     message = WorkDone(
         message_type="work_done",
@@ -265,18 +298,17 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
     )
 
     try:
-        insert_message(
+        insert_bc_response(
+            lead_root,
             bc_root,
             args.work_id,
-            "outbox",
             "work_done",
             message.model_dump(),
-            notify=True,
         )
     except CollisionError:
         print(
-            f"shop-msg respond work_done: refusing to overwrite existing outbox "
-            f"entry for work_id={args.work_id!r}",
+            f"shop-msg respond work_done: refusing to overwrite existing response "
+            f"for work_id={args.work_id!r}",
             file=sys.stderr,
         )
         return 1
@@ -286,11 +318,20 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
 def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
     bc_root = _resolve_bc(args)
 
-    # Path-safety: refuse work_ids that would escape the outbox dir.
+    # Path-safety: refuse work_ids that would escape safe naming.
     if "/" in args.work_id or ".." in args.work_id or not args.work_id:
         print(
             f"shop-msg respond mechanism_observation: refusing unsafe "
             f"work_id {args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    lead_root = _resolve_registered_lead()
+    if lead_root is None:
+        print(
+            "shop-msg respond mechanism_observation: no lead shop is registered "
+            "in the registry. Run 'shop-msg registry add --lead-shop' first.",
             file=sys.stderr,
         )
         return 1
@@ -306,18 +347,17 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
     )
 
     try:
-        insert_message(
+        insert_bc_response(
+            lead_root,
             bc_root,
             args.work_id,
-            "outbox",
             "mechanism_observation",
             message.model_dump(exclude_none=True),
-            notify=True,
         )
     except CollisionError:
         print(
             f"shop-msg respond mechanism_observation: refusing to overwrite "
-            f"existing outbox entry for work_id={args.work_id!r}",
+            f"existing response for work_id={args.work_id!r}",
             file=sys.stderr,
         )
         return 1
@@ -556,6 +596,51 @@ def _cmd_pending_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pending_lead_inbox(args: argparse.Namespace) -> int:
+    """Enumerate BC responses in the lead's inbox.
+
+    Lead-side counterpart to ``pending inbox --bc``.  Queries Postgres for
+    inbox rows stored under the lead's namespace — these are BC responses
+    that arrived via ``shop-msg respond`` under the new routing model
+    (Brief-006 scope C / lead-e9x).
+    """
+    lead_root = _resolve_lead(args)
+    rows = query_pending_lead_inbox(lead_root)
+    for work_id, message_type in rows:
+        print(f"{work_id} {message_type}")
+    return 0
+
+
+def _cmd_read_lead_inbox(args: argparse.Namespace) -> int:
+    """Read and validate a BC response from the lead's inbox.
+
+    Lead-side counterpart to ``read inbox --bc``.  Reads the row stored
+    under the lead's namespace for the given work_id and validates it
+    against the BCResponse schema union.
+    """
+    lead_root = _resolve_lead(args)
+    raw = read_lead_inbox_message(lead_root, args.work_id)
+    if raw is None:
+        print(
+            f"shop-msg read inbox: no inbox message found for "
+            f"work_id={args.work_id!r} in lead={lead_root!r}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        message = _response_adapter.validate_python(raw)
+    except ValidationError as e:
+        print(
+            f"shop-msg read inbox: validation failed for "
+            f"work_id={args.work_id!r}:\n{e}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"valid {message.message_type} from {args.work_id}:")
+    print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
+    return 0
+
+
 def _cmd_pending_outbox(args: argparse.Namespace) -> int:
     """Enumerate pending outbox responses across sibling BC clones.
 
@@ -703,7 +788,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     try:
         if hasattr(args, "lead") and args.lead is not None:
             lead_root = _resolve_lead(args)
-            watch_outbox_for_lead(lead_root)
+            watch_lead_inbox(lead_root)
             return 0
 
         bc_root = _resolve_bc(args)
@@ -933,14 +1018,30 @@ def build_parser() -> argparse.ArgumentParser:
     read_outbox.set_defaults(func=_cmd_read_outbox)
 
     read_inbox = read_sub.add_parser(
-        "inbox", help="read and validate a lead message from a BC's inbox"
+        "inbox",
+        help=(
+            "read and validate a message from a BC's inbox (--bc) "
+            "or a BC response from the lead's inbox (--lead)"
+        ),
     )
-    read_inbox.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _read_inbox_mode = read_inbox.add_mutually_exclusive_group(required=True)
+    _read_inbox_mode.add_argument(
+        "--bc", default=None, help="canonical BC name (BC-side inbox mode)"
+    )
+    _read_inbox_mode.add_argument(
+        "--lead", default=None, help="canonical lead shop name (lead-side inbox mode)"
+    )
     _add_removed_flag(read_inbox, "--bc-root")
     read_inbox.add_argument(
         "--work-id", required=True, help="work_id whose inbox message to read"
     )
-    read_inbox.set_defaults(func=_cmd_read_inbox)
+
+    def _dispatch_read_inbox(args: argparse.Namespace) -> int:
+        if args.lead is not None:
+            return _cmd_read_lead_inbox(args)
+        return _cmd_read_inbox(args)
+
+    read_inbox.set_defaults(func=_dispatch_read_inbox)
 
     pending = sub.add_parser(
         "pending", help="enumerate pending mailbox entries (queries, not gates)"
@@ -949,11 +1050,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     pending_inbox = pending_sub.add_parser(
         "inbox",
-        help="list inbox messages with no matching outbox response (BC side)",
+        help=(
+            "list inbox messages with no matching outbox response (BC side: --bc); "
+            "or list BC responses in the lead's inbox (lead side: --lead)"
+        ),
     )
-    pending_inbox.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _pending_inbox_mode = pending_inbox.add_mutually_exclusive_group(required=True)
+    _pending_inbox_mode.add_argument(
+        "--bc", default=None, help="canonical BC name (BC-side inbox mode)"
+    )
+    _pending_inbox_mode.add_argument(
+        "--lead", default=None, help="canonical lead shop name (lead-side inbox mode)"
+    )
     _add_removed_flag(pending_inbox, "--bc-root")
-    pending_inbox.set_defaults(func=_cmd_pending_inbox)
+
+    def _dispatch_pending_inbox(args: argparse.Namespace) -> int:
+        if args.lead is not None:
+            return _cmd_pending_lead_inbox(args)
+        return _cmd_pending_inbox(args)
+
+    pending_inbox.set_defaults(func=_dispatch_pending_inbox)
 
     pending_outbox = pending_sub.add_parser(
         "outbox",

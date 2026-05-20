@@ -1,8 +1,6 @@
-Feature: shop-msg respond — write a clarify outbox YAML
+Feature: shop-msg respond — write a clarify response to the lead inbox
 
-  @scenario_hash:b9ed9c63b8ccb208 @bc:shop-msg
-  Scenario: Reply to lead with a clarify message
-    Given an empty BC at a temporary path
-    When I run shop-msg respond clarify with work-id "lead-001" and question "What about equality?"
-    Then the BC's outbox contains a file named "lead-001-clarify.yaml"
-    And the file parses as a valid Clarify with work_id "lead-001" and question "What about equality?"
+  # Scenario b9ed9c63b8ccb208 ("Reply to lead with a clarify message") previously
+  # asserted BC outbox write.  Under lead-e9x, clarify responses are routed to
+  # the lead's inbox.  That scenario (hash b9ed9c63b8ccb208) is deleted here.
+  # See features/respond_routes_to_lead_inbox.feature for AC1/AC2/AC3 pinning.

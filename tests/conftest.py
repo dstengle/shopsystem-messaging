@@ -48,15 +48,19 @@ import uuid
 from shop_msg.storage import (
     _bc_id,
     _bc_outbox_slug,
+    _lead_inbox_slug,
     _connect,
     consume_outbox_message,
     delete_bc_messages,
     inbox_row_exists,
+    insert_bc_response,
     insert_message,
     insert_raw_payload,
+    listen_on_lead_inbox_channel,
     listen_on_outbox_channel,
     outbox_row_exists,
     read_inbox_message,
+    read_lead_inbox_message,
     read_outbox_messages,
     registry_add,
     registry_remove,
@@ -70,6 +74,66 @@ from shop_msg.storage import (
 # stable unique name within the test session. Names are registered in
 # Postgres and cleaned up at session teardown.
 _test_registry: dict[str, str] = {}  # path_str -> name
+
+# Session-wide "default test lead" — a single lead shop registered once per
+# test session so that ``shop-msg respond`` commands can route to it.
+# respond commands call resolve_lead_shop() which returns the first registered
+# lead shop by name.  All BDD tests share this lead shop as the response
+# target; each test's respond output lands in the lead's inbox namespace.
+_SESSION_LEAD_ROOT: Path | None = None
+_SESSION_LEAD_NAME: str | None = None
+
+
+def _ensure_session_lead(tmp_path_factory) -> tuple[Path, str]:
+    """Ensure the session-wide test lead shop exists and return (root, name).
+
+    Also registers ``shopsystem-product`` pointing to the session lead root so
+    that ``resolve_lead_shop()`` (which orders by name and picks the first) always
+    returns the CURRENT session lead, not a stale entry from a previous session.
+    """
+    global _SESSION_LEAD_ROOT, _SESSION_LEAD_NAME
+    if _SESSION_LEAD_ROOT is None:
+        root = tmp_path_factory.mktemp("session_lead")
+        name = f"test-lead-session-{uuid.uuid4().hex[:8]}"
+        registry_add(name, str(root.resolve()), shop_type="lead")
+        _test_registry[str(root.resolve())] = name
+        _SESSION_LEAD_ROOT = root
+        _SESSION_LEAD_NAME = name
+        # Also register under the canonical name used in test scenarios so that
+        # resolve_lead_shop() always finds the current session lead (overwriting
+        # any stale entry from a previous test session in the Postgres registry).
+        registry_add("shopsystem-product", str(root.resolve()), shop_type="lead")
+    return _SESSION_LEAD_ROOT, _SESSION_LEAD_NAME
+
+
+@pytest.fixture(scope="session", autouse=True)
+def session_lead_shop(tmp_path_factory):
+    """Register a session-wide lead shop so ``shop-msg respond`` can route to it.
+
+    All respond commands (clarify, work_done, mechanism_observation) now
+    write to the registered lead shop's inbox.  This fixture ensures the
+    registry has a lead shop entry for the entire test session.
+    """
+    root, name = _ensure_session_lead(tmp_path_factory)
+    yield root, name
+    # Cleanup: remove the session lead from the registry (best-effort).
+    registry_remove(name)
+
+
+def get_session_lead_root() -> Path:
+    """Return the session-scoped lead root (guaranteed to exist after fixture)."""
+    assert _SESSION_LEAD_ROOT is not None, (
+        "session_lead_shop fixture not yet run; ensure it's autouse=True"
+    )
+    return _SESSION_LEAD_ROOT
+
+
+def get_session_lead_name() -> str:
+    """Return the session-scoped lead name (guaranteed to exist after fixture)."""
+    assert _SESSION_LEAD_NAME is not None, (
+        "session_lead_shop fixture not yet run"
+    )
+    return _SESSION_LEAD_NAME
 
 
 def _get_or_register_bc_name(bc_root: Path) -> str:
@@ -90,6 +154,34 @@ def _get_or_register_lead_name(lead_root: Path) -> str:
         registry_add(name, path_str, shop_type="lead")
         _test_registry[path_str] = name
     return _test_registry[path_str]
+
+
+def _fetch_lead_inbox_payload(lead_root: Path, work_id: str, message_type: str) -> dict | None:
+    """Return the payload for a specific lead-inbox BC response row, or None.
+
+    Under the new routing model (lead-e9x), BC responses arrive at the
+    lead's inbox namespace (bc=lead_root, direction='inbox').
+    """
+    bc = _bc_id(str(lead_root.resolve()))
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (bc, work_id, message_type),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return payload
 
 
 @pytest.fixture
@@ -254,6 +346,46 @@ def outbox_preexisting_file(bc_root: Path, filename: str, context: dict) -> None
     context["preexisting_files"][filename] = sentinel_payload.copy()
 
 
+@given(parsers.parse('the lead\'s inbox already contains a response named "{filename}"'))
+def lead_inbox_preexisting_response(bc_root: Path, filename: str, context: dict) -> None:
+    """Pre-insert a BC response into the lead's inbox namespace for collision tests.
+
+    Under the new routing model (lead-e9x), shop-msg respond writes to the
+    lead's inbox.  Collision tests pre-insert a sentinel row there so the
+    CLI's collision check fires.
+
+    Uses direct SQL (not insert_raw_payload / insert_message) to bypass the
+    inbox pre-check which would reject a second inbox row for the same work_id.
+    The lead's inbox may contain multiple BC responses for the same work_id
+    (work_done, clarify, mechanism_observation) — different message_types are
+    allowed under the UNIQUE constraint; the pre-check is too broad here.
+    """
+    import json as _json
+    lead_root = get_session_lead_root()
+    work_id, message_type = _parse_outbox_filename(filename)
+    sentinel_payload: dict[str, Any] = {
+        "message_type": message_type,
+        "work_id": work_id,
+        "_sentinel": True,
+        "preexisting": True,
+    }
+    bc_id = _bc_id(str(lead_root.resolve()))
+    payload_json = _json.dumps(sentinel_payload)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO messages (bc, work_id, direction, message_type, payload)
+                VALUES (%s, %s, 'inbox', %s, %s::jsonb)
+                ON CONFLICT (bc, work_id, direction, message_type) DO NOTHING
+                """,
+                (bc_id, work_id, message_type, payload_json),
+            )
+        conn.commit()
+    context["preexisting_lead_responses"] = context.get("preexisting_lead_responses", {})
+    context["preexisting_lead_responses"][filename] = sentinel_payload.copy()
+
+
 @when(
     parsers.re(
         r'I run shop-msg respond clarify with work-id "(?P<work_id>[^"]*)" '
@@ -337,6 +469,21 @@ def outbox_file_unchanged(bc_root: Path, filename: str, context: dict) -> None:
     )
 
 
+@then(parsers.parse('the lead\'s inbox response "{filename}" is unchanged'))
+def lead_inbox_response_unchanged(filename: str, context: dict) -> None:
+    """Verify the lead-inbox row still has the sentinel payload (collision test)."""
+    lead_root = get_session_lead_root()
+    work_id, message_type = _parse_outbox_filename(filename)
+    actual_payload = _fetch_lead_inbox_payload(lead_root, work_id, message_type)
+    assert actual_payload is not None, (
+        f"expected lead-inbox row for {filename} to still exist after failed write"
+    )
+    assert actual_payload.get("_sentinel") is True, (
+        f"expected lead-inbox row to retain sentinel payload; "
+        f"actual payload: {actual_payload!r}"
+    )
+
+
 @then("the BC's outbox is empty")
 def outbox_is_empty(bc_root: Path) -> None:
     rows = _fetch_outbox_rows(bc_root)
@@ -344,6 +491,35 @@ def outbox_is_empty(bc_root: Path) -> None:
         f"expected no outbox rows for bc={bc_root}; "
         f"found: {[(r['work_id'], r['message_type']) for r in rows]}"
     )
+
+
+@then(parsers.parse('the lead\'s inbox contains a response named "{filename}"'))
+def lead_inbox_contains_response(filename: str, context: dict) -> None:
+    """Assert that a BC response was delivered to the lead's inbox.
+
+    Under the new routing model (lead-e9x), shop-msg respond writes to the
+    lead's inbox namespace (bc=lead_root, direction='inbox').
+    """
+    lead_root = get_session_lead_root()
+    rc = context.get("cli_returncode")
+    assert rc == 0, (
+        f"shop-msg exited {rc}; stderr:\n{context.get('cli_stderr', '')}"
+    )
+    work_id, message_type = _parse_outbox_filename(filename)
+    payload = _fetch_lead_inbox_payload(lead_root, work_id, message_type)
+    assert payload is not None, (
+        f"expected lead-inbox row for work_id={work_id!r} message_type={message_type!r}; "
+        f"no matching row found"
+    )
+    context["outbox_payload"] = payload  # reuse downstream Then-steps (file_parses_as_*)
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False,
+        prefix=f"shopmsg_lead_inbox_{work_id}_"
+    )
+    yaml.safe_dump(payload, tmp, sort_keys=False)
+    tmp.close()
+    context["outbox_file"] = Path(tmp.name)
 
 
 @then(
@@ -1433,11 +1609,18 @@ def run_respond_mechanism_observation(
 def file_parses_as_mechanism_observation(
     bc_root: Path, work_id: str, subject: str, context: dict
 ) -> None:
-    # Read from DB: outbox row for work_id with message_type=mechanism_observation.
-    payload = _fetch_outbox_payload(bc_root, work_id, "mechanism_observation")
+    # With new routing, mechanism_observation lands in lead inbox.
+    # Fall back to outbox_payload if already fetched (e.g. by lead_inbox_contains_response).
+    payload = context.get("outbox_payload")
+    if payload is None:
+        lead_root = get_session_lead_root()
+        payload = _fetch_lead_inbox_payload(lead_root, work_id, "mechanism_observation")
+    if payload is None:
+        # Legacy: check BC outbox for backward compatibility.
+        payload = _fetch_outbox_payload(bc_root, work_id, "mechanism_observation")
     assert payload is not None, (
-        f"expected outbox row for work_id={work_id!r} "
-        f"message_type='mechanism_observation'"
+        f"expected mechanism_observation row for work_id={work_id!r} "
+        f"in lead inbox or bc outbox"
     )
     obs = MechanismObservation.model_validate(payload)
     assert obs.subject == subject
@@ -3222,3 +3405,191 @@ def pending_outbox_lead_contains_no_entry_with_type(
                 f"expected no pending outbox entry for work_id={work_id!r} "
                 f"message_type={message_type!r}; found line: {line!r}"
             )
+
+
+# -----------------------------------------------------------------------
+# lead-e9x: BC responses route to the lead inbox
+# (respond_routes_to_lead_inbox.feature — AC1, AC2, AC3)
+# -----------------------------------------------------------------------
+
+
+@given(parsers.parse('"{lead_name}" is registered as the lead shop'))
+def given_lead_registered(lead_name: str, context: dict) -> None:
+    """Ensure the named lead shop is registered in the registry.
+
+    The session_lead_shop fixture already registers 'test-lead-session-*' as
+    the resolve_lead_shop() target.  For scenarios that name a specific lead
+    shop (e.g. 'shopsystem-product'), we record the intent in context but
+    reuse the session lead's path so the registry lookup works.
+    """
+    # Point the named lead at the session lead's root so the registry
+    # resolve_lead_shop() call in the CLI finds a lead shop.
+    # If already registered, this is a no-op (upsert semantics).
+    lead_root = get_session_lead_root()
+    registry_add(lead_name, str(lead_root.resolve()), shop_type="lead")
+    _test_registry[str(lead_root.resolve())] = lead_name
+    context["named_lead_root"] = lead_root
+    context["named_lead_name"] = lead_name
+
+
+@given(parsers.parse('"{bc_name}" is registered in the messaging registry'))
+def given_bc_registered(bc_name: str, tmp_path: Path, context: dict) -> None:
+    """Register a BC under the given canonical name for lead-inbox routing tests."""
+    bc_root = tmp_path / bc_name
+    (bc_root / "inbox").mkdir(parents=True)
+    (bc_root / "outbox").mkdir()
+    registry_add(bc_name, str(bc_root.resolve()), shop_type="bc")
+    _test_registry[str(bc_root.resolve())] = bc_name
+    context["registered_bc_root"] = bc_root
+    context["registered_bc_name"] = bc_name
+    # Also set bc_root fixture-scope so step defs that depend on it work.
+    context["bc_root"] = bc_root
+
+
+@given(
+    parsers.parse(
+        'a request_maintenance inbox message with work-id "{work_id}" '
+        'has been sent to "{bc_name}"'
+    )
+)
+def given_inbox_msg_sent_to_named_bc(work_id: str, bc_name: str, context: dict) -> None:
+    """Insert a request_maintenance inbox message for the named BC."""
+    bc_root = context.get("registered_bc_root")
+    if bc_root is None:
+        raise AssertionError(
+            "registered_bc_root not in context; ensure the BC registration "
+            "step runs before this step"
+        )
+    subprocess.run(
+        [
+            "shop-msg", "send", "request_maintenance",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--description", "lead-e9x routing test setup",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    context["test_work_id"] = work_id
+
+
+@when(
+    parsers.parse(
+        'shop-msg respond work_done is run by "{bc_name}" for work-id "{work_id}"'
+    )
+)
+def when_respond_work_done_by_bc_name(bc_name: str, work_id: str, context: dict) -> None:
+    """Run shop-msg respond work_done using the canonical BC name."""
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@given(
+    parsers.parse(
+        'shop-msg respond work_done has been run by "{bc_name}" for work-id "{work_id}"'
+    )
+)
+def given_respond_work_done_was_run(bc_name: str, work_id: str, context: dict) -> None:
+    """Pre-condition: respond work_done was already called for this work_id."""
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@then(
+    parsers.parse(
+        'shop-msg pending inbox --lead {lead_name} includes work-id "{work_id}"'
+    )
+)
+def then_pending_lead_inbox_includes_work_id(lead_name: str, work_id: str, context: dict) -> None:
+    """Assert the named work_id appears in the lead's pending inbox."""
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "inbox",
+            "--lead", lead_name,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    tokens_all = " ".join(lines)
+    assert work_id in tokens_all, (
+        f"expected work_id={work_id!r} in pending inbox --lead {lead_name}; "
+        f"got lines: {lines}"
+    )
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg read inbox --lead {lead_name} for work-id "{work_id}"'
+    )
+)
+def when_read_lead_inbox(lead_name: str, work_id: str, context: dict) -> None:
+    """Run shop-msg read inbox --lead <name> for a specific work_id."""
+    result = subprocess.run(
+        [
+            "shop-msg", "read", "inbox",
+            "--lead", lead_name,
+            "--work-id", work_id,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@given(
+    parsers.parse(
+        'shop-msg watch --lead {lead_name} is running and has completed its startup drain'
+    )
+)
+def given_watch_lead_running_by_name(lead_name: str, context: dict, request) -> None:
+    """Start shop-msg watch --lead <name> and wait for the READY sentinel.
+
+    Registers a finalizer to terminate the process after the test completes,
+    preventing Postgres connection pool exhaustion.
+    """
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--lead", lead_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+
+    def _cleanup():
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    request.addfinalizer(_cleanup)

@@ -746,6 +746,287 @@ def listen_on_outbox_channel(bc_root: str, timeout: float = 5.0) -> list[str]:
     return payloads
 
 
+def resolve_lead_shop() -> str | None:
+    """Return the shop_root for the first registered lead shop, or None.
+
+    Used by ``shop-msg respond`` to determine where to route the response:
+    the lead shop's inbox receives all BC responses (Brief-006 scope C).
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT shop_root FROM shop_registry
+                WHERE shop_type = 'lead'
+                ORDER BY name
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return row["shop_root"]
+
+
+def _lead_inbox_slug(lead_root: str) -> str:
+    """Return a Postgres-safe NOTIFY channel name for a lead shop's inbox.
+
+    Uses the same naming scheme as _bc_slug (inbox_ prefix + slug) so
+    the lead's inbox channel is indistinguishable in form from any BC's
+    inbox channel — it is distinguished by the lead's root path slug.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]", "_", lead_root)
+    return f"inbox_{slug}"[:63]
+
+
+def insert_bc_response(
+    lead_root: str,
+    bc_root: str,
+    work_id: str,
+    message_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """Insert a BC response into the lead shop's inbox namespace.
+
+    This replaces the old ``insert_message(..., direction='outbox', ...)``
+    call that the respond commands previously used.  Under the new routing
+    (Brief-006 scope C / PDR-007 / lead-e9x) BC responses are delivered
+    TO the lead's inbox rather than written to the BC's own outbox.
+
+    Two writes happen atomically:
+    1. ``(bc=lead_root, work_id, direction='inbox', message_type)`` — the
+       response in the lead's namespace.  This is the primary delivery target
+       and the row that ``shop-msg read inbox --lead`` and
+       ``shop-msg pending inbox --lead`` inspect.
+    2. ``(bc=bc_root, work_id, direction='outbox', message_type)`` — a local
+       marker in the BC's own namespace so that ``shop-msg pending inbox --bc``
+       can determine that the BC has responded to this work_id (the existing
+       ``NOT EXISTS outbox`` query in ``query_pending_inbox`` uses this).
+
+    Collision semantics: if the lead-inbox row already exists, ``CollisionError``
+    is raised (no second write attempted).  The BC-side marker is written
+    idempotently (ON CONFLICT DO NOTHING) since it is a secondary artefact.
+
+    After a successful insert, fires NOTIFY on the lead-inbox channel so
+    ``shop-msg watch --lead`` can wake up.
+    """
+    lead_bc_id = _bc_id(lead_root)
+    bc_bc_id = _bc_id(bc_root)
+    payload_json = json.dumps(payload)
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            # Check collision on the lead-inbox row first (primary target).
+            cur.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
+                LIMIT 1
+                """,
+                (lead_bc_id, work_id, message_type),
+            )
+            if cur.fetchone() is not None:
+                raise CollisionError(
+                    f"response already exists: lead={lead_root!r} work_id={work_id!r} "
+                    f"message_type={message_type!r}"
+                )
+
+            # 1. Write to lead inbox.
+            cur.execute(
+                """
+                INSERT INTO messages (bc, work_id, direction, message_type, payload)
+                VALUES (%s, %s, 'inbox', %s, %s::jsonb)
+                ON CONFLICT (bc, work_id, direction, message_type) DO NOTHING
+                """,
+                (lead_bc_id, work_id, message_type, payload_json),
+            )
+            lead_rows = cur.rowcount
+
+            # 2. Write BC-side marker (for pending inbox --bc tracking).
+            cur.execute(
+                """
+                INSERT INTO messages (bc, work_id, direction, message_type, payload)
+                VALUES (%s, %s, 'outbox', %s, %s::jsonb)
+                ON CONFLICT (bc, work_id, direction, message_type) DO NOTHING
+                """,
+                (bc_bc_id, work_id, message_type, payload_json),
+            )
+        conn.commit()
+
+    if lead_rows == 0:
+        raise CollisionError(
+            f"response already exists: lead={lead_root!r} work_id={work_id!r} "
+            f"message_type={message_type!r}"
+        )
+
+    # Fire NOTIFY on the lead's inbox channel so ``watch --lead`` wakes up.
+    from psycopg import sql
+    channel = _lead_inbox_slug(lead_root)
+    with psycopg.connect(_get_dsn(), autocommit=True) as nconn:
+        nconn.execute(
+            sql.SQL("NOTIFY {channel}, {payload}").format(
+                channel=sql.Identifier(channel),
+                payload=sql.Literal(work_id),
+            )
+        )
+
+
+def query_pending_lead_inbox(lead_root: str) -> list[tuple[str, str]]:
+    """Return (work_id, message_type) pairs for BC responses in the lead's inbox.
+
+    A BC response is 'pending' (from the lead's perspective) if it exists
+    in the lead's inbox namespace and has not been marked consumed.
+    """
+    bc = _bc_id(lead_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT work_id, message_type
+                FROM messages
+                WHERE bc = %s AND direction = 'inbox'
+                  AND consumed = FALSE
+                ORDER BY created_at
+                """,
+                (bc,),
+            )
+            return [(row["work_id"], row["message_type"]) for row in cur.fetchall()]
+
+
+def read_lead_inbox_message(lead_root: str, work_id: str) -> dict[str, Any] | None:
+    """Return the most recent BC-response payload for work_id in the lead's inbox.
+
+    Returns None if no matching row exists.
+    """
+    bc = _bc_id(lead_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (bc, work_id),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return payload
+
+
+def watch_lead_inbox(lead_root: str) -> None:
+    """Lead-side inbox watcher: drain pending BC responses then LISTEN for new ones.
+
+    This replaces ``watch_outbox_for_lead`` under the new routing model
+    (Brief-006 scope E): the lead watches its own inbox channel instead
+    of polling BC outbox channels.
+
+    Each output line is of the form:
+        <work_id> <message_type>
+
+    Startup sequence:
+      1. Connect to Postgres.
+      2. LISTEN on the lead's inbox channel.
+      3. Drain: query pending BC responses (direction='inbox', consumed=FALSE)
+         and print each one.
+      4. Emit a sentinel READY line.
+      5. Block on NOTIFY, printing one line per notification received.
+
+    The function never returns under normal operation.
+    """
+    import sys
+    from psycopg import sql
+
+    bc = _bc_id(lead_root)
+    channel = _lead_inbox_slug(lead_root)
+
+    dsn = _get_dsn()
+    try:
+        conn = psycopg.connect(dsn, autocommit=True)
+    except psycopg.OperationalError as exc:
+        raise RuntimeError(
+            f"shop-msg watch: cannot connect to Postgres at DSN {dsn!r}.\n"
+            f"Check that the service is running (e.g. 'docker compose up -d').\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+
+        _ensure_schema(conn)
+
+        conn.execute(
+            sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel))
+        )
+
+        # Drain existing BC responses in the lead's inbox.
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT work_id, message_type
+                FROM messages
+                WHERE bc = %s AND direction = 'inbox'
+                  AND consumed = FALSE
+                ORDER BY created_at
+                """,
+                (bc,),
+            )
+            for row in cur.fetchall():
+                print(f"{row['work_id']} {row['message_type']}")
+
+        print("READY")
+
+        # Block indefinitely on NOTIFY.
+        for notify in conn.notifies():
+            work_id = notify.payload
+            # Look up message_type from the DB.
+            with _connect() as lookup_conn:
+                with lookup_conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        """
+                        SELECT message_type FROM messages
+                        WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (bc, work_id),
+                    )
+                    row = cur.fetchone()
+            message_type = row["message_type"] if row else "unknown"
+            print(f"{work_id} {message_type}")
+    finally:
+        conn.close()
+
+
+def listen_on_lead_inbox_channel(lead_root: str, timeout: float = 5.0) -> list[str]:
+    """LISTEN on the lead's inbox channel and return received payloads.
+
+    Test-support helper for BDD step definitions that verify a NOTIFY
+    is fired when a BC executes ``shop-msg respond``.
+    """
+    from psycopg import sql
+
+    channel = _lead_inbox_slug(lead_root)
+    dsn = _get_dsn()
+    payloads: list[str] = []
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(
+            sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel))
+        )
+        for notify in conn.notifies(timeout=timeout):
+            payloads.append(notify.payload)
+            break  # return after first notification
+
+    return payloads
+
+
 def watch_inbox(bc_root: str) -> None:
     """Drain pending inbox messages then LISTEN for new ones, printing one line
     per event to stdout.
