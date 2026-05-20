@@ -43,6 +43,8 @@ from catalog.schemas import (
     ScenarioPayload,
     WorkDone,
 )
+import uuid
+
 from shop_msg.storage import (
     _bc_id,
     _bc_outbox_slug,
@@ -56,7 +58,38 @@ from shop_msg.storage import (
     outbox_row_exists,
     read_inbox_message,
     read_outbox_messages,
+    registry_add,
+    registry_remove,
 )
+
+
+# ---------------------------------------------------------------------------
+# Test-scoped registry helpers
+# ---------------------------------------------------------------------------
+# Maps resolved path -> canonical name so each tmp_path BC/lead gets a
+# stable unique name within the test session. Names are registered in
+# Postgres and cleaned up at session teardown.
+_test_registry: dict[str, str] = {}  # path_str -> name
+
+
+def _get_or_register_bc_name(bc_root: Path) -> str:
+    """Return (and register) a canonical name for bc_root."""
+    path_str = str(bc_root.resolve())
+    if path_str not in _test_registry:
+        name = f"test-bc-{uuid.uuid4().hex[:12]}"
+        registry_add(name, path_str, shop_type="bc")
+        _test_registry[path_str] = name
+    return _test_registry[path_str]
+
+
+def _get_or_register_lead_name(lead_root: Path) -> str:
+    """Return (and register) a canonical name for lead_root."""
+    path_str = str(lead_root.resolve())
+    if path_str not in _test_registry:
+        name = f"test-lead-{uuid.uuid4().hex[:12]}"
+        registry_add(name, path_str, shop_type="lead")
+        _test_registry[path_str] = name
+    return _test_registry[path_str]
 
 
 @pytest.fixture
@@ -233,8 +266,7 @@ def run_respond_clarify(bc_root: Path, work_id: str, question: str, context: dic
             "shop-msg",
             "respond",
             "clarify",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--question",
@@ -342,8 +374,7 @@ def run_respond_work_done_with_hash(
             "shop-msg",
             "respond",
             "work_done",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--status",
@@ -373,8 +404,7 @@ def run_respond_work_done_no_hash(
             "shop-msg",
             "respond",
             "work_done",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--status",
@@ -442,8 +472,7 @@ def run_send_request_maintenance(
             "shop-msg",
             "send",
             "request_maintenance",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--description",
@@ -478,8 +507,7 @@ def run_send_request_maintenance_with_criterion_and_hint(
             "shop-msg",
             "send",
             "request_maintenance",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--description",
@@ -518,8 +546,7 @@ def run_send_request_maintenance_with_two_criteria(
             "shop-msg",
             "send",
             "request_maintenance",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--description",
@@ -732,8 +759,7 @@ def run_send_assign_scenarios_one_file(
         "shop-msg",
         "send",
         "assign_scenarios",
-        "--bc-root",
-        str(bc_root),
+        "--bc", _get_or_register_bc_name(bc_root),
         "--work-id",
         work_id,
         "--feature-title",
@@ -772,8 +798,7 @@ def run_send_assign_scenarios_both_files(
         "shop-msg",
         "send",
         "assign_scenarios",
-        "--bc-root",
-        str(bc_root),
+        "--bc", _get_or_register_bc_name(bc_root),
         "--work-id",
         work_id,
         "--feature-title",
@@ -858,8 +883,7 @@ def run_send_request_bugfix_description_only(
             "shop-msg",
             "send",
             "request_bugfix",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--description",
@@ -898,8 +922,7 @@ def run_send_request_bugfix_with_one_scenario(
         "shop-msg",
         "send",
         "request_bugfix",
-        "--bc-root",
-        str(bc_root),
+        "--bc", _get_or_register_bc_name(bc_root),
         "--work-id",
         work_id,
         "--description",
@@ -961,8 +984,7 @@ def given_prior_work_done(
             "shop-msg",
             "respond",
             "work_done",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--status",
@@ -993,8 +1015,7 @@ def given_prior_clarify(bc_root: Path, filename: str, question: str) -> None:
             "shop-msg",
             "respond",
             "clarify",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
             "--question",
@@ -1017,8 +1038,7 @@ def run_read_outbox(bc_root: Path, work_id: str, context: dict) -> None:
             "shop-msg",
             "read",
             "outbox",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             work_id,
         ],
@@ -1327,8 +1347,7 @@ def when_invoke_shopmsg_send_assign_scenarios(
             "shop-msg",
             "send",
             "assign_scenarios",
-            "--bc-root",
-            str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id",
             "lead-018-roundtrip",
             "--feature-title",
@@ -1392,7 +1411,7 @@ def run_respond_mechanism_observation(
     result = subprocess.run(
         [
             "shop-msg", "respond", "mechanism_observation",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--subject", subject,
             "--body", body,
@@ -1434,14 +1453,14 @@ def _shop_msg_send_inbox(bc_root: Path, message_type: str, work_id: str) -> None
     if message_type == "request_maintenance":
         cmd = [
             "shop-msg", "send", "request_maintenance",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--description", "pending-listing setup payload",
         ]
     elif message_type == "request_bugfix":
         cmd = [
             "shop-msg", "send", "request_bugfix",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--description", "pending-listing setup payload",
         ]
@@ -1455,7 +1474,7 @@ def _shop_msg_send_inbox(bc_root: Path, message_type: str, work_id: str) -> None
         )
         cmd = [
             "shop-msg", "send", "assign_scenarios",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--feature-title", "pending-listing setup",
             "--bc-tag", "shopsystem-messaging",
@@ -1506,7 +1525,7 @@ def given_prior_outbox_work_done(bc_root: Path, work_id: str, status: str) -> No
     subprocess.run(
         [
             "shop-msg", "respond", "work_done",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--status", status,
         ],
@@ -1538,7 +1557,7 @@ def given_prior_inbox_assign_scenarios_tagged(
     subprocess.run(
         [
             "shop-msg", "send", "assign_scenarios",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--feature-title", "read-inbox happy-path setup",
             "--bc-tag", suffix,
@@ -1612,7 +1631,7 @@ def given_prior_outbox_work_done_in_bc(
     subprocess.run(
         [
             "shop-msg", "respond", "work_done",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--status", status,
         ],
@@ -1635,7 +1654,7 @@ def given_prior_outbox_clarify_in_bc(
     subprocess.run(
         [
             "shop-msg", "respond", "clarify",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--question", question,
         ],
@@ -1658,7 +1677,7 @@ def given_prior_inbox_request_bugfix_in_bc(
     subprocess.run(
         [
             "shop-msg", "send", "request_bugfix",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--description", "pending-outbox-test setup payload",
         ],
@@ -1681,7 +1700,7 @@ def given_prior_inbox_request_maintenance_in_bc(
     subprocess.run(
         [
             "shop-msg", "send", "request_maintenance",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--description", "pending-outbox-test setup payload",
         ],
@@ -1699,7 +1718,7 @@ def run_pending_inbox(bc_root: Path, context: dict) -> None:
     result = subprocess.run(
         [
             "shop-msg", "pending", "inbox",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
         ],
         capture_output=True,
         text=True,
@@ -1707,7 +1726,7 @@ def run_pending_inbox(bc_root: Path, context: dict) -> None:
     context["cli_returncode"] = result.returncode
     context["cli_stdout"] = result.stdout
     context["cli_stderr"] = result.stderr
-    context["cli_argv"] = ["shop-msg", "pending", "inbox", "--bc-root", str(bc_root)]
+    context["cli_argv"] = ["shop-msg", "pending", "inbox", "--bc", _get_or_register_bc_name(bc_root)]
 
 
 @when(
@@ -1720,8 +1739,8 @@ def run_pending_outbox_filtered(lead_root: Path, bc: str, context: dict) -> None
     result = subprocess.run(
         [
             "shop-msg", "pending", "outbox",
-            "--lead-root", str(lead_root),
-            "--bc", bc,
+            "--lead", _get_or_register_lead_name(lead_root),
+            "--bc-name", bc,
         ],
         capture_output=True,
         text=True,
@@ -1740,7 +1759,7 @@ def run_read_inbox(bc_root: Path, work_id: str, context: dict) -> None:
     result = subprocess.run(
         [
             "shop-msg", "read", "inbox",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
         ],
         capture_output=True,
@@ -2180,7 +2199,7 @@ def set_dsn_to_unreachable(context: dict) -> None:
 def run_watch_in_background(bc_root: Path, context: dict) -> None:
     """Launch shop-msg watch as a background process, then read until READY."""
     proc = subprocess.Popen(
-        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2202,7 +2221,7 @@ def run_watch_in_background_and_collect_drain_line(
 ) -> None:
     """Launch shop-msg watch, collect drain lines, store the line for work_id."""
     proc = subprocess.Popen(
-        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2225,7 +2244,7 @@ def run_watch_in_background_and_collect_drain_line(
 def run_watch_wait_for_drain(bc_root: Path, context: dict) -> None:
     """Launch watch, wait for READY, record the time and drain lines."""
     proc = subprocess.Popen(
-        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2242,7 +2261,7 @@ def run_watch_wait_for_drain(bc_root: Path, context: dict) -> None:
 def given_watch_running_after_drain(bc_root: Path, context: dict) -> None:
     """Start watch and wait for READY before proceeding."""
     proc = subprocess.Popen(
-        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2271,7 +2290,7 @@ def run_watch_synchronously(bc_root: Path, context: dict) -> None:
     if override_dsn:
         env["SHOPMSG_DSN"] = override_dsn
     result = subprocess.run(
-        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
         capture_output=True,
         text=True,
         timeout=10,
@@ -2485,7 +2504,7 @@ def when_respond_work_done_at_bc_root(
     result = subprocess.run(
         [
             "shop-msg", "respond", "work_done",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--status", "complete",
         ],
@@ -2571,7 +2590,7 @@ def given_watch_lead_root_running_after_drain(
     """Start shop-msg watch --lead-root and wait for the READY sentinel."""
     lead_root = lead_root_with_bcs["lead_root"]
     proc = subprocess.Popen(
-        ["shop-msg", "watch", "--lead-root", str(lead_root)],
+        ["shop-msg", "watch", "--lead", _get_or_register_lead_name(lead_root)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2600,7 +2619,7 @@ def when_respond_work_done_into_first_bc_outbox(
     result = subprocess.run(
         [
             "shop-msg", "respond", "work_done",
-            "--bc-root", str(bc_a),
+            "--bc", _get_or_register_bc_name(bc_a),
             "--work-id", work_id,
             "--status", "complete",
         ],
@@ -2649,6 +2668,11 @@ def given_lead_shop_with_one_bc(tmp_path: Path, bc_a: str) -> Path:
     bc = repos / bc_a
     (bc / "inbox").mkdir(parents=True)
     (bc / "outbox").mkdir()
+    # Register the BC and lead in the registry under their canonical names so
+    # name-based addressing (--bc <name> / --lead <name>) works in step defs.
+    registry_add(bc_a, str(bc.resolve()), shop_type="bc")
+    _test_registry[str(bc.resolve())] = bc_a  # sync with session cache
+    _get_or_register_lead_name(lead_root)  # register lead under a uuid name
     return lead_root
 
 
@@ -2688,7 +2712,7 @@ def given_consume_outbox_already_run(
     result = subprocess.run(
         [
             "shop-msg", "consume", "outbox",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--message-type", message_type,
         ],
@@ -2711,7 +2735,7 @@ def run_consume_outbox(
     result = subprocess.run(
         [
             "shop-msg", "consume", "outbox",
-            "--bc-root", str(bc_root),
+            "--bc", _get_or_register_bc_name(bc_root),
             "--work-id", work_id,
             "--message-type", message_type,
         ],
@@ -2730,7 +2754,7 @@ def run_pending_outbox_no_filter(lead_root: Path, context: dict) -> None:
     result = subprocess.run(
         [
             "shop-msg", "pending", "outbox",
-            "--lead-root", str(lead_root),
+            "--lead", _get_or_register_lead_name(lead_root),
         ],
         capture_output=True,
         text=True,
@@ -2752,7 +2776,7 @@ def pending_outbox_contains_no_entry_for_work_id(
     result = subprocess.run(
         [
             "shop-msg", "pending", "outbox",
-            "--lead-root", str(lead_root),
+            "--lead", _get_or_register_lead_name(lead_root),
         ],
         capture_output=True,
         text=True,
@@ -2780,7 +2804,7 @@ def pending_outbox_includes_entry(
     result = subprocess.run(
         [
             "shop-msg", "pending", "outbox",
-            "--lead-root", str(lead_root),
+            "--lead", _get_or_register_lead_name(lead_root),
         ],
         capture_output=True,
         text=True,
@@ -2810,7 +2834,7 @@ def pending_outbox_contains_no_entry_for_work_id_and_type(
     result = subprocess.run(
         [
             "shop-msg", "pending", "outbox",
-            "--lead-root", str(lead_root),
+            "--lead", _get_or_register_lead_name(lead_root),
         ],
         capture_output=True,
         text=True,
@@ -2849,7 +2873,7 @@ def stderr_includes_work_id_and_message_type(
 def given_watch_bc_root_running_after_drain(bc_root: Path, context: dict) -> None:
     """Alias for the existing bc-root watch startup step (scenario b4083b5ff38638f7)."""
     proc = subprocess.Popen(
-        ["shop-msg", "watch", "--bc-root", str(bc_root)],
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2877,3 +2901,324 @@ def then_watch_bc_root_outputs_one_line(context: dict, work_id: str) -> None:
         f"expected line to contain work_id={work_id!r}; got: {line!r}"
     )
     context["watch_live_line"] = line
+
+
+# -----------------------------------------------------------------------
+# lead-paj: Removed --bc-root / --lead-root clean-break migration errors
+# (scenarios 1803bfa0abaf3487, 0d04698f4a53a7cd)
+# -----------------------------------------------------------------------
+
+
+@given("the shop-msg CLI has shipped name-based addressing")
+def given_cli_has_shipped_name_based_addressing() -> None:
+    """No-op: this step documents the Given context. The CLI always has
+    name-based addressing after the clean break (PDR-007 / Brief-006)."""
+
+
+@when("I run any shop-msg subcommand with a --bc-root flag")
+def when_run_subcommand_with_bc_root_flag(context: dict) -> None:
+    """Run a representative shop-msg subcommand with the removed --bc-root flag."""
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc-root", "/some/path"],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@when("I run any shop-msg subcommand with a --lead-root flag")
+def when_run_subcommand_with_lead_root_flag(context: dict) -> None:
+    """Run a representative shop-msg subcommand with the removed --lead-root flag."""
+    result = subprocess.run(
+        ["shop-msg", "pending", "outbox", "--lead-root", "/some/path"],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    "stderr contains a message indicating --bc-root is no longer supported "
+    "and instructs the caller to use --bc <name>"
+)
+def then_stderr_contains_bc_root_migration_message(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "--bc-root" in stderr, (
+        f"expected stderr to mention '--bc-root'; stderr:\n{stderr}"
+    )
+    assert "--bc" in stderr, (
+        f"expected stderr to instruct use of '--bc'; stderr:\n{stderr}"
+    )
+
+
+@then(
+    "stderr contains a message indicating --lead-root is no longer supported "
+    "and instructs the caller to use --lead <name>"
+)
+def then_stderr_contains_lead_root_migration_message(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "--lead-root" in stderr, (
+        f"expected stderr to mention '--lead-root'; stderr:\n{stderr}"
+    )
+    assert "--lead" in stderr, (
+        f"expected stderr to instruct use of '--lead'; stderr:\n{stderr}"
+    )
+
+
+# -----------------------------------------------------------------------
+# lead-paj: Rewritten step definitions for the 7 superseded scenarios
+# (outbox_notify_and_watch_lead_root and consume_outbox rewrites)
+# -----------------------------------------------------------------------
+
+
+@given(
+    "a shop-msg watch --lead session is LISTEN-ing on the outbox channel for that BC"
+)
+def given_listen_on_outbox_channel_lead(bc_root: Path, context: dict) -> None:
+    """Start a background thread that LISTENs on the outbox NOTIFY channel
+    for bc_root. Same logic as the --lead-root variant."""
+    import threading as _threading
+
+    payloads_received: list[str] = []
+    arrival_times: list[float] = []
+    listen_ready = _threading.Event()
+
+    def _listener():
+        import psycopg as _pg
+        from psycopg import sql as _sql
+
+        channel = _bc_outbox_slug(str(bc_root.resolve()))
+        dsn = os.environ.get("SHOPMSG_DSN", "host=/tmp/pgrun port=5433 dbname=shopsystem user=vscode")
+        with _pg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                _sql.SQL("LISTEN {channel}").format(channel=_sql.Identifier(channel))
+            )
+            listen_ready.set()
+            for notify in conn.notifies(timeout=10.0):
+                payloads_received.append(notify.payload)
+                arrival_times.append(time.monotonic())
+                break
+
+    t = _threading.Thread(target=_listener, daemon=True)
+    t.start()
+    assert listen_ready.wait(timeout=10.0), (
+        "LISTEN thread did not become ready within 10 seconds"
+    )
+    context["outbox_listen_thread"] = t
+    context["outbox_listen_payloads"] = payloads_received
+    context["outbox_listen_arrival_times"] = arrival_times
+
+
+@given(
+    "shop-msg watch --lead is running in the background and has completed its startup drain"
+)
+def given_watch_lead_running_after_drain(
+    lead_root_with_bcs: dict, context: dict
+) -> None:
+    """Start shop-msg watch --lead and wait for the READY sentinel."""
+    lead_root = lead_root_with_bcs["lead_root"]
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--lead", _get_or_register_lead_name(lead_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+    context["lead_root_with_bcs"] = lead_root_with_bcs
+
+
+@then(
+    parsers.parse(
+        "shop-msg watch --lead outputs exactly one line to stdout "
+        'for work_id "{work_id}"'
+    )
+)
+def then_watch_lead_outputs_one_line(context: dict, work_id: str) -> None:
+    """Assert that the --lead watch process emits exactly one line for work_id."""
+    proc = context["watch_proc"]
+    line = _read_next_watch_line(proc, timeout=10.0)
+    assert line is not None, (
+        f"expected shop-msg watch --lead to emit a line for work_id={work_id!r}; "
+        f"no line received within timeout"
+    )
+    assert work_id in line, (
+        f"expected line to contain work_id={work_id!r}; got: {line!r}"
+    )
+    context["watch_live_line"] = line
+
+
+@given(
+    "shop-msg watch --bc is running in the background and has completed its startup drain"
+)
+def given_watch_bc_running_after_drain(bc_root: Path, context: dict) -> None:
+    """Start shop-msg watch --bc and wait for the READY sentinel."""
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--bc", _get_or_register_bc_name(bc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    drain_lines = _read_watch_lines_until_ready(proc)
+    context["watch_drain_lines"] = drain_lines
+
+
+@then(
+    parsers.parse(
+        "shop-msg watch --bc outputs exactly one line to stdout "
+        'for work_id "{work_id}"'
+    )
+)
+def then_watch_bc_outputs_one_line(context: dict, work_id: str) -> None:
+    """Assert that the --bc watch process emits exactly one line for work_id."""
+    proc = context["watch_proc"]
+    line = _read_next_watch_line(proc, timeout=10.0)
+    assert line is not None, (
+        f"expected shop-msg watch --bc to emit a line for work_id={work_id!r}; "
+        f"no line received within timeout"
+    )
+    assert work_id in line, (
+        f"expected line to contain work_id={work_id!r}; got: {line!r}"
+    )
+    context["watch_live_line"] = line
+
+
+@given(
+    parsers.parse(
+        'shop-msg consume outbox has been run with --bc {bc}, '
+        '--work-id "{work_id}", and --message-type "{message_type}"'
+    )
+)
+def given_consume_outbox_already_run_bc_name(
+    lead_root: Path, bc: str, work_id: str, message_type: str
+) -> None:
+    """Pre-condition (name-based): consume the specified outbox row."""
+    bc_root = lead_root / "repos" / bc
+    result = subprocess.run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc", _get_or_register_bc_name(bc_root),
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg consume outbox with --bc {bc}, '
+        '--work-id "{work_id}", and --message-type "{message_type}"'
+    )
+)
+def run_consume_outbox_bc_name(
+    lead_root: Path, bc: str, work_id: str, message_type: str, context: dict
+) -> None:
+    bc_root = lead_root / "repos" / bc
+    result = subprocess.run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc", _get_or_register_bc_name(bc_root),
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    parsers.parse(
+        'running shop-msg pending outbox --lead at the lead path '
+        'contains no entry for work_id "{work_id}"'
+    )
+)
+def pending_outbox_lead_contains_no_entry(
+    lead_root: Path, work_id: str
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead", _get_or_register_lead_name(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    for line in lines:
+        tokens = line.split()
+        assert work_id not in tokens, (
+            f"expected no pending outbox entry for work_id={work_id!r}; "
+            f"found line: {line!r}"
+        )
+
+
+@then(
+    parsers.re(
+        r'running shop-msg pending outbox --lead at the lead path '
+        r'includes an entry for work_id "(?P<work_id>[^"]*)" with message_type '
+        r'"(?P<message_type>[^"]*)" originating from BC "(?P<bc>[^"]*)"'
+    )
+)
+def pending_outbox_lead_includes_entry(
+    lead_root: Path, work_id: str, message_type: str, bc: str
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead", _get_or_register_lead_name(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    for line in lines:
+        tokens = line.split()
+        if work_id in tokens and message_type in tokens and bc in tokens:
+            return
+    raise AssertionError(
+        f"expected pending outbox to include work_id={work_id!r} "
+        f"message_type={message_type!r} bc={bc!r}; lines:\n{lines}"
+    )
+
+
+@then(
+    parsers.re(
+        r'running shop-msg pending outbox --lead at the lead path '
+        r'contains no entry for work_id "(?P<work_id>[^"]*)" with message_type '
+        r'"(?P<message_type>[^"]*)"'
+    )
+)
+def pending_outbox_lead_contains_no_entry_with_type(
+    lead_root: Path, work_id: str, message_type: str
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "pending", "outbox",
+            "--lead", _get_or_register_lead_name(lead_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    for line in lines:
+        tokens = line.split()
+        if work_id in tokens and message_type in tokens:
+            raise AssertionError(
+                f"expected no pending outbox entry for work_id={work_id!r} "
+                f"message_type={message_type!r}; found line: {line!r}"
+            )

@@ -99,11 +99,21 @@ ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS consumed BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
+_DDL_REGISTRY = """
+CREATE TABLE IF NOT EXISTS shop_registry (
+  name         TEXT PRIMARY KEY,
+  shop_root    TEXT NOT NULL,
+  shop_type    TEXT NOT NULL DEFAULT 'bc',
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(_DDL)
         cur.execute(_DDL_CONSUMED_COL)
+        cur.execute(_DDL_REGISTRY)
     conn.commit()
 
 
@@ -575,6 +585,139 @@ def watch_outbox_for_lead(lead_root: str) -> None:
             print(f"{work_id} {message_type}")
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Shop registry (name-based addressing — PDR-007 / Brief-006)
+# ---------------------------------------------------------------------------
+
+
+def registry_add(name: str, shop_root: str, shop_type: str = "bc") -> None:
+    """Register a shop by canonical name.
+
+    If the name already exists with the same shop_root and shop_type, this
+    is a no-op (idempotent). If the name exists with different values, the
+    existing entry is updated (upsert semantics).
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO shop_registry (name, shop_root, shop_type)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (name) DO UPDATE
+                  SET shop_root = EXCLUDED.shop_root,
+                      shop_type = EXCLUDED.shop_type
+                """,
+                (name, shop_root, shop_type),
+            )
+        conn.commit()
+
+
+def registry_remove(name: str) -> bool:
+    """Remove a shop from the registry by canonical name.
+
+    Returns True if an entry was removed, False if the name was not found.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM shop_registry WHERE name = %s",
+                (name,),
+            )
+            rows_affected = cur.rowcount
+        conn.commit()
+    return rows_affected > 0
+
+
+def registry_list() -> list[tuple[str, str, str]]:
+    """Return all registry entries as (name, shop_root, shop_type) triples."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name, shop_root, shop_type
+                FROM shop_registry
+                ORDER BY name
+                """
+            )
+            return [(row["name"], row["shop_root"], row["shop_type"]) for row in cur.fetchall()]
+
+
+def registry_sync(manifest_path: str) -> None:
+    """Synchronise the registry from a BC manifest file.
+
+    The manifest is a YAML or JSON file with a top-level 'bcs' key mapping
+    canonical BC names to their shop_root paths. Entries in the manifest
+    are upserted; entries absent from the manifest (except lead shops) are
+    removed. Lead shops (shop_type='lead') are never removed by sync.
+
+    Manifest format (YAML or JSON):
+        bcs:
+          shopsystem-messaging: /path/to/repo
+          shopsystem-scenarios: /path/to/repo
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    import yaml as _yaml
+
+    raw = _Path(manifest_path).read_text()
+    try:
+        data = _yaml.safe_load(raw)
+    except Exception:
+        data = _json.loads(raw)
+
+    manifest_bcs: dict[str, str] = data.get("bcs", {}) or {}
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            # Upsert all BCs from manifest.
+            for name, shop_root in manifest_bcs.items():
+                cur.execute(
+                    """
+                    INSERT INTO shop_registry (name, shop_root, shop_type)
+                    VALUES (%s, %s, 'bc')
+                    ON CONFLICT (name) DO UPDATE
+                      SET shop_root = EXCLUDED.shop_root,
+                          shop_type = 'bc'
+                    """,
+                    (name, shop_root),
+                )
+            # Remove BC entries not in manifest (do not remove lead entries).
+            if manifest_bcs:
+                placeholders = ", ".join(["%s"] * len(manifest_bcs))
+                cur.execute(
+                    f"""
+                    DELETE FROM shop_registry
+                    WHERE shop_type = 'bc'
+                      AND name NOT IN ({placeholders})
+                    """,
+                    list(manifest_bcs.keys()),
+                )
+            else:
+                # Empty manifest: remove all BC entries.
+                cur.execute(
+                    "DELETE FROM shop_registry WHERE shop_type = 'bc'"
+                )
+        conn.commit()
+
+
+def resolve_shop_name(name: str) -> str | None:
+    """Resolve a canonical shop name to its shop_root path.
+
+    Returns the shop_root string if found, or None if the name is not
+    registered.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT shop_root FROM shop_registry WHERE name = %s",
+                (name,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return row["shop_root"]
 
 
 def listen_on_outbox_channel(bc_root: str, timeout: float = 5.0) -> list[str]:

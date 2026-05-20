@@ -113,12 +113,85 @@ from shop_msg.storage import (
     query_pending_outbox,
     read_inbox_message,
     read_outbox_messages,
+    registry_add,
+    registry_list,
+    registry_remove,
+    registry_sync,
+    resolve_shop_name,
     watch_inbox,
     watch_outbox_for_lead,
 )
 
 _response_adapter = TypeAdapter(BCResponse)
 _lead_adapter = TypeAdapter(LeadMessage)
+
+# ---------------------------------------------------------------------------
+# Migration guards for removed flags
+# ---------------------------------------------------------------------------
+
+
+class _RemovedFlagAction(argparse.Action):
+    """argparse Action that immediately errors out with a migration message."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        flag = option_string or self.option_strings[0]
+        if flag == "--bc-root":
+            replacement = "--bc <name>"
+        elif flag == "--lead-root":
+            replacement = "--lead <name>"
+        else:
+            replacement = "--bc <name> or --lead <name>"
+        print(
+            f"shop-msg: {flag} is no longer supported. "
+            f"Use {replacement} instead (name-based addressing, PDR-007).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _add_removed_flag(parser: argparse.ArgumentParser, flag: str) -> None:
+    """Register a removed flag so it produces a migration error instead of
+    'unrecognized arguments'."""
+    parser.add_argument(
+        flag,
+        nargs="?",
+        action=_RemovedFlagAction,
+        help=argparse.SUPPRESS,
+    )
+
+
+def _resolve_bc(args: argparse.Namespace) -> str:
+    """Resolve --bc <name> to the bc_root path via the registry.
+
+    Exits non-zero if the name is not registered.
+    """
+    name = args.bc
+    path = resolve_shop_name(name)
+    if path is None:
+        print(
+            f"shop-msg: shop name {name!r} is not registered in the registry. "
+            f"Run 'shop-msg registry add' to register it first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return str(Path(path).resolve())
+
+
+def _resolve_lead(args: argparse.Namespace) -> str:
+    """Resolve --lead <name> to the lead_root path via the registry.
+
+    Exits non-zero if the name is not registered.
+    """
+    name = args.lead
+    path = resolve_shop_name(name)
+    if path is None:
+        print(
+            f"shop-msg: lead name {name!r} is not registered in the registry. "
+            f"Run 'shop-msg registry add' to register it first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return str(Path(path).resolve())
 
 
 def _compute_scenario_hash(gherkin_body: str) -> str:
@@ -139,7 +212,7 @@ def _compute_scenario_hash(gherkin_body: str) -> str:
 
 
 def _cmd_respond_clarify(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
 
     if not args.question:
         print(
@@ -181,7 +254,7 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
 
 
 def _cmd_respond_work_done(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
 
     message = WorkDone(
         message_type="work_done",
@@ -211,7 +284,7 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
 
 
 def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
 
     # Path-safety: refuse work_ids that would escape the outbox dir.
     if "/" in args.work_id or ".." in args.work_id or not args.work_id:
@@ -252,7 +325,7 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
 
 
 def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
 
     acceptance_criteria = list(args.acceptance_criterion or []) or None
     file_hints = list(args.file_hint or []) or None
@@ -332,7 +405,7 @@ def _build_scenario_payload(
 
 
 def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
 
     scenario_files = list(args.scenario_file or [])
     # --feature-title and --bc-tag are conditionally required: only when
@@ -378,7 +451,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
 
 
 def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
 
     scenario_files = list(args.scenario_file or [])
     scenarios_payload: list[ScenarioPayload] = [
@@ -412,7 +485,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
 
 
 def _cmd_read_outbox(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
     rows = read_outbox_messages(bc_root, args.work_id)
     if not rows:
         print(
@@ -438,7 +511,7 @@ def _cmd_read_outbox(args: argparse.Namespace) -> int:
 
 
 def _cmd_read_inbox(args: argparse.Namespace) -> int:
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
     raw = read_inbox_message(bc_root, args.work_id)
     if raw is None:
         # Same pattern as `read outbox`: a missing row is the
@@ -476,7 +549,7 @@ def _cmd_pending_inbox(args: argparse.Namespace) -> int:
     directory-glob walk. Missing bc_root directories are no longer
     relevant — the database is the store.
     """
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
     rows = query_pending_inbox(bc_root)
     for work_id, message_type in rows:
         print(f"{work_id} {message_type}")
@@ -489,8 +562,8 @@ def _cmd_pending_outbox(args: argparse.Namespace) -> int:
     Lead-side counterpart to `pending inbox`. Queries Postgres for
     outbox rows whose bc path sits under <lead-root>/repos/.
     """
-    lead_root = str(Path(args.lead_root).resolve())
-    rows = query_pending_outbox(lead_root, bc_filter=args.bc)
+    lead_root = _resolve_lead(args)
+    rows = query_pending_outbox(lead_root, bc_filter=args.bc_name)
     for work_id, message_type, bc_name in rows:
         print(f"{work_id} {message_type} {bc_name}")
     return 0
@@ -502,7 +575,7 @@ def _cmd_consume_outbox(args: argparse.Namespace) -> int:
     After consumption the row no longer appears in 'pending outbox' output.
     Exits non-zero if no matching unconsumed outbox row exists.
     """
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
     found = consume_outbox_message(bc_root, args.work_id, args.message_type)
     if not found:
         print(
@@ -529,7 +602,8 @@ def _cmd_prime(args: argparse.Namespace) -> int:
     """
     from shop_msg.storage import _get_dsn, query_pending_inbox
 
-    bc_root = str(Path(args.bc_root).resolve())
+    bc_root = _resolve_bc(args)
+    bc_name = args.bc
     dsn = _get_dsn()
 
     print(f"DSN: {dsn}")
@@ -541,7 +615,7 @@ def _cmd_prime(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"DB reachable: no — {exc}")
         print()
-        _print_prime_reminder(bc_root)
+        _print_prime_reminder(bc_name)
         return 1
 
     print("DB reachable: yes")
@@ -553,16 +627,16 @@ def _cmd_prime(args: argparse.Namespace) -> int:
         print(f"  {work_id}  {message_type}")
     print()
 
-    _print_prime_reminder(bc_root)
+    _print_prime_reminder(bc_name)
     return 0
 
 
-def _print_prime_reminder(bc_root: str) -> None:
+def _print_prime_reminder(bc_name: str) -> None:
     print(
         "Use shop-msg CLI commands — inbox/outbox are in postgres, not on the filesystem.\n"
         "Key commands:\n"
-        f"  shop-msg pending inbox --bc-root {bc_root}\n"
-        f"  shop-msg read inbox --bc-root {bc_root} --work-id <id>\n"
+        f"  shop-msg pending inbox --bc {bc_name}\n"
+        f"  shop-msg read inbox --bc {bc_name} --work-id <id>\n"
         "  shop-msg respond clarify | work_done | mechanism_observation ..."
     )
 
@@ -572,7 +646,16 @@ def _cmd_dump(args: argparse.Namespace) -> int:
     import json as _json
     from shop_msg.storage import _connect, _bc_id
 
-    bc_root = str(Path(args.bc_root).resolve()) if args.bc_root else None
+    bc_root: str | None = None
+    if hasattr(args, "bc") and args.bc:
+        bc_root = resolve_shop_name(args.bc)
+        if bc_root is None:
+            print(
+                f"shop-msg dump: shop name {args.bc!r} not registered in registry",
+                file=sys.stderr,
+            )
+            return 1
+        bc_root = str(Path(bc_root).resolve())
     direction = args.direction
     limit = args.limit or 100
 
@@ -614,24 +697,52 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     unreachable at startup.
 
     Modes:
-      --bc-root PATH   Inbox watcher for a single BC.
-      --lead-root PATH Outbox watcher across all BCs under <lead-root>/repos/.
+      --bc <name>    Inbox watcher for a single BC (resolves via registry).
+      --lead <name>  Outbox watcher across all BCs under the lead root.
     """
-    if args.lead_root is not None:
-        lead_root = str(Path(args.lead_root).resolve())
-        try:
-            watch_outbox_for_lead(lead_root)
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        return 0
-
-    bc_root = str(Path(args.bc_root).resolve())
     try:
+        if hasattr(args, "lead") and args.lead is not None:
+            lead_root = _resolve_lead(args)
+            watch_outbox_for_lead(lead_root)
+            return 0
+
+        bc_root = _resolve_bc(args)
         watch_inbox(bc_root)
+        return 0
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+
+def _cmd_registry_add(args: argparse.Namespace) -> int:
+    """Register a shop by canonical name."""
+    shop_type = "lead" if getattr(args, "lead_shop", False) else "bc"
+    registry_add(args.name, args.shop_root, shop_type=shop_type)
+    return 0
+
+
+def _cmd_registry_remove(args: argparse.Namespace) -> int:
+    """Remove a shop from the registry by canonical name."""
+    found = registry_remove(args.name)
+    if not found:
+        print(
+            f"shop-msg registry remove: {args.name!r} was not found in the registry",
+            file=sys.stdout,
+        )
+    return 0
+
+
+def _cmd_registry_list(args: argparse.Namespace) -> int:
+    """List all registered shops."""
+    entries = registry_list()
+    for name, shop_root, shop_type in entries:
+        print(f"{name} {shop_root} {shop_type}")
+    return 0
+
+
+def _cmd_registry_sync(args: argparse.Namespace) -> int:
+    """Synchronise the registry from a BC manifest file."""
+    registry_sync(args.manifest)
     return 0
 
 
@@ -643,13 +754,15 @@ def build_parser() -> argparse.ArgumentParser:
     respond_sub = respond.add_subparsers(dest="response_type", required=True)
 
     clarify = respond_sub.add_parser("clarify", help="write a clarify response")
-    clarify.add_argument("--bc-root", required=True, help="BC root directory")
+    clarify.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(clarify, "--bc-root")
     clarify.add_argument("--work-id", required=True, help="work_id from the lead message")
     clarify.add_argument("--question", required=True, help="clarifying question text")
     clarify.set_defaults(func=_cmd_respond_clarify)
 
     work_done = respond_sub.add_parser("work_done", help="write a work_done response")
-    work_done.add_argument("--bc-root", required=True, help="BC root directory")
+    work_done.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(work_done, "--bc-root")
     work_done.add_argument("--work-id", required=True, help="work_id from the lead message")
     work_done.add_argument(
         "--status",
@@ -674,7 +787,8 @@ def build_parser() -> argparse.ArgumentParser:
         "mechanism_observation",
         help="surface a BC observation about the shop-system mechanism",
     )
-    mech_obs.add_argument("--bc-root", required=True, help="BC root directory")
+    mech_obs.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(mech_obs, "--bc-root")
     mech_obs.add_argument(
         "--work-id", required=True,
         help=(
@@ -719,7 +833,8 @@ def build_parser() -> argparse.ArgumentParser:
     request_maintenance = send_sub.add_parser(
         "request_maintenance", help="write a request_maintenance message"
     )
-    request_maintenance.add_argument("--bc-root", required=True, help="BC root directory")
+    request_maintenance.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(request_maintenance, "--bc-root")
     request_maintenance.add_argument(
         "--work-id", required=True, help="work_id identifying this assignment"
     )
@@ -743,7 +858,8 @@ def build_parser() -> argparse.ArgumentParser:
     assign_scenarios = send_sub.add_parser(
         "assign_scenarios", help="write an assign_scenarios message"
     )
-    assign_scenarios.add_argument("--bc-root", required=True, help="BC root directory")
+    assign_scenarios.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(assign_scenarios, "--bc-root")
     assign_scenarios.add_argument(
         "--work-id", required=True, help="work_id identifying this assignment"
     )
@@ -769,7 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
     request_bugfix = send_sub.add_parser(
         "request_bugfix", help="write a request_bugfix message"
     )
-    request_bugfix.add_argument("--bc-root", required=True, help="BC root directory")
+    request_bugfix.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(request_bugfix, "--bc-root")
     request_bugfix.add_argument(
         "--work-id", required=True, help="work_id identifying this assignment"
     )
@@ -808,7 +925,8 @@ def build_parser() -> argparse.ArgumentParser:
     read_outbox = read_sub.add_parser(
         "outbox", help="read and validate a BC response from its outbox"
     )
-    read_outbox.add_argument("--bc-root", required=True, help="BC root directory")
+    read_outbox.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(read_outbox, "--bc-root")
     read_outbox.add_argument(
         "--work-id", required=True, help="work_id whose response to read"
     )
@@ -817,7 +935,8 @@ def build_parser() -> argparse.ArgumentParser:
     read_inbox = read_sub.add_parser(
         "inbox", help="read and validate a lead message from a BC's inbox"
     )
-    read_inbox.add_argument("--bc-root", required=True, help="BC root directory")
+    read_inbox.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(read_inbox, "--bc-root")
     read_inbox.add_argument(
         "--work-id", required=True, help="work_id whose inbox message to read"
     )
@@ -832,7 +951,8 @@ def build_parser() -> argparse.ArgumentParser:
         "inbox",
         help="list inbox messages with no matching outbox response (BC side)",
     )
-    pending_inbox.add_argument("--bc-root", required=True, help="BC root directory")
+    pending_inbox.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(pending_inbox, "--bc-root")
     pending_inbox.set_defaults(func=_cmd_pending_inbox)
 
     pending_outbox = pending_sub.add_parser(
@@ -840,14 +960,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="list pending outbox responses across sibling BC clones (lead side)",
     )
     pending_outbox.add_argument(
-        "--lead-root",
+        "--lead",
         required=True,
-        help="lead-shop root containing a repos/ directory of sibling BC clones",
+        help="canonical lead shop name (resolved via registry to lead root path)",
     )
+    _add_removed_flag(pending_outbox, "--lead-root")
     pending_outbox.add_argument(
-        "--bc",
+        "--bc-name",
         default=None,
-        help="restrict to a single BC name (must match the directory under repos/)",
+        dest="bc_name",
+        help="restrict to a single BC by canonical name",
     )
     pending_outbox.set_defaults(func=_cmd_pending_outbox)
 
@@ -865,10 +987,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     consume_outbox.add_argument(
-        "--bc-root",
+        "--bc",
         required=True,
-        help="BC root directory whose outbox contains the row to consume",
+        help="canonical BC name (resolved via registry)",
     )
+    _add_removed_flag(consume_outbox, "--bc-root")
     consume_outbox.add_argument(
         "--work-id",
         required=True,
@@ -886,14 +1009,16 @@ def build_parser() -> argparse.ArgumentParser:
         "prime",
         help="session-start orientation: DSN, DB health, pending inbox, and CLI reminder",
     )
-    prime.add_argument("--bc-root", required=True, help="BC root directory")
+    prime.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    _add_removed_flag(prime, "--bc-root")
     prime.set_defaults(func=_cmd_prime)
 
     dump = sub.add_parser(
         "dump",
         help="operator debugging: dump messages table rows to stdout as YAML",
     )
-    dump.add_argument("--bc-root", default=None, help="restrict to this BC root path")
+    dump.add_argument("--bc", default=None, help="restrict to this BC (canonical name)")
+    _add_removed_flag(dump, "--bc-root")
     dump.add_argument(
         "--direction",
         default=None,
@@ -914,18 +1039,69 @@ def build_parser() -> argparse.ArgumentParser:
             "Monitor-compatible watcher: drain pending messages then "
             "LISTEN for new ones, printing one '<work_id> <message_type>' "
             "line per event to stdout. Never exits unless the DB is unreachable. "
-            "Use --bc-root for inbox watching (BC mode) or --lead-root for "
+            "Use --bc <name> for inbox watching (BC mode) or --lead <name> for "
             "outbox watching across all BCs (lead mode)."
         ),
     )
     _watch_mode = watch.add_mutually_exclusive_group(required=True)
-    _watch_mode.add_argument("--bc-root", default=None, help="BC root directory (inbox watch mode)")
+    _watch_mode.add_argument("--bc", default=None, help="canonical BC name (inbox watch mode)")
     _watch_mode.add_argument(
-        "--lead-root",
+        "--lead",
         default=None,
-        help="lead-shop root containing a repos/ directory (outbox watch mode)",
+        help="canonical lead shop name (outbox watch mode)",
     )
+    # Register removed flags on watch but they cannot be in the mutex group;
+    # they're handled via the action which exits immediately.
+    _add_removed_flag(watch, "--bc-root")
+    _add_removed_flag(watch, "--lead-root")
     watch.set_defaults(func=_cmd_watch)
+
+    # Registry subcommand
+    registry = sub.add_parser(
+        "registry",
+        help="manage the shop name registry (name-based addressing)",
+    )
+    registry_sub = registry.add_subparsers(dest="registry_cmd", required=True)
+
+    registry_add_cmd = registry_sub.add_parser(
+        "add",
+        help="register a shop by canonical name",
+    )
+    registry_add_cmd.add_argument("name", help="canonical shop name")
+    registry_add_cmd.add_argument(
+        "shop_root",
+        help="filesystem path to the shop root directory",
+    )
+    registry_add_cmd.add_argument(
+        "--lead-shop",
+        action="store_true",
+        default=False,
+        help="register as a lead shop (shop_type=lead) instead of a BC",
+    )
+    registry_add_cmd.set_defaults(func=_cmd_registry_add)
+
+    registry_remove_cmd = registry_sub.add_parser(
+        "remove",
+        help="remove a shop from the registry by canonical name",
+    )
+    registry_remove_cmd.add_argument("name", help="canonical shop name to remove")
+    registry_remove_cmd.set_defaults(func=_cmd_registry_remove)
+
+    registry_list_cmd = registry_sub.add_parser(
+        "list",
+        help="list all registered shops",
+    )
+    registry_list_cmd.set_defaults(func=_cmd_registry_list)
+
+    registry_sync_cmd = registry_sub.add_parser(
+        "sync",
+        help="synchronise the registry from a BC manifest file",
+    )
+    registry_sync_cmd.add_argument(
+        "manifest",
+        help="path to YAML/JSON manifest with 'bcs' mapping of name -> root path",
+    )
+    registry_sync_cmd.set_defaults(func=_cmd_registry_sync)
 
     return parser
 
