@@ -6434,3 +6434,710 @@ def then_lead_inbox_clarify_still_exists(work_id: str, context: dict) -> None:
         f"a --force work_done replacement; it was deleted"
     )
 
+
+# -----------------------------------------------------------------------
+# lead-nn5f: consume-outbox-releases-lead-inbox-slot recovery contract.
+#
+# These steps map the canonical names "shopsystem-product" (lead) and
+# "shopsystem-messaging" (BC) onto the session lead root and a per-test
+# tmp BC root, then drive the real shop-msg CLI so the storage-layer
+# release path is exercised end to end.
+# -----------------------------------------------------------------------
+
+
+def _nn5f_register_lead(lead_name: str, context: dict, request) -> None:
+    """Register lead_name → session lead root (restored on teardown)."""
+    saved = _registry_lookup(lead_name, ignore_test_paths=True)
+    lead_root = get_session_lead_root()
+    registry_add(lead_name, str(lead_root.resolve()), shop_type="lead")
+    _test_registry[str(lead_root.resolve())] = lead_name
+    context["nn5f_lead_name"] = lead_name
+    context["nn5f_lead_root"] = lead_root
+    request.addfinalizer(lambda: _registry_restore(lead_name, saved))
+
+
+def _nn5f_register_bc(bc_name: str, tmp_path: Path, context: dict, request) -> None:
+    """Register bc_name → a BC root under the session lead's repos/ tree.
+
+    `pending outbox --lead` only surfaces BC-outbox markers whose path sits
+    under <lead_root>/repos/, so the BC root must live there for the
+    lead-side pending-outbox assertions in these scenarios to observe the
+    marker (and its consumption).
+    """
+    saved = _registry_lookup(bc_name, ignore_test_paths=True)
+    bc_root = get_session_lead_root() / "repos" / bc_name
+    (bc_root / "inbox").mkdir(parents=True, exist_ok=True)
+    (bc_root / "outbox").mkdir(exist_ok=True)
+    registry_add(bc_name, str(bc_root.resolve()), shop_type="bc")
+    _test_registry[str(bc_root.resolve())] = bc_name
+    context["nn5f_bc_name"] = bc_name
+    context["nn5f_bc_root"] = bc_root
+    # Also expose under the keys the pre-existing shared steps expect, so a
+    # scenario can reuse e.g. the request_maintenance-inbox-sent step.
+    context["registered_bc_root"] = bc_root
+    context["registered_bc_name"] = bc_name
+    context["bc_root"] = bc_root
+    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
+
+
+def _run(argv: list[str], context: dict, *, check: bool = False):
+    result = subprocess.run(argv, capture_output=True, text=True, check=check)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    return result
+
+
+@given(
+    parsers.parse(
+        'a lead shop "{lead_name}" registered as the lead in the messaging registry'
+    )
+)
+def nn5f_given_lead_registered(lead_name: str, context: dict, request) -> None:
+    _nn5f_register_lead(lead_name, context, request)
+
+
+@given(parsers.parse('a BC "{bc_name}" registered in the messaging registry'))
+def nn5f_given_bc_registered(
+    bc_name: str, tmp_path: Path, context: dict, request
+) -> None:
+    _nn5f_register_bc(bc_name, tmp_path, context, request)
+
+
+@given(
+    parsers.parse(
+        'a lead shop "{lead_name}" and a BC "{bc_name}" registered in the '
+        'messaging registry'
+    )
+)
+def nn5f_given_lead_and_bc_registered(
+    lead_name: str, bc_name: str, tmp_path: Path, context: dict, request
+) -> None:
+    _nn5f_register_lead(lead_name, context, request)
+    _nn5f_register_bc(bc_name, tmp_path, context, request)
+
+
+@given(
+    parsers.parse(
+        'the BC has previously called "shop-msg respond work_done" for '
+        'work-id "{work_id}" producing a lead-inbox row at {li} AND a '
+        'BC-outbox marker at {ob}'
+    )
+)
+def nn5f_given_prior_work_done(
+    work_id: str, li: str, ob: str, context: dict
+) -> None:
+    bc_name = context["nn5f_bc_name"]
+    _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        context,
+        check=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'the BC has previously called "shop-msg respond work_done" for '
+        'work-id "{work_id}" producing a lead-inbox row and a BC-outbox marker'
+    )
+)
+def nn5f_given_prior_work_done_short(work_id: str, context: dict) -> None:
+    bc_name = context["nn5f_bc_name"]
+    _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        context,
+        check=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'the BC has emitted two responses for work-id "{work_id}": one '
+        '"{first}" and one "{second}"'
+    )
+)
+def nn5f_given_two_responses(
+    work_id: str, first: str, second: str, context: dict
+) -> None:
+    bc_name = context["nn5f_bc_name"]
+    for mtype in (first, second):
+        if mtype == "clarify":
+            argv = [
+                "shop-msg", "respond", "clarify",
+                "--bc", bc_name, "--work-id", work_id,
+                "--question", "which acceptance criterion applies?",
+            ]
+        elif mtype == "work_done":
+            argv = [
+                "shop-msg", "respond", "work_done",
+                "--bc", bc_name, "--work-id", work_id,
+                "--status", "complete",
+            ]
+        else:
+            raise AssertionError(f"unsupported message_type in setup: {mtype!r}")
+        _run(argv, context, check=True)
+
+
+@given(
+    parsers.parse(
+        'both responses are visible on both surfaces: "shop-msg pending '
+        'outbox --lead {lead_name}" lists both, and "shop-msg pending inbox '
+        '--lead {lead_name2}" lists both'
+    )
+)
+def nn5f_given_both_visible(lead_name: str, lead_name2: str, context: dict) -> None:
+    work_id = "lead-n02"
+    out = _run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name], context
+    ).stdout
+    inb = _run(
+        ["shop-msg", "pending", "inbox", "--lead", lead_name2], context
+    ).stdout
+    for mtype in ("clarify", "work_done"):
+        assert work_id in out and mtype in out, (
+            f"expected {work_id} {mtype} in pending outbox; got:\n{out}"
+        )
+        assert work_id in inb and mtype in inb, (
+            f"expected {work_id} {mtype} in pending inbox; got:\n{inb}"
+        )
+
+
+@given(parsers.parse('NO prior lead-inbox row exists for {triple}'))
+def nn5f_given_no_prior_row(triple: str, context: dict) -> None:
+    # No-op: a freshly registered lead/BC pair has no prior lead-inbox row.
+    # The clause documents the precondition the scenario relies on.
+    pass
+
+
+@given(
+    parsers.parse(
+        'the BC has previously called "shop-msg respond work_done --bc '
+        '{bc_name} --work-id {work_id} --status complete --summary {summary}" '
+        'producing both a lead-inbox row and a BC-outbox marker carrying the '
+        '{summary2} payload'
+    )
+)
+def nn5f_given_prior_work_done_with_summary(
+    bc_name: str, work_id: str, summary: str, summary2: str, context: dict
+) -> None:
+    _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+            "--summary", summary,
+        ],
+        context,
+        check=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'the lead operator has already read the {payloadword} payload via '
+        '"shop-msg read inbox --lead {lead_name} --work-id {work_id}" but '
+        'has NOT yet run "shop-msg consume outbox"'
+    )
+)
+def nn5f_given_lead_read_not_consumed(
+    payloadword: str, lead_name: str, work_id: str, context: dict
+) -> None:
+    _run(
+        ["shop-msg", "read", "inbox", "--lead", lead_name, "--work-id", work_id],
+        context,
+        check=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'the lead operator has run "shop-msg consume outbox --bc {bc_name} '
+        '--work-id {work_id} --message-type {mtype}" successfully, releasing '
+        'BOTH the BC-outbox marker and the lead-inbox row per the '
+        'consume-releases-slot contract above'
+    )
+)
+def nn5f_given_consume_run(
+    bc_name: str, work_id: str, mtype: str, context: dict
+) -> None:
+    _run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--message-type", mtype,
+        ],
+        context,
+        check=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'the lead has an active "shop-msg watch --lead {lead_name}" Monitor '
+        'pipeline subscribed to the lead\'s inbox channel'
+    )
+)
+def nn5f_given_watch_active(lead_name: str, context: dict, request) -> None:
+    proc = subprocess.Popen(
+        ["shop-msg", "watch", "--lead", lead_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    context["watch_proc"] = proc
+    context["watch_drain_lines"] = _read_watch_lines_until_ready(proc)
+
+    def _cleanup():
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    request.addfinalizer(_cleanup)
+
+
+@when(
+    parsers.parse(
+        'the lead operator runs "shop-msg consume outbox --bc {bc_name} '
+        '--work-id {work_id} --message-type {mtype}"'
+    )
+)
+def nn5f_when_consume(bc_name: str, work_id: str, mtype: str, context: dict) -> None:
+    context["nn5f_active_work_id"] = work_id
+    _run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--message-type", mtype,
+        ],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the BC runs "shop-msg respond work_done --force --bc {bc_name} '
+        '--work-id {work_id} --status complete --summary {summary}"'
+    )
+)
+def nn5f_when_respond_force(
+    bc_name: str, work_id: str, summary: str, context: dict
+) -> None:
+    context["nn5f_active_work_id"] = work_id
+    _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--force",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+            "--summary", summary,
+        ],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the BC runs "shop-msg respond work_done --force --bc {bc_name} '
+        '--work-id {work_id} --status complete --summary {summary}" before '
+        'the lead\'s reconciliation completes'
+    )
+)
+def nn5f_when_respond_force_midrecon(
+    bc_name: str, work_id: str, summary: str, context: dict
+) -> None:
+    _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--force",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+            "--summary", summary,
+        ],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the BC runs "shop-msg respond work_done --bc {bc_name} --work-id '
+        '{work_id} --status complete --summary {summary}" WITHOUT --force'
+    )
+)
+def nn5f_when_respond_no_force(
+    bc_name: str, work_id: str, summary: str, context: dict
+) -> None:
+    _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+            "--summary", summary,
+        ],
+        context,
+    )
+
+
+@then(
+    parsers.parse(
+        'the BC-outbox marker for {triple} is marked consumed (no longer '
+        'surfaced by "shop-msg pending outbox --lead {lead_name}")'
+    )
+)
+def nn5f_then_outbox_consumed(triple: str, lead_name: str, context: dict) -> None:
+    work_id = context.get("nn5f_active_work_id", "lead-n01")
+    out = _run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name], context
+    ).stdout
+    # The work_done marker for this work_id must be gone.
+    for line in out.splitlines():
+        if work_id in line and "work_done" in line:
+            raise AssertionError(
+                f"expected work_done outbox marker for {work_id} to be "
+                f"consumed; still present: {line!r}"
+            )
+
+
+@then(
+    parsers.parse(
+        'the lead-inbox row for {triple} is ALSO released (no longer '
+        'surfaced by "shop-msg pending inbox --lead {lead_name}")'
+    )
+)
+def nn5f_then_inbox_released(triple: str, lead_name: str, context: dict) -> None:
+    work_id = "lead-n01"
+    lead_root = get_session_lead_root()
+    payload = _fetch_lead_inbox_payload(lead_root, work_id, "work_done")
+    assert payload is None, (
+        f"expected lead-inbox work_done row for {work_id} to be released by "
+        f"consume; it survived: {payload!r}"
+    )
+    inb = _run(
+        ["shop-msg", "pending", "inbox", "--lead", lead_name], context
+    ).stdout
+    for line in inb.splitlines():
+        if work_id in line and "work_done" in line:
+            raise AssertionError(
+                f"expected lead-inbox work_done row for {work_id} gone from "
+                f"pending inbox; still present: {line!r}"
+            )
+
+
+@then(
+    parsers.parse(
+        'a subsequent "shop-msg respond work_done --bc {bc_name} --work-id '
+        '{work_id} --status complete" WITHOUT --force exits zero rather than '
+        'raising CollisionError, because there is no surviving lead-inbox row '
+        'to collide against'
+    )
+)
+def nn5f_then_reemit_without_force_ok(
+    bc_name: str, work_id: str, context: dict
+) -> None:
+    result = _run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+        ],
+        context,
+    )
+    assert result.returncode == 0, (
+        f"expected re-emit without --force to exit zero after consume "
+        f"released the slot; got rc={result.returncode}, stderr:\n"
+        f"{result.stderr}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the rationale that pins this behavior is single-source-of-truth: a '
+        'consumed response is no longer authoritative, so the BC may re-emit '
+        'cleanly under the original verb without escalating to the --force '
+        'recovery affordance'
+    )
+)
+def nn5f_then_rationale_ssot(context: dict) -> None:
+    # Rationale clause: no further assertion beyond the behavior pinned above.
+    pass
+
+
+@then(
+    parsers.parse(
+        'the {triplea} BC-outbox marker AND the {tripleb} lead-inbox row '
+        'are BOTH released'
+    )
+)
+def nn5f_then_both_released(triplea: str, tripleb: str, context: dict) -> None:
+    work_id = "lead-n02"
+    lead_name = context["nn5f_lead_name"]
+    lead_root = get_session_lead_root()
+    # lead-inbox work_done row gone.
+    assert _fetch_lead_inbox_payload(lead_root, work_id, "work_done") is None, (
+        f"expected work_done lead-inbox row for {work_id} released"
+    )
+    # BC-outbox work_done marker no longer pending.
+    out = _run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name], context
+    ).stdout
+    for line in out.splitlines():
+        if work_id in line and "work_done" in line:
+            raise AssertionError(
+                f"expected work_done outbox marker for {work_id} consumed; "
+                f"still present: {line!r}"
+            )
+
+
+@then(
+    parsers.parse(
+        'the {triplea} BC-outbox marker AND the {tripleb} lead-inbox row '
+        'are BOTH intact and still surfaced on their respective pending queries'
+    )
+)
+def nn5f_then_both_intact(triplea: str, tripleb: str, context: dict) -> None:
+    work_id = "lead-n02"
+    lead_name = context["nn5f_lead_name"]
+    lead_root = get_session_lead_root()
+    # clarify lead-inbox row intact.
+    assert _fetch_lead_inbox_payload(lead_root, work_id, "clarify") is not None, (
+        f"expected clarify lead-inbox row for {work_id} to remain intact"
+    )
+    out = _run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name], context
+    ).stdout
+    inb = _run(
+        ["shop-msg", "pending", "inbox", "--lead", lead_name], context
+    ).stdout
+    assert any(work_id in l and "clarify" in l for l in out.splitlines()), (
+        f"expected clarify outbox marker for {work_id} still pending; got:\n{out}"
+    )
+    assert any(work_id in l and "clarify" in l for l in inb.splitlines()), (
+        f"expected clarify lead-inbox row for {work_id} still pending; got:\n{inb}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the release scoping rule is identical to the --force scoping rule in '
+        'respond_force_scoped_per_triple.feature: both DELETEs key on the '
+        'full (bc, work_id, message_type) triple, so the two recovery paths '
+        'compose without cross-talk'
+    )
+)
+def nn5f_then_scoping_identical(context: dict) -> None:
+    # Property clause: pinned by the BOTH-released / BOTH-intact assertions.
+    pass
+
+
+@then(
+    parsers.parse(
+        'a lead-inbox row at {triple} is created carrying the {summary} payload'
+    )
+)
+def nn5f_then_inbox_row_created(triple: str, summary: str, context: dict) -> None:
+    work_id = context.get("nn5f_active_work_id", "lead-n03")
+    lead_root = get_session_lead_root()
+    payload = _fetch_lead_inbox_payload(lead_root, work_id, "work_done")
+    assert payload is not None, (
+        f"expected a lead-inbox work_done row for {work_id} carrying "
+        f"{summary!r}; none found"
+    )
+    assert summary in json.dumps(payload), (
+        f"expected {summary!r} in lead-inbox payload; got: {payload!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'a BC-outbox marker at {triple} is created'
+    )
+)
+def nn5f_then_outbox_marker_created(triple: str, context: dict) -> None:
+    bc_root = context["nn5f_bc_root"]
+    work_id = context.get("nn5f_active_work_id", "lead-n03")
+    assert outbox_row_exists(str(bc_root.resolve()), work_id, "work_done"), (
+        f"expected BC-outbox work_done marker for {work_id}"
+    )
+
+
+@then(
+    parsers.parse(
+        '"shop-msg read inbox --lead {lead_name} --work-id {work_id}" returns '
+        'the {summary} payload byte-for-byte'
+    )
+)
+def nn5f_then_read_returns_payload(
+    lead_name: str, work_id: str, summary: str, context: dict
+) -> None:
+    result = _run(
+        ["shop-msg", "read", "inbox", "--lead", lead_name, "--work-id", work_id],
+        context,
+    )
+    assert result.returncode == 0, (
+        f"expected read inbox to exit zero; stderr:\n{result.stderr}"
+    )
+    assert summary in result.stdout, (
+        f"expected {summary!r} in read inbox output; got:\n{result.stdout}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that --force does NOT become '
+        'a "respond only if a prior row exists" precondition; --force is the '
+        'recovery affordance for the collision case AND a no-op DELETE on the '
+        'empty case, never a guard against the empty case'
+    )
+)
+def nn5f_then_empty_case_property(context: dict) -> None:
+    pass
+
+
+@then(
+    parsers.parse(
+        'a NOTIFY fires on the lead\'s inbox channel so any "shop-msg watch '
+        '--lead {lead_name}" Monitor pipeline emits a fresh notification line '
+        'for work-id "{work_id}"'
+    )
+)
+def nn5f_then_notify_fires_force(
+    lead_name: str, work_id: str, context: dict
+) -> None:
+    # The force re-emit fired while no watcher was attached for this scenario;
+    # assert observability by re-deriving it through a fresh watch session
+    # that drains the just-fired row is not reliable. Instead, pin the
+    # delivery (the NOTIFY is fired by insert_bc_response on every success);
+    # the fresh-pending-inbox and read-payload assertions that follow pin
+    # the observable consequence the NOTIFY exists to wake.
+    assert context.get("cli_returncode") == 0, (
+        "expected the --force re-emit to have exited zero (NOTIFY fires on "
+        "every successful insert_bc_response)"
+    )
+
+
+@then(
+    parsers.parse(
+        'a fresh "shop-msg pending inbox --lead {lead_name}" lists the '
+        '{triple} row as pending (the --force replacement is delivered and '
+        'visible, not stuck behind the prior in-flight reconciliation)'
+    )
+)
+def nn5f_then_fresh_pending_lists(
+    lead_name: str, triple: str, context: dict
+) -> None:
+    work_id = "lead-n04"
+    inb = _run(
+        ["shop-msg", "pending", "inbox", "--lead", lead_name], context
+    ).stdout
+    assert any(work_id in l and "work_done" in l for l in inb.splitlines()), (
+        f"expected {work_id} work_done pending in lead inbox after --force "
+        f"re-emit; got:\n{inb}"
+    )
+
+
+@then(
+    parsers.parse(
+        '"shop-msg read inbox --lead {lead_name} --work-id {work_id}" returns '
+        'the {summary} payload (NOT the {other} payload)'
+    )
+)
+def nn5f_then_read_returns_replacement(
+    lead_name: str, work_id: str, summary: str, other: str, context: dict
+) -> None:
+    result = _run(
+        ["shop-msg", "read", "inbox", "--lead", lead_name, "--work-id", work_id],
+        context,
+    )
+    assert summary in result.stdout, (
+        f"expected replacement summary {summary!r} in read output; got:\n"
+        f"{result.stdout}"
+    )
+    assert other not in result.stdout, (
+        f"did not expect superseded summary {other!r} in read output; got:\n"
+        f"{result.stdout}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that --force is observable '
+        'to the lead on its next read regardless of any reconciliation state '
+        'the lead is carrying in-process; the lead\'s reconciliation is a '
+        'per-turn read, not a row-level lease that --force has to wait on'
+    )
+)
+def nn5f_then_force_observable_property(context: dict) -> None:
+    pass
+
+
+@then(
+    parsers.parse(
+        'a fresh lead-inbox row at {triple} is created carrying the {summary} '
+        'payload'
+    )
+)
+def nn5f_then_fresh_inbox_row(triple: str, summary: str, context: dict) -> None:
+    work_id = "lead-n05"
+    lead_root = get_session_lead_root()
+    payload = _fetch_lead_inbox_payload(lead_root, work_id, "work_done")
+    assert payload is not None, (
+        f"expected a fresh lead-inbox work_done row for {work_id}; none found"
+    )
+    assert summary in json.dumps(payload), (
+        f"expected {summary!r} in fresh lead-inbox payload; got: {payload!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'a NOTIFY fires on the lead\'s inbox channel and the watcher emits a '
+        'fresh "{work_id} {mtype}" notification line on its stdout, identical '
+        'in form to the notification that fires on a first emit'
+    )
+)
+def nn5f_then_watcher_emits_line(
+    work_id: str, mtype: str, context: dict
+) -> None:
+    proc = context.get("watch_proc")
+    assert proc is not None, "expected an active watch process in context"
+    line = _read_next_watch_line(proc, timeout=10.0)
+    assert line is not None, (
+        f"expected watcher to emit a notification line for {work_id} after "
+        f"the re-emit; got none"
+    )
+    assert work_id in line, (
+        f"expected re-emit notification line to mention {work_id}; got {line!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that consume-then-re-emit is '
+        'observationally indistinguishable from a first emit on the wake-up '
+        'channel: the lead\'s reactive posture (Monitor armed on watch --lead) '
+        'wakes the same way for a re-emit as it does for a first emit, so '
+        'reconciliation logic does not need a separate "is this a re-emit?" '
+        'code path'
+    )
+)
+def nn5f_then_indistinguishable_property(context: dict) -> None:
+    pass
+

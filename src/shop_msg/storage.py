@@ -447,8 +447,22 @@ def consume_outbox_message(bc_root: str, work_id: str, message_type: str) -> boo
     Returns True if the row was found and marked consumed, False if no matching
     unconsumed outbox row exists. Does not raise on missing rows; the CLI layer
     translates False into a non-zero exit with a descriptive error.
+
+    Recovery-surface symmetry (lead-nn5f): consume is one of two recovery
+    paths (the other being ``shop-msg respond --force``). For the two to
+    compose, consume must do more than flip the BC-outbox marker — in the
+    SAME transaction it also releases the lead-inbox row at
+    (bc=lead_root, direction='inbox', work_id, message_type) by DELETE,
+    scoped to exactly the same (bc, work_id, message_type) triple as the
+    --force DELETE in :func:`insert_bc_response`. After consume the
+    response is no longer authoritative, so the BC may re-emit cleanly
+    under the original verb WITHOUT escalating to --force: there is no
+    surviving lead-inbox row to collide against. The DELETE is triple-
+    scoped, so a different message_type's row on the same work_id is left
+    intact on both surfaces.
     """
     bc = _bc_id(bc_root)
+    lead_root = resolve_lead_shop()
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -462,6 +476,21 @@ def consume_outbox_message(bc_root: str, work_id: str, message_type: str) -> boo
                 (bc, work_id, message_type),
             )
             rows_affected = cur.rowcount
+            # Release the lead-inbox slot in the SAME transaction, scoped to
+            # the same (bc, work_id, message_type) triple as the --force
+            # DELETE so the two recovery paths compose without cross-talk.
+            # A no-op when no lead is registered or no matching lead-inbox
+            # row exists.
+            if lead_root is not None:
+                lead_bc_id = _bc_id(lead_root)
+                cur.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE bc = %s AND work_id = %s
+                      AND direction = 'inbox' AND message_type = %s
+                    """,
+                    (lead_bc_id, work_id, message_type),
+                )
         conn.commit()
     return rows_affected > 0
 
