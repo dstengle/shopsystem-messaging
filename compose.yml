@@ -14,4 +14,4 @@ services:
 
 networks:
   shopsystem:
-    attachable: true
+    external: true

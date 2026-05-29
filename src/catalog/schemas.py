@@ -66,6 +66,11 @@ class RequestMaintenance(BaseModel):
     description: str
     acceptance_criteria: list[str] | None = None
     file_hints: list[str] | None = None
+    # from_shop names the sender (the shop that ran `shop-msg send`).
+    # When the sender is resolved implicitly from CWD (PDR-008), the CLI
+    # populates this field with the canonical name read from the sender
+    # shop's .claude/shop/name.md. None when not resolved.
+    from_shop: str | None = None
 
 
 class ScenarioPayload(BaseModel):
@@ -123,6 +128,9 @@ class AssignScenarios(BaseModel):
     message_type: Literal["assign_scenarios"]
     work_id: str
     scenarios: list[ScenarioPayload]
+    # See RequestMaintenance.from_shop. Populated by `shop-msg send` when
+    # the sender is resolved implicitly from CWD (PDR-008).
+    from_shop: str | None = None
 
 
 class RequestBugfix(BaseModel):
@@ -130,6 +138,9 @@ class RequestBugfix(BaseModel):
     work_id: str
     description: str
     scenarios: list[ScenarioPayload] = Field(default_factory=list)
+    # See RequestMaintenance.from_shop. Populated by `shop-msg send` when
+    # the sender is resolved implicitly from CWD (PDR-008).
+    from_shop: str | None = None
 
 
 class Clarify(BaseModel):

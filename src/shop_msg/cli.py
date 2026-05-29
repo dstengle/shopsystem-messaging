@@ -105,6 +105,7 @@ from shop_msg.storage import (
     CollisionError,
     consume_outbox_message,
     delete_bc_messages,
+    existing_lead_inbox_message_type,
     inbox_row_exists,
     insert_bc_response,
     insert_message,
@@ -163,6 +164,93 @@ def _add_removed_flag(parser: argparse.ArgumentParser, flag: str) -> None:
         action=_RemovedFlagAction,
         help=argparse.SUPPRESS,
     )
+
+
+def _walk_up_resolve_shop(start: Path | None = None) -> tuple[str, str]:
+    """Walk up from CWD looking for the nearest .claude/shop/ marker.
+
+    Returns ``(canonical_name, shop_type)`` read literally from
+    ``.claude/shop/name.md`` and ``.claude/shop/type.md`` of the nearest
+    ancestor that contains both files.
+
+    Exits non-zero with a diagnostic to stderr when:
+      - No ancestor (up to the filesystem root) contains a
+        ``.claude/shop/`` directory with both ``name.md`` and ``type.md``.
+      - The nearest ``.claude/shop/`` is partial (only one of the two
+        files is present).
+
+    The shop_type value is one of ``"bc"`` or ``"lead"``; values outside
+    this set are surfaced as an error so a typo in type.md does not
+    silently route a shop into the wrong mode.
+    """
+    cwd = (start or Path.cwd()).resolve()
+
+    cur = cwd
+    while True:
+        marker = cur / ".claude" / "shop"
+        if marker.is_dir():
+            name_path = marker / "name.md"
+            type_path = marker / "type.md"
+            has_name = name_path.is_file()
+            has_type = type_path.is_file()
+            if has_name and has_type:
+                name = name_path.read_text().strip()
+                shop_type = type_path.read_text().strip()
+                if shop_type not in ("bc", "lead"):
+                    print(
+                        f"shop-msg: shop marker at {marker} has unrecognized "
+                        f"shop type {shop_type!r}; expected 'bc' or 'lead'.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                return name, shop_type
+            # Partial marker (one file but not the other) — the resolved
+            # marker is incomplete; do not silently fall through to a
+            # higher ancestor and do not treat it as either shop type.
+            missing = "type.md" if has_name else "name.md"
+            print(
+                f"shop-msg: shop marker at {marker} is incomplete: "
+                f"missing {missing!r}. A .claude/shop/ marker must contain "
+                f"both name.md and type.md.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    print(
+        f"shop-msg: no shop was found by walking up from the current "
+        f"directory {cwd!s}; no ancestor contains a .claude/shop/ "
+        f"directory with both name.md and type.md.\n"
+        f"Remediation: cd into a shop directory (one whose .claude/shop/ "
+        f"contains both name.md and type.md), or pass an explicit "
+        f"--bc <name> or --lead <name> flag.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _apply_cwd_resolution(args: argparse.Namespace) -> None:
+    """Populate args.bc or args.lead from CWD if neither was given.
+
+    Used by the bare-invocation surface (``shop-msg prime / pending / read /
+    respond / watch``): when neither addressing flag is supplied, walk up
+    from CWD to find the invoking shop's .claude/shop/ marker, then
+    populate the appropriate args attribute based on the shop type read
+    from type.md (PDR-008).
+
+    No-op when one of the flags is already set (explicit-flag precedence).
+    """
+    bc = getattr(args, "bc", None)
+    lead = getattr(args, "lead", None)
+    if bc is not None or lead is not None:
+        return
+    name, shop_type = _walk_up_resolve_shop()
+    if shop_type == "lead":
+        args.lead = name
+    else:
+        args.bc = name
 
 
 def _resolve_bc(args: argparse.Namespace) -> str:
@@ -266,11 +354,16 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
             args.work_id,
             "clarify",
             message.model_dump(),
+            force=getattr(args, "force", False),
         )
     except CollisionError:
+        existing = existing_lead_inbox_message_type(
+            lead_root, args.work_id, "clarify"
+        ) or "clarify"
         print(
-            f"shop-msg respond clarify: refusing to overwrite existing response "
-            f"for work_id={args.work_id!r}",
+            f"shop-msg respond clarify: refusing to overwrite existing "
+            f"{existing} response for work_id={args.work_id!r} "
+            f"(use --force to replace)",
             file=sys.stderr,
         )
         return 1
@@ -304,11 +397,16 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
             args.work_id,
             "work_done",
             message.model_dump(),
+            force=getattr(args, "force", False),
         )
     except CollisionError:
+        existing = existing_lead_inbox_message_type(
+            lead_root, args.work_id, "work_done"
+        ) or "work_done"
         print(
-            f"shop-msg respond work_done: refusing to overwrite existing response "
-            f"for work_id={args.work_id!r}",
+            f"shop-msg respond work_done: refusing to overwrite existing "
+            f"{existing} response for work_id={args.work_id!r} "
+            f"(use --force to replace)",
             file=sys.stderr,
         )
         return 1
@@ -353,15 +451,42 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
             args.work_id,
             "mechanism_observation",
             message.model_dump(exclude_none=True),
+            force=getattr(args, "force", False),
         )
     except CollisionError:
+        existing = existing_lead_inbox_message_type(
+            lead_root, args.work_id, "mechanism_observation"
+        ) or "mechanism_observation"
         print(
             f"shop-msg respond mechanism_observation: refusing to overwrite "
-            f"existing response for work_id={args.work_id!r}",
+            f"existing {existing} response for work_id={args.work_id!r} "
+            f"(use --force to replace)",
             file=sys.stderr,
         )
         return 1
     return 0
+
+
+def _resolve_send_sender() -> str | None:
+    """Resolve the sender's canonical name for `shop-msg send`.
+
+    Walks up from CWD to find the nearest .claude/shop/ marker and returns
+    the canonical name read from ``name.md``. Unlike the bare-invocation
+    resolution used by prime/pending/read/respond/watch, this is a soft
+    lookup: when no marker is found we return None instead of exiting,
+    because the sender's identity is supplementary context — the recipient
+    flag is what matters for delivery.
+
+    The recipient address is NEVER resolved here; that remains explicit
+    via --bc / --lead (PDR-008, scenario 6492effd22a6d3e7).
+    """
+    try:
+        name, _shop_type = _walk_up_resolve_shop()
+    except SystemExit:
+        # No marker found — the sender's identity is not derivable, but
+        # send still proceeds (the recipient flag is what delivery uses).
+        return None
+    return name
 
 
 def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
@@ -376,6 +501,7 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
         description=args.description,
         acceptance_criteria=acceptance_criteria,
         file_hints=file_hints,
+        from_shop=_resolve_send_sender(),
     )
 
     try:
@@ -469,6 +595,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
         work_id=args.work_id,
         description=args.description,
         scenarios=scenarios_payload,
+        from_shop=_resolve_send_sender(),
     )
 
     try:
@@ -477,7 +604,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
             args.work_id,
             "inbox",
             "request_bugfix",
-            message.model_dump(),
+            message.model_dump(exclude_none=True),
             notify=True,
         )
     except CollisionError:
@@ -503,6 +630,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         message_type="assign_scenarios",
         work_id=args.work_id,
         scenarios=scenarios_payload,
+        from_shop=_resolve_send_sender(),
     )
 
     try:
@@ -511,7 +639,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
             args.work_id,
             "inbox",
             "assign_scenarios",
-            message.model_dump(),
+            message.model_dump(exclude_none=True),
             notify=True,
         )
     except CollisionError:
@@ -586,10 +714,27 @@ def _cmd_pending_inbox(args: argparse.Namespace) -> int:
     """Enumerate inbox messages that have no matching outbox response.
 
     Queries Postgres using the pending-query SQL that replaces the old
-    directory-glob walk. Missing bc_root directories are no longer
-    relevant — the database is the store.
+    directory-glob walk.
+
+    Registry staleness guard: before querying, verify that the path
+    resolved from the registry actually exists on disk.  If it does not,
+    the registry entry is stale (e.g. a test fixture overwrote it with a
+    tmp path that has since been deleted) and the query would silently
+    return zero rows even though the real inbox messages live under a
+    different path.  Emitting a clear error surfaces the problem instead
+    of hiding it.
     """
     bc_root = _resolve_bc(args)
+    resolved = Path(bc_root)
+    if not resolved.exists():
+        print(
+            f"shop-msg: registry entry for {args.bc!r} points to path "
+            f"{bc_root!r} which does not exist on disk.  The registry may "
+            f"be stale.  Re-register the BC with:\n"
+            f"  shop-msg registry add {args.bc} <correct-path>",
+            file=sys.stderr,
+        )
+        return 1
     rows = query_pending_inbox(bc_root)
     for work_id, message_type in rows:
         print(f"{work_id} {message_type}")
@@ -726,6 +871,67 @@ def _print_prime_reminder(bc_name: str) -> None:
     )
 
 
+def _cmd_prime_lead(args: argparse.Namespace) -> int:
+    """Session-start orientation for lead shop agents.
+
+    Prints:
+      1. Current DSN
+      2. DB reachability (yes / no — <error>)
+      3. Count of unconsumed BC responses in the lead's inbox
+      4. Each pending work_id + message_type
+      5. A brief reminder block with key commands for the lead role
+
+    Exit 0 when DB is reachable; non-zero when unreachable.
+    """
+    from shop_msg.storage import _get_dsn, query_pending_lead_inbox
+
+    lead_root = _resolve_lead(args)
+    lead_name = args.lead
+    dsn = _get_dsn()
+
+    print(f"DSN: {dsn}")
+
+    # Probe connectivity.
+    try:
+        pending_rows = query_pending_lead_inbox(lead_root)
+        db_reachable = True
+    except Exception as exc:
+        print(f"DB reachable: no — {exc}")
+        print()
+        _print_prime_lead_reminder(lead_name)
+        return 1
+
+    print("DB reachable: yes")
+    print()
+
+    count = len(pending_rows)
+    print(f"Pending outbox responses: {count}")
+    for work_id, message_type in pending_rows:
+        print(f"  {work_id}  {message_type}")
+    print()
+
+    _print_prime_lead_reminder(lead_name)
+    return 0
+
+
+def _print_prime_lead_reminder(lead_name: str) -> None:
+    print(
+        "Use shop-msg CLI commands — inbox/outbox are in postgres, not on the filesystem.\n"
+        "Key commands:\n"
+        f"  shop-msg pending inbox --lead {lead_name}\n"
+        f"  shop-msg read inbox --lead {lead_name} --work-id <id>\n"
+        "  shop-msg respond clarify  # lead answers BC questions\n"
+        "  shop-msg respond work_done | mechanism_observation ..."
+    )
+
+
+def _cmd_prime_dispatch(args: argparse.Namespace) -> int:
+    """Dispatch prime to BC mode (--bc) or lead mode (--lead)."""
+    if getattr(args, "lead", None):
+        return _cmd_prime_lead(args)
+    return _cmd_prime(args)
+
+
 def _cmd_dump(args: argparse.Namespace) -> int:
     """Operator debugging: dump rows from the messages table."""
     import json as _json
@@ -839,14 +1045,39 @@ def build_parser() -> argparse.ArgumentParser:
     respond_sub = respond.add_subparsers(dest="response_type", required=True)
 
     clarify = respond_sub.add_parser("clarify", help="write a clarify response")
-    clarify.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    clarify.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (resolved via registry). Optional: when "
+            "omitted, the BC name is resolved from CWD via .claude/shop/ "
+            "marker walk-up (PDR-008)."
+        ),
+    )
     _add_removed_flag(clarify, "--bc-root")
     clarify.add_argument("--work-id", required=True, help="work_id from the lead message")
     clarify.add_argument("--question", required=True, help="clarifying question text")
-    clarify.set_defaults(func=_cmd_respond_clarify)
+    clarify.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace an existing same-message_type lead-inbox response for this "
+            "work_id (recovery path; lead-2id). Without --force the command "
+            "refuses on collision."
+        ),
+    )
+    clarify.set_defaults(func=_cmd_respond_clarify, _cwd_resolves=True)
 
     work_done = respond_sub.add_parser("work_done", help="write a work_done response")
-    work_done.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    work_done.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (resolved via registry). Optional: when "
+            "omitted, the BC name is resolved from CWD via .claude/shop/ "
+            "marker walk-up (PDR-008)."
+        ),
+    )
     _add_removed_flag(work_done, "--bc-root")
     work_done.add_argument("--work-id", required=True, help="work_id from the lead message")
     work_done.add_argument(
@@ -866,13 +1097,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional free-form summary of what was done",
     )
-    work_done.set_defaults(func=_cmd_respond_work_done)
+    work_done.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace an existing same-message_type lead-inbox response for this "
+            "work_id (recovery path; lead-2id). Without --force the command "
+            "refuses on collision."
+        ),
+    )
+    work_done.set_defaults(func=_cmd_respond_work_done, _cwd_resolves=True)
 
     mech_obs = respond_sub.add_parser(
         "mechanism_observation",
         help="surface a BC observation about the shop-system mechanism",
     )
-    mech_obs.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    mech_obs.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (resolved via registry). Optional: when "
+            "omitted, the BC name is resolved from CWD via .claude/shop/ "
+            "marker walk-up (PDR-008)."
+        ),
+    )
     _add_removed_flag(mech_obs, "--bc-root")
     mech_obs.add_argument(
         "--work-id", required=True,
@@ -910,7 +1158,18 @@ def build_parser() -> argparse.ArgumentParser:
             "tracker (lead-231 item C)."
         ),
     )
-    mech_obs.set_defaults(func=_cmd_respond_mechanism_observation)
+    mech_obs.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace an existing same-message_type lead-inbox response for this "
+            "work_id (recovery path; lead-2id). Without --force the command "
+            "refuses on collision."
+        ),
+    )
+    mech_obs.set_defaults(
+        func=_cmd_respond_mechanism_observation, _cwd_resolves=True
+    )
 
     send = sub.add_parser("send", help="write a lead-to-BC message into a BC's inbox")
     send_sub = send.add_subparsers(dest="message_type", required=True)
@@ -1010,12 +1269,20 @@ def build_parser() -> argparse.ArgumentParser:
     read_outbox = read_sub.add_parser(
         "outbox", help="read and validate a BC response from its outbox"
     )
-    read_outbox.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    read_outbox.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (resolved via registry). Optional: when "
+            "omitted, the BC name is resolved from CWD via .claude/shop/ "
+            "marker walk-up (PDR-008)."
+        ),
+    )
     _add_removed_flag(read_outbox, "--bc-root")
     read_outbox.add_argument(
         "--work-id", required=True, help="work_id whose response to read"
     )
-    read_outbox.set_defaults(func=_cmd_read_outbox)
+    read_outbox.set_defaults(func=_cmd_read_outbox, _cwd_resolves=True)
 
     read_inbox = read_sub.add_parser(
         "inbox",
@@ -1024,12 +1291,27 @@ def build_parser() -> argparse.ArgumentParser:
             "or a BC response from the lead's inbox (--lead)"
         ),
     )
-    _read_inbox_mode = read_inbox.add_mutually_exclusive_group(required=True)
+    # The mutually-exclusive group is *not required* at parse time so that
+    # bare invocations (PDR-008) can populate one of the flags via CWD
+    # walk-up before dispatch. argparse still enforces that both cannot be
+    # set simultaneously.
+    _read_inbox_mode = read_inbox.add_mutually_exclusive_group(required=False)
     _read_inbox_mode.add_argument(
-        "--bc", default=None, help="canonical BC name (BC-side inbox mode)"
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (BC-side inbox mode). Optional: when neither "
+            "--bc nor --lead is supplied, the shop is resolved from CWD via "
+            ".claude/shop/ marker walk-up (PDR-008)."
+        ),
     )
     _read_inbox_mode.add_argument(
-        "--lead", default=None, help="canonical lead shop name (lead-side inbox mode)"
+        "--lead",
+        default=None,
+        help=(
+            "canonical lead shop name (lead-side inbox mode). Optional: see "
+            "--bc help above."
+        ),
     )
     _add_removed_flag(read_inbox, "--bc-root")
     read_inbox.add_argument(
@@ -1041,7 +1323,7 @@ def build_parser() -> argparse.ArgumentParser:
             return _cmd_read_lead_inbox(args)
         return _cmd_read_inbox(args)
 
-    read_inbox.set_defaults(func=_dispatch_read_inbox)
+    read_inbox.set_defaults(func=_dispatch_read_inbox, _cwd_resolves=True)
 
     pending = sub.add_parser(
         "pending", help="enumerate pending mailbox entries (queries, not gates)"
@@ -1055,12 +1337,25 @@ def build_parser() -> argparse.ArgumentParser:
             "or list BC responses in the lead's inbox (lead side: --lead)"
         ),
     )
-    _pending_inbox_mode = pending_inbox.add_mutually_exclusive_group(required=True)
+    # Not required at parse time — bare invocations resolve via CWD walk-up
+    # (PDR-008). argparse still enforces that both cannot be set together.
+    _pending_inbox_mode = pending_inbox.add_mutually_exclusive_group(required=False)
     _pending_inbox_mode.add_argument(
-        "--bc", default=None, help="canonical BC name (BC-side inbox mode)"
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (BC-side inbox mode). Optional: when neither "
+            "--bc nor --lead is supplied, the shop is resolved from CWD via "
+            ".claude/shop/ marker walk-up (PDR-008)."
+        ),
     )
     _pending_inbox_mode.add_argument(
-        "--lead", default=None, help="canonical lead shop name (lead-side inbox mode)"
+        "--lead",
+        default=None,
+        help=(
+            "canonical lead shop name (lead-side inbox mode). Optional: see "
+            "--bc help above."
+        ),
     )
     _add_removed_flag(pending_inbox, "--bc-root")
 
@@ -1069,7 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
             return _cmd_pending_lead_inbox(args)
         return _cmd_pending_inbox(args)
 
-    pending_inbox.set_defaults(func=_dispatch_pending_inbox)
+    pending_inbox.set_defaults(func=_dispatch_pending_inbox, _cwd_resolves=True)
 
     pending_outbox = pending_sub.add_parser(
         "outbox",
@@ -1077,8 +1372,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pending_outbox.add_argument(
         "--lead",
-        required=True,
-        help="canonical lead shop name (resolved via registry to lead root path)",
+        default=None,
+        help=(
+            "canonical lead shop name (resolved via registry to lead root "
+            "path). Optional: when omitted, the lead shop is resolved from "
+            "CWD via .claude/shop/ marker walk-up (PDR-008)."
+        ),
     )
     _add_removed_flag(pending_outbox, "--lead-root")
     pending_outbox.add_argument(
@@ -1087,7 +1386,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="bc_name",
         help="restrict to a single BC by canonical name",
     )
-    pending_outbox.set_defaults(func=_cmd_pending_outbox)
+    pending_outbox.set_defaults(func=_cmd_pending_outbox, _cwd_resolves=True)
 
     consume = sub.add_parser(
         "consume",
@@ -1125,9 +1424,28 @@ def build_parser() -> argparse.ArgumentParser:
         "prime",
         help="session-start orientation: DSN, DB health, pending inbox, and CLI reminder",
     )
-    prime.add_argument("--bc", required=True, help="canonical BC name (resolved via registry)")
+    # Not required at parse time — bare invocations resolve via CWD walk-up
+    # (PDR-008). argparse still enforces that both cannot be set together.
+    _prime_mode = prime.add_mutually_exclusive_group(required=False)
+    _prime_mode.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (resolved via registry). Optional: when "
+            "neither --bc nor --lead is supplied, the shop is resolved "
+            "from CWD via .claude/shop/ marker walk-up (PDR-008)."
+        ),
+    )
+    _prime_mode.add_argument(
+        "--lead",
+        default=None,
+        help=(
+            "canonical lead shop name (lead mode). Optional: see --bc "
+            "help above."
+        ),
+    )
     _add_removed_flag(prime, "--bc-root")
-    prime.set_defaults(func=_cmd_prime)
+    prime.set_defaults(func=_cmd_prime_dispatch, _cwd_resolves=True)
 
     dump = sub.add_parser(
         "dump",
@@ -1159,18 +1477,31 @@ def build_parser() -> argparse.ArgumentParser:
             "outbox watching across all BCs (lead mode)."
         ),
     )
-    _watch_mode = watch.add_mutually_exclusive_group(required=True)
-    _watch_mode.add_argument("--bc", default=None, help="canonical BC name (inbox watch mode)")
+    # Not required at parse time — bare invocations resolve via CWD walk-up
+    # (PDR-008). argparse still enforces that both cannot be set together.
+    _watch_mode = watch.add_mutually_exclusive_group(required=False)
+    _watch_mode.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name (inbox watch mode). Optional: when neither "
+            "--bc nor --lead is supplied, the shop is resolved from CWD via "
+            ".claude/shop/ marker walk-up (PDR-008)."
+        ),
+    )
     _watch_mode.add_argument(
         "--lead",
         default=None,
-        help="canonical lead shop name (outbox watch mode)",
+        help=(
+            "canonical lead shop name (outbox watch mode). Optional: see "
+            "--bc help above."
+        ),
     )
     # Register removed flags on watch but they cannot be in the mutex group;
     # they're handled via the action which exits immediately.
     _add_removed_flag(watch, "--bc-root")
     _add_removed_flag(watch, "--lead-root")
-    watch.set_defaults(func=_cmd_watch)
+    watch.set_defaults(func=_cmd_watch, _cwd_resolves=True)
 
     # Registry subcommand
     registry = sub.add_parser(
@@ -1225,6 +1556,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Subcommands that opt in to CWD-implicit shop resolution mark themselves
+    # via set_defaults(_cwd_resolves=True). When neither --bc nor --lead was
+    # given on such a subcommand, walk up from CWD to find the invoking
+    # shop's .claude/shop/ marker and populate the appropriate flag
+    # (PDR-008). Subcommands that do not opt in (registry, dump, send) are
+    # untouched by this pass.
+    if getattr(args, "_cwd_resolves", False):
+        _apply_cwd_resolution(args)
     return args.func(args)
 
 

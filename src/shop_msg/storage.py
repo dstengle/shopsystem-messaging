@@ -175,12 +175,18 @@ def insert_message(
     payload: dict[str, Any],
     *,
     notify: bool = False,
+    allow_multi_type: bool = False,
 ) -> None:
     """Insert a message row into the messages table.
 
     Raises CollisionError if:
-    - For inbox direction: any row already exists for (bc, work_id, 'inbox')
-      regardless of message_type. A BC receives exactly one message per work_id.
+    - For inbox direction with allow_multi_type=False (default): any row already
+      exists for (bc, work_id, 'inbox') regardless of message_type.  A lead sends
+      exactly one message per work_id into any BC's inbox.
+    - For inbox direction with allow_multi_type=True: only raises if a row with the
+      same (bc, work_id, 'inbox', message_type) already exists.  This path is used
+      by BC-to-lead writes where multiple message_types (work_done, clarify,
+      mechanism_observation) may land in the lead inbox for the same work_id.
     - For outbox direction: a row with the same (bc, work_id, 'outbox',
       message_type) already exists. The UNIQUE constraint handles this.
 
@@ -193,9 +199,15 @@ def insert_message(
     payload_json = json.dumps(payload)
     with _connect() as conn:
         with conn.cursor() as cur:
-            # For inbox: enforce work_id uniqueness regardless of message_type.
-            # A lead sends exactly one message per work_id into any BC's inbox.
-            if direction == "inbox":
+            # For inbox: enforce uniqueness.
+            # When allow_multi_type=False (the default, used by lead-to-BC sends):
+            #   a lead sends exactly one message per work_id, so any existing inbox
+            #   row for (bc, work_id) raises CollisionError regardless of message_type.
+            # When allow_multi_type=True (used by BC-to-lead writes):
+            #   multiple message_types are permitted for the same work_id; only a
+            #   duplicate (bc, work_id, direction, message_type) raises CollisionError,
+            #   which the DB UNIQUE constraint enforces via ON CONFLICT DO NOTHING below.
+            if direction == "inbox" and not allow_multi_type:
                 cur.execute(
                     """
                     SELECT 1 FROM messages
@@ -469,12 +481,27 @@ def insert_raw_payload(
     direction: str,
     message_type: str,
     payload: dict[str, Any],
+    *,
+    allow_multi_type: bool = False,
 ) -> None:
     """Insert a raw (unvalidated) payload. Used by test setup steps that
     need to inject invalid payloads for schema-validation error paths.
     Does NOT fire NOTIFY. Raises CollisionError on duplicate.
+
+    When allow_multi_type=True, multiple message_types are permitted for the
+    same (bc, work_id, direction='inbox') — matching the semantics of
+    BC-to-lead inbox writes where work_done, clarify, and mechanism_observation
+    may all arrive for the same work_id.
     """
-    insert_message(bc_root, work_id, direction, message_type, payload, notify=False)
+    insert_message(
+        bc_root,
+        work_id,
+        direction,
+        message_type,
+        payload,
+        notify=False,
+        allow_multi_type=allow_multi_type,
+    )
 
 
 def list_bc_roots_for_lead(lead_root: str) -> list[str]:
@@ -779,12 +806,43 @@ def _lead_inbox_slug(lead_root: str) -> str:
     return f"inbox_{slug}"[:63]
 
 
+def existing_lead_inbox_message_type(
+    lead_root: str, work_id: str, message_type: str
+) -> str | None:
+    """Return the message_type of an existing lead-inbox row for this triple, or None.
+
+    Used by the CLI to enrich the collision error message (lead-b3z) with the
+    existing row's message_type before reporting refusal. The triple keyed on
+    is (bc=lead_root, direction='inbox', work_id, message_type) — identical to
+    the SELECT gate in ``insert_bc_response`` — so a hit means a collision
+    would occur on a fresh (non-force) insert.
+    """
+    lead_bc_id = _bc_id(lead_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT message_type FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
+                LIMIT 1
+                """,
+                (lead_bc_id, work_id, message_type),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return row["message_type"]
+
+
 def insert_bc_response(
     lead_root: str,
     bc_root: str,
     work_id: str,
     message_type: str,
     payload: dict[str, Any],
+    *,
+    force: bool = False,
 ) -> None:
     """Insert a BC response into the lead shop's inbox namespace.
 
@@ -807,6 +865,16 @@ def insert_bc_response(
     is raised (no second write attempted).  The BC-side marker is written
     idempotently (ON CONFLICT DO NOTHING) since it is a secondary artefact.
 
+    Recovery path (``force=True``, lead-2id): the existing lead-inbox row
+    matching the (bc=lead_root, direction='inbox', work_id, message_type)
+    triple is DELETEd in the SAME transaction as the replacement INSERT, so
+    the new payload becomes the surviving delivered response.  The DELETE is
+    scoped to exactly that triple (per-message_type), matching the SELECT gate;
+    a different message_type's row on the same work_id is untouched.  The
+    BC-side marker is re-written so it carries the replacement payload too.
+    NOTIFY still fires on the force path so ``shop-msg watch --lead`` wakes for
+    the replacement.
+
     After a successful insert, fires NOTIFY on the lead-inbox channel so
     ``shop-msg watch --lead`` can wake up.
     """
@@ -816,21 +884,44 @@ def insert_bc_response(
 
     with _connect() as conn:
         with conn.cursor() as cur:
-            # Check collision on the lead-inbox row first (primary target).
-            cur.execute(
-                """
-                SELECT 1 FROM messages
-                WHERE bc = %s AND work_id = %s
-                  AND direction = 'inbox' AND message_type = %s
-                LIMIT 1
-                """,
-                (lead_bc_id, work_id, message_type),
-            )
-            if cur.fetchone() is not None:
-                raise CollisionError(
-                    f"response already exists: lead={lead_root!r} work_id={work_id!r} "
-                    f"message_type={message_type!r}"
+            if force:
+                # Recovery path: atomically replace the existing triple.
+                # DELETE the prior lead-inbox row (scoped per-message_type) so
+                # the replacement INSERT lands cleanly in the same transaction.
+                cur.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE bc = %s AND work_id = %s
+                      AND direction = 'inbox' AND message_type = %s
+                    """,
+                    (lead_bc_id, work_id, message_type),
                 )
+                # Re-write the BC-side marker as well so it carries the
+                # replacement payload rather than a stale one.
+                cur.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE bc = %s AND work_id = %s
+                      AND direction = 'outbox' AND message_type = %s
+                    """,
+                    (bc_bc_id, work_id, message_type),
+                )
+            else:
+                # Check collision on the lead-inbox row first (primary target).
+                cur.execute(
+                    """
+                    SELECT 1 FROM messages
+                    WHERE bc = %s AND work_id = %s
+                      AND direction = 'inbox' AND message_type = %s
+                    LIMIT 1
+                    """,
+                    (lead_bc_id, work_id, message_type),
+                )
+                if cur.fetchone() is not None:
+                    raise CollisionError(
+                        f"response already exists: lead={lead_root!r} work_id={work_id!r} "
+                        f"message_type={message_type!r}"
+                    )
 
             # 1. Write to lead inbox.
             cur.execute(
@@ -920,6 +1011,127 @@ def read_lead_inbox_message(lead_root: str, work_id: str) -> dict[str, Any] | No
     return payload
 
 
+# ---------------------------------------------------------------------------
+# LISTEN-drop reconnect (lead-m32 / supersedes lead-7v1)
+#
+# The long-running Monitor surfaces (watch_lead_inbox, watch_inbox) block on a
+# bare `for notify in conn.notifies():` loop. If the underlying connection is
+# dropped (DB container restart, network hiccup, keepalive expiry) the bare
+# loop silently stops delivering notifications while the process stays alive —
+# the lead-7v1 bug. The hybrid contract: bounded reconnect with per-attempt
+# stdout logging, then a non-zero exit with stderr on exhaustion.
+# ---------------------------------------------------------------------------
+
+# Bounded reconnect params: max 5 attempts, exponential backoff starting at 1s
+# (1, 2, 4, 8, 16). Round numbers chosen as a simple test seam.
+_LISTEN_MAX_ATTEMPTS = 5
+_LISTEN_BACKOFF_BASE = 1
+
+
+def _listen_backoff_seconds(attempt: int) -> int:
+    """Backoff for a 1-indexed reconnect attempt: 1, 2, 4, 8, 16."""
+    return _LISTEN_BACKOFF_BASE * (2 ** (attempt - 1))
+
+
+def _sleep(seconds: float) -> None:
+    """Sleep seam — overridable in tests so reconnect backoff is instant."""
+    import time as _time
+
+    _time.sleep(seconds)
+
+
+def _reconfigure_stdout_line_buffered() -> None:
+    """Force line-buffering on stdout when supported.
+
+    No-op when stdout does not support reconfigure() (e.g. an in-process
+    StringIO under redirect_stdout in the test harness), so the watcher
+    surfaces remain directly callable in-process.
+    """
+    import sys
+
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(line_buffering=True)
+
+
+def _open_listen_connection(channel: str):
+    """Open a fresh autocommit connection and LISTEN on ``channel``.
+
+    Factored out so the reconnect path and the initial connect path share one
+    implementation, and so tests can monkeypatch the reconnect seam.
+    """
+    from psycopg import sql
+
+    dsn = _get_dsn()
+    conn = psycopg.connect(dsn, autocommit=True)
+    conn.execute(sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel)))
+    return conn
+
+
+# Connection-loss signals collapsed into one handler. notifies() may raise
+# psycopg.OperationalError directly, or exhaust (StopIteration, surfaced as a
+# normal loop exit) with conn.broken True, or raise IOError on a dead socket.
+_LISTEN_DROP_EXCEPTIONS = (psycopg.OperationalError, IOError)
+
+
+def _run_listen_loop_with_reconnect(conn, channel: str, handle_notify) -> None:
+    """Run the live NOTIFY loop with bounded reconnect.
+
+    ``conn`` is the already-LISTENing connection (post-drain). ``handle_notify``
+    is called with each ``notify`` object. On a connection drop this re-opens a
+    fresh LISTEN connection and resumes the bare notifies() loop ONLY — it never
+    re-runs the caller's drain phase, so already-handled work_ids are not
+    re-emitted (the lead-m32 no-re-drain constraint).
+    """
+    import sys
+
+    while True:
+        dropped = False
+        try:
+            for notify in conn.notifies():
+                handle_notify(notify)
+            # notifies() returned (generator exhausted). A clean exhaustion
+            # with a broken connection is a drop; otherwise treat as drop too,
+            # since the long-running loop is not expected to terminate normally.
+            dropped = True
+        except _LISTEN_DROP_EXCEPTIONS:
+            dropped = True
+
+        if not dropped:
+            return
+
+        # Reconnect with bounded exponential backoff.
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        reconnected = False
+        for attempt in range(1, _LISTEN_MAX_ATTEMPTS + 1):
+            backoff = _listen_backoff_seconds(attempt)
+            print(
+                f"LISTEN_DROP attempt={attempt}/{_LISTEN_MAX_ATTEMPTS} "
+                f"backoff={backoff}s"
+            )
+            _sleep(backoff)
+            try:
+                conn = _open_listen_connection(channel)
+            except _LISTEN_DROP_EXCEPTIONS:
+                continue
+            print("LISTEN_RECONNECTED")
+            reconnected = True
+            break
+
+        if not reconnected:
+            print(
+                f"error: LISTEN watcher could not reconnect after "
+                f"{_LISTEN_MAX_ATTEMPTS} attempts; exiting",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        # Loop back to resume the bare notifies() loop on the new conn.
+
+
 def watch_lead_inbox(lead_root: str) -> None:
     """Lead-side inbox watcher: drain pending BC responses then LISTEN for new ones.
 
@@ -957,7 +1169,7 @@ def watch_lead_inbox(lead_root: str) -> None:
         ) from exc
 
     try:
-        sys.stdout.reconfigure(line_buffering=True)
+        _reconfigure_stdout_line_buffered()
 
         _ensure_schema(conn)
 
@@ -982,8 +1194,8 @@ def watch_lead_inbox(lead_root: str) -> None:
 
         print("READY")
 
-        # Block indefinitely on NOTIFY.
-        for notify in conn.notifies():
+        # Block indefinitely on NOTIFY, with bounded reconnect on drop.
+        def _handle(notify):
             work_id = notify.payload
             # Look up message_type from the DB.
             with _connect() as lookup_conn:
@@ -1000,6 +1212,8 @@ def watch_lead_inbox(lead_root: str) -> None:
                     row = cur.fetchone()
             message_type = row["message_type"] if row else "unknown"
             print(f"{work_id} {message_type}")
+
+        _run_listen_loop_with_reconnect(conn, channel, _handle)
     finally:
         conn.close()
 
@@ -1073,7 +1287,7 @@ def watch_inbox(bc_root: str) -> None:
         # non-TTY stdout; `flush=True` on print() only flushes Python's
         # internal layer, not the underlying C-level buffer.  Reconfiguring
         # to line_buffering=True ensures every newline flushes through.
-        sys.stdout.reconfigure(line_buffering=True)
+        _reconfigure_stdout_line_buffered()
 
         _ensure_schema(conn)
 
@@ -1104,8 +1318,8 @@ def watch_inbox(bc_root: str) -> None:
         # Step 4: sentinel so callers can detect drain completion.
         print("READY")
 
-        # Step 5: block indefinitely on NOTIFY, printing one line per event.
-        for notify in conn.notifies():
+        # Step 5: block indefinitely on NOTIFY, with bounded reconnect on drop.
+        def _handle(notify):
             # The notification payload is the work_id.
             work_id = notify.payload
             # Look up the message_type from the DB using a separate connection.
@@ -1127,5 +1341,7 @@ def watch_inbox(bc_root: str) -> None:
                     row = cur.fetchone()
             message_type = row["message_type"] if row else "unknown"
             print(f"{work_id} {message_type}")
+
+        _run_listen_loop_with_reconnect(conn, channel, _handle)
     finally:
         conn.close()
