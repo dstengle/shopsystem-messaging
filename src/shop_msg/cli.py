@@ -101,10 +101,13 @@ from catalog.schemas import (
     ScenarioPayload,
     WorkDone,
 )
+from shop_msg import bd_facade
 from shop_msg.storage import (
     CollisionError,
+    OutboxDepositError,
     consume_outbox_message,
     delete_bc_messages,
+    dispatch_inbox_row_exists,
     existing_lead_inbox_message_type,
     inbox_row_exists,
     insert_bc_response,
@@ -285,6 +288,33 @@ def _resolve_lead(args: argparse.Namespace) -> str:
         )
         sys.exit(1)
     return str(Path(path).resolve())
+
+
+def _bc_origin_main_commit(bc_root: str) -> str | None:
+    """Return the short origin/main HEAD SHA of the BC clone, or None.
+
+    Recorded on the lead bd entry at dispatch time as
+    ``bc_origin_main_commit_at_dispatch`` (ADR-011 field mapping) so the lead
+    can later answer "what BC commit was current when we dispatched this?".
+    Best-effort: returns None when the path is not a git clone or git is not
+    available. Tries origin/main first, falling back to HEAD.
+    """
+    root = Path(bc_root)
+    if not (root / ".git").exists():
+        return None
+    for ref in ("origin/main", "HEAD"):
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--short", ref],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return None
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    return None
 
 
 def _resolve_registered_lead() -> str | None:
@@ -489,38 +519,184 @@ def _resolve_send_sender() -> str | None:
     return name
 
 
-def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
-    bc_root = _resolve_bc(args)
+def _bd_first_send(
+    *,
+    command: str,
+    bc_root: str,
+    bc_name: str,
+    work_id: str,
+    message_type: str,
+    payload: dict,
+    scenario_hashes_pinned: list[str] | None,
+    depends_on_dispatch: str | None,
+    bc_origin_main_commit: str | None,
+    payload_ref: str | None,
+) -> int:
+    """Run the bd-first 3-step send protocol (PDR-010 / ADR-012).
 
-    acceptance_criteria = list(args.acceptance_criterion or []) or None
-    file_hints = list(args.file_hint or []) or None
+    Step 1: write the lead bd entry at dispatch_state=outbox_pending carrying
+            the canonical field set as structured metadata, fsynced to disk.
+    Step 2: insert the postgres outbox (inbox-direction) row.
+    Step 3: flip the bd entry to dispatch_state=dispatched.
 
-    message = RequestMaintenance(
-        message_type="request_maintenance",
-        work_id=args.work_id,
-        description=args.description,
-        acceptance_criteria=acceptance_criteria,
-        file_hints=file_hints,
-        from_shop=_resolve_send_sender(),
-    )
+    The Step-3 flip is GUARDED by Step-2 success: when the postgres deposit
+    raises (OutboxDepositError), the bd entry is LEFT at outbox_pending and
+    the command exits non-zero naming the failure, so a later
+    ``shop-msg sweep`` can recover it (lead-tuu5 scenario ef558dc7233466d8).
+    bd never lies about transmission state.
 
+    When no lead shop is registered (a non-lead invocation, or a bare test of
+    the messaging layer), the bd steps are skipped and only the postgres
+    deposit runs, preserving the pre-lead-tuu5 behavior for callers that do
+    not participate in the bd dispatch lifecycle.
+    """
+    lead_root_str = _resolve_registered_lead()
+    use_bd = lead_root_str is not None and bd_facade.bd_available(Path(lead_root_str))
+    lead_root = Path(lead_root_str) if lead_root_str else None
+
+    # Step 1: bd write (durable) BEFORE any postgres write.
+    if use_bd:
+        outbox_pending_at = (
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        ).isoformat()
+        try:
+            bd_facade.create_dispatch_bead(
+                lead_root,
+                work_id,
+                dispatched_to_bc=bc_name,
+                dispatch_message_type=message_type,
+                scenario_hashes_pinned=scenario_hashes_pinned,
+                depends_on_dispatch=depends_on_dispatch,
+                bc_origin_main_commit_at_dispatch=bc_origin_main_commit,
+                payload_ref=payload_ref,
+                outbox_pending_at=outbox_pending_at,
+            )
+        except bd_facade.BdFacadeError as exc:
+            print(f"shop-msg send {command}: bd Step 1 failed: {exc}", file=sys.stderr)
+            return 1
+
+    # Step 2: postgres deposit.
     try:
         insert_message(
             bc_root,
-            args.work_id,
+            work_id,
             "inbox",
-            "request_maintenance",
-            message.model_dump(exclude_none=True),
+            message_type,
+            payload,
             notify=True,
         )
     except CollisionError:
         print(
-            f"shop-msg send request_maintenance: refusing to overwrite existing "
-            f"inbox entry for work_id={args.work_id!r}",
+            f"shop-msg send {command}: refusing to overwrite existing "
+            f"inbox entry for work_id={work_id!r}",
             file=sys.stderr,
         )
         return 1
+    except OutboxDepositError as exc:
+        # Step 2 failed: leave the bd entry at outbox_pending (do NOT flip).
+        print(
+            f"shop-msg send {command}: postgres deposit failed; bd entry "
+            f"{work_id!r} left at dispatch_state=outbox_pending for sweep "
+            f"recovery. {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Step 3: bd flip to dispatched (guarded by Step 2 success).
+    if use_bd:
+        try:
+            bd_facade.set_dispatch_state(
+                lead_root, work_id, bd_facade.STATE_DISPATCHED
+            )
+        except bd_facade.BdFacadeError as exc:
+            print(
+                f"shop-msg send {command}: postgres deposit succeeded but bd "
+                f"Step 3 flip failed: {exc}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
+
+
+def _scenario_hashes_from_payload(scenarios: list[ScenarioPayload]) -> list[str] | None:
+    hashes = [s.hash for s in scenarios]
+    return hashes or None
+
+
+def _load_payload_file(path_str: str, message_type: str, work_id: str) -> dict:
+    """Load a --payload YAML/JSON file that pins a complete lead-to-BC message.
+
+    The file is the authoritative content source: it carries the message body
+    (description, scenarios with pre-computed hashes, etc.). The CLI overrides
+    message_type and work_id from the command-line flags so the on-wire row is
+    keyed consistently, and validates the result against the matching schema.
+    Returns the validated payload dict ready for the postgres deposit.
+    """
+    raw = Path(path_str).read_text()
+    data = yaml.safe_load(raw) or {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"--payload file {path_str!r} must contain a YAML/JSON mapping"
+        )
+    data["message_type"] = message_type
+    data["work_id"] = work_id
+    data.setdefault("from_shop", _resolve_send_sender())
+    model_cls = {
+        "request_maintenance": RequestMaintenance,
+        "request_bugfix": RequestBugfix,
+        "assign_scenarios": AssignScenarios,
+    }[message_type]
+    message = model_cls(**data)
+    return message.model_dump(exclude_none=True)
+
+
+def _scenario_hashes_from_dict(payload: dict) -> list[str] | None:
+    scenarios = payload.get("scenarios") or []
+    hashes = [s.get("hash") for s in scenarios if isinstance(s, dict) and s.get("hash")]
+    return hashes or None
+
+
+def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
+    bc_root = _resolve_bc(args)
+
+    if getattr(args, "payload", None):
+        payload = _load_payload_file(
+            args.payload, "request_maintenance", args.work_id
+        )
+        hashes = None
+    else:
+        if args.description is None:
+            print(
+                "shop-msg send request_maintenance: --description is required "
+                "unless --payload is supplied",
+                file=sys.stderr,
+            )
+            return 2
+        acceptance_criteria = list(args.acceptance_criterion or []) or None
+        file_hints = list(args.file_hint or []) or None
+        message = RequestMaintenance(
+            message_type="request_maintenance",
+            work_id=args.work_id,
+            description=args.description,
+            acceptance_criteria=acceptance_criteria,
+            file_hints=file_hints,
+            from_shop=_resolve_send_sender(),
+        )
+        payload = message.model_dump(exclude_none=True)
+        hashes = None
+
+    return _bd_first_send(
+        command="request_maintenance",
+        bc_root=bc_root,
+        bc_name=args.bc,
+        work_id=args.work_id,
+        message_type="request_maintenance",
+        payload=payload,
+        scenario_hashes_pinned=hashes,
+        depends_on_dispatch=getattr(args, "depends_on", None),
+        bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+        payload_ref=getattr(args, "payload", None),
+    )
 
 
 def _build_scenario_payload(
@@ -573,6 +749,29 @@ def _build_scenario_payload(
 def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
     bc_root = _resolve_bc(args)
 
+    if getattr(args, "payload", None):
+        payload = _load_payload_file(args.payload, "request_bugfix", args.work_id)
+        return _bd_first_send(
+            command="request_bugfix",
+            bc_root=bc_root,
+            bc_name=args.bc,
+            work_id=args.work_id,
+            message_type="request_bugfix",
+            payload=payload,
+            scenario_hashes_pinned=_scenario_hashes_from_dict(payload),
+            depends_on_dispatch=getattr(args, "depends_on", None),
+            bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+            payload_ref=args.payload,
+        )
+
+    if args.description is None:
+        print(
+            "shop-msg send request_bugfix: --description is required unless "
+            "--payload is supplied",
+            file=sys.stderr,
+        )
+        return 2
+
     scenario_files = list(args.scenario_file or [])
     # --feature-title and --bc-tag are conditionally required: only when
     # at least one --scenario-file is supplied. argparse cannot express
@@ -598,27 +797,45 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
         from_shop=_resolve_send_sender(),
     )
 
-    try:
-        insert_message(
-            bc_root,
-            args.work_id,
-            "inbox",
-            "request_bugfix",
-            message.model_dump(exclude_none=True),
-            notify=True,
-        )
-    except CollisionError:
-        print(
-            f"shop-msg send request_bugfix: refusing to overwrite existing "
-            f"inbox entry for work_id={args.work_id!r}",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+    return _bd_first_send(
+        command="request_bugfix",
+        bc_root=bc_root,
+        bc_name=args.bc,
+        work_id=args.work_id,
+        message_type="request_bugfix",
+        payload=message.model_dump(exclude_none=True),
+        scenario_hashes_pinned=_scenario_hashes_from_payload(scenarios_payload),
+        depends_on_dispatch=getattr(args, "depends_on", None),
+        bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+        payload_ref=getattr(args, "payload", None),
+    )
 
 
 def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
     bc_root = _resolve_bc(args)
+
+    if getattr(args, "payload", None):
+        payload = _load_payload_file(args.payload, "assign_scenarios", args.work_id)
+        return _bd_first_send(
+            command="assign_scenarios",
+            bc_root=bc_root,
+            bc_name=args.bc,
+            work_id=args.work_id,
+            message_type="assign_scenarios",
+            payload=payload,
+            scenario_hashes_pinned=_scenario_hashes_from_dict(payload),
+            depends_on_dispatch=getattr(args, "depends_on", None),
+            bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+            payload_ref=args.payload,
+        )
+
+    if not args.scenario_file or args.feature_title is None or args.bc_tag is None:
+        print(
+            "shop-msg send assign_scenarios: --scenario-file, --feature-title, "
+            "and --bc-tag are required unless --payload is supplied",
+            file=sys.stderr,
+        )
+        return 2
 
     scenario_files = list(args.scenario_file or [])
     scenarios_payload: list[ScenarioPayload] = [
@@ -633,23 +850,18 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         from_shop=_resolve_send_sender(),
     )
 
-    try:
-        insert_message(
-            bc_root,
-            args.work_id,
-            "inbox",
-            "assign_scenarios",
-            message.model_dump(exclude_none=True),
-            notify=True,
-        )
-    except CollisionError:
-        print(
-            f"shop-msg send assign_scenarios: refusing to overwrite existing "
-            f"inbox entry for work_id={args.work_id!r}",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+    return _bd_first_send(
+        command="assign_scenarios",
+        bc_root=bc_root,
+        bc_name=args.bc,
+        work_id=args.work_id,
+        message_type="assign_scenarios",
+        payload=message.model_dump(exclude_none=True),
+        scenario_hashes_pinned=_scenario_hashes_from_payload(scenarios_payload),
+        depends_on_dispatch=getattr(args, "depends_on", None),
+        bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+        payload_ref=getattr(args, "payload", None),
+    )
 
 
 def _cmd_read_outbox(args: argparse.Namespace) -> int:
@@ -815,6 +1027,163 @@ def _cmd_consume_outbox(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # lead-tuu5 scenario fcdd854bfba8f2a2 (ADR-016): the consume CLI itself
+    # flips the lead bd entry dispatch_state bc_emitted -> consumed via the
+    # bd_facade, under the same atomicity boundary as the messaging-layer
+    # release above. The agent runs ONE command; the CLI performs both the
+    # messaging action and the paired bd update — no separate agent
+    # `bd update` step is required. Best-effort and scoped to a registered
+    # lead with a reachable bd workspace; a bd-less invocation just performs
+    # the messaging release (pre-lead-tuu5 behavior).
+    lead_root_str = _resolve_registered_lead()
+    if lead_root_str is not None:
+        lead_root = Path(lead_root_str)
+        if (
+            bd_facade.bd_available(lead_root)
+            and bd_facade.get_dispatch_bead(lead_root, args.work_id) is not None
+        ):
+            try:
+                bd_facade.set_dispatch_state(
+                    lead_root, args.work_id, bd_facade.STATE_CONSUMED
+                )
+            except bd_facade.BdFacadeError as exc:
+                print(
+                    f"shop-msg consume outbox: messaging release succeeded but "
+                    f"bd dispatch_state flip to consumed failed: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+    return 0
+
+
+def _sweep_is_stale(metadata: dict, threshold_seconds: int) -> bool:
+    """Return True iff the outbox_pending bead is older than the threshold.
+
+    Uses the ``outbox_pending_at`` ISO timestamp recorded at Step 1. When the
+    timestamp is absent or unparseable, the bead is treated as stale (a bead
+    stuck at outbox_pending with no timestamp is exactly the corrupt-intent
+    case the sweeper exists to recover).
+    """
+    import datetime as _dt
+
+    raw = metadata.get(bd_facade.KEY_OUTBOX_PENDING_AT)
+    if not raw:
+        return True
+    try:
+        ts = _dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=_dt.timezone.utc)
+    age = (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds()
+    return age >= threshold_seconds
+
+
+def _cmd_sweep(args: argparse.Namespace) -> int:
+    """Recover lead bd entries stuck at dispatch_state=outbox_pending.
+
+    For each stale outbox_pending bead in the shop's bd workspace, reconcile
+    against the actual postgres state (lead-tuu5 scenarios 236eb236a79beb84,
+    97b6112b1aedd7ae). The reconciliation rule is shop-msg-wins for "was the
+    message sent" (PDR-010 decision 3): the postgres outbox row's existence
+    is authoritative.
+
+    - Deposit ALREADY landed -> bd-flip-only recovery (no duplicate row).
+    - Deposit NEVER landed    -> re-deposit from the bd payload reference,
+                                  then flip. The re-deposit is guarded against
+                                  double-write by the postgres UNIQUE
+                                  constraint (a concurrent deposit makes the
+                                  retry a CollisionError, which is swallowed
+                                  so the sweeper still proceeds to the flip).
+
+    Idempotent: a second sweep finds nothing at outbox_pending and is a no-op.
+    """
+    shop_root_str = resolve_shop_name(args.shop)
+    if shop_root_str is None:
+        print(
+            f"shop-msg sweep: shop name {args.shop!r} is not registered in the "
+            f"registry.",
+            file=sys.stderr,
+        )
+        return 1
+    shop_root = Path(shop_root_str).resolve()
+    threshold = args.threshold_seconds
+
+    if not bd_facade.bd_available(shop_root):
+        print(
+            f"shop-msg sweep: no reachable bd workspace under {shop_root!r}; "
+            f"nothing to sweep.",
+            file=sys.stderr,
+        )
+        return 0
+
+    recovered = 0
+    for bead in bd_facade.list_dispatch_beads(shop_root):
+        metadata = bead.get("metadata") or {}
+        if metadata.get(bd_facade.KEY_DISPATCH_STATE) != bd_facade.STATE_OUTBOX_PENDING:
+            continue
+        if not _sweep_is_stale(metadata, threshold):
+            continue
+        work_id = bead.get("id")
+        bc_name = metadata.get(bd_facade.KEY_DISPATCHED_TO_BC)
+        message_type = metadata.get(bd_facade.KEY_DISPATCH_MESSAGE_TYPE)
+        if not (work_id and bc_name and message_type):
+            continue
+        bc_root_str = resolve_shop_name(bc_name)
+        if bc_root_str is None:
+            print(
+                f"shop-msg sweep: bead {work_id} references unregistered BC "
+                f"{bc_name!r}; skipping.",
+                file=sys.stderr,
+            )
+            continue
+        bc_root = str(Path(bc_root_str).resolve())
+
+        if not dispatch_inbox_row_exists(bc_root, work_id, message_type):
+            # Deposit never landed: re-deposit from the payload reference.
+            payload_ref = metadata.get(bd_facade.KEY_PAYLOAD_REF)
+            if not payload_ref or not Path(payload_ref).exists():
+                print(
+                    f"shop-msg sweep: bead {work_id} has no usable payload "
+                    f"reference to reconstruct the postgres deposit; skipping.",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                payload = _load_payload_file(payload_ref, message_type, work_id)
+            except (ValueError, ValidationError, OSError) as exc:
+                print(
+                    f"shop-msg sweep: bead {work_id} payload reconstruction "
+                    f"failed: {exc}; skipping.",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                insert_message(
+                    bc_root, work_id, "inbox", message_type, payload, notify=True
+                )
+            except CollisionError:
+                # A concurrent sweep already deposited; the UNIQUE constraint
+                # guarded the double-write. Proceed to the flip.
+                pass
+
+        # Deposit is present (already-landed, just re-deposited, or a
+        # concurrent sweep landed it): flip bd to dispatched.
+        try:
+            bd_facade.set_dispatch_state(
+                shop_root, work_id, bd_facade.STATE_DISPATCHED
+            )
+        except bd_facade.BdFacadeError as exc:
+            print(
+                f"shop-msg sweep: bead {work_id} flip to dispatched failed: "
+                f"{exc}",
+                file=sys.stderr,
+            )
+            return 1
+        recovered += 1
+
+    print(f"shop-msg sweep: recovered {recovered} outbox_pending bead(s).")
     return 0
 
 
@@ -1183,7 +1552,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-id", required=True, help="work_id identifying this assignment"
     )
     request_maintenance.add_argument(
-        "--description", required=True, help="description of the work being requested"
+        "--description",
+        default=None,
+        help="description of the work being requested (required unless --payload)",
     )
     request_maintenance.add_argument(
         "--acceptance-criterion",
@@ -1197,6 +1568,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="file path hint relevant to the work (repeatable)",
     )
+    request_maintenance.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the complete message body; "
+            "when supplied it is the authoritative content source and the "
+            "per-field flags are not required"
+        ),
+    )
+    request_maintenance.add_argument(
+        "--depends-on",
+        default=None,
+        help=(
+            "work_id of a prior dispatch this one depends on; recorded on the "
+            "lead bd entry as depends_on_dispatch metadata"
+        ),
+    )
     request_maintenance.set_defaults(func=_cmd_send_request_maintenance)
 
     assign_scenarios = send_sub.add_parser(
@@ -1209,20 +1597,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assign_scenarios.add_argument(
         "--feature-title",
-        required=True,
-        help="title used in the wrapping `Feature:` line for each scenario",
+        default=None,
+        help=(
+            "title used in the wrapping `Feature:` line for each scenario; "
+            "required unless --payload is supplied"
+        ),
     )
     assign_scenarios.add_argument(
         "--bc-tag",
-        required=True,
-        help="BC name used in the @bc:<name> scenario tag",
+        default=None,
+        help=(
+            "BC name used in the @bc:<name> scenario tag; required unless "
+            "--payload is supplied"
+        ),
     )
     assign_scenarios.add_argument(
         "--scenario-file",
         action="append",
         default=None,
-        required=True,
-        help="path to a file containing one scenario body (repeatable)",
+        help=(
+            "path to a file containing one scenario body (repeatable); "
+            "required unless --payload is supplied"
+        ),
+    )
+    assign_scenarios.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the complete assign_scenarios "
+            "message body (scenarios with pre-computed hashes); the "
+            "authoritative content source when supplied"
+        ),
+    )
+    assign_scenarios.add_argument(
+        "--depends-on",
+        default=None,
+        help="work_id of a prior dispatch this one depends on (bd metadata)",
     )
     assign_scenarios.set_defaults(func=_cmd_send_assign_scenarios)
 
@@ -1236,8 +1646,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     request_bugfix.add_argument(
         "--description",
-        required=True,
-        help="plain-language description of the fix",
+        default=None,
+        help="plain-language description of the fix (required unless --payload)",
     )
     request_bugfix.add_argument(
         "--feature-title",
@@ -1260,6 +1670,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help="path to a file containing one scenario body (repeatable, optional)",
+    )
+    request_bugfix.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the complete request_bugfix "
+            "message body (scenarios with pre-computed hashes); the "
+            "authoritative content source when supplied"
+        ),
+    )
+    request_bugfix.add_argument(
+        "--depends-on",
+        default=None,
+        help="work_id of a prior dispatch this one depends on (bd metadata)",
     )
     request_bugfix.set_defaults(func=_cmd_send_request_bugfix)
 
@@ -1419,6 +1843,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="message_type of the outbox row to consume",
     )
     consume_outbox.set_defaults(func=_cmd_consume_outbox)
+
+    sweep = sub.add_parser(
+        "sweep",
+        help=(
+            "recover lead bd entries stuck at dispatch_state=outbox_pending by "
+            "reconciling against the actual postgres outbox state"
+        ),
+    )
+    sweep.add_argument(
+        "--shop",
+        required=True,
+        help="canonical shop name whose bd workspace to sweep (resolved via registry)",
+    )
+    sweep.add_argument(
+        "--threshold-seconds",
+        type=int,
+        default=bd_facade.DEFAULT_SWEEP_THRESHOLD_SECONDS,
+        help=(
+            "only sweep outbox_pending beads older than this many seconds "
+            f"(default {bd_facade.DEFAULT_SWEEP_THRESHOLD_SECONDS})"
+        ),
+    )
+    sweep.set_defaults(func=_cmd_sweep)
 
     prime = sub.add_parser(
         "prime",

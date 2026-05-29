@@ -126,6 +126,17 @@ class CollisionError(Exception):
     """Raised when an INSERT would violate the UNIQUE constraint."""
 
 
+class OutboxDepositError(Exception):
+    """Raised when a postgres outbox deposit fails (Step 2 of the bd-first
+    send protocol). Distinct from CollisionError: a CollisionError means the
+    row already exists (idempotent / already-sent), whereas an
+    OutboxDepositError means the deposit could not be performed at all
+    (network drop, DB-side rejection). The send command translates this into
+    a non-zero exit that names the postgres failure, and crucially leaves the
+    Step-1 bd entry at dispatch_state=outbox_pending so the sweeper can
+    recover it (lead-tuu5 / ADR-012)."""
+
+
 # ---------------------------------------------------------------------------
 # bc identifier helpers
 # ---------------------------------------------------------------------------
@@ -197,6 +208,26 @@ def insert_message(
     """
     bc = _bc_id(bc_root)
     payload_json = json.dumps(payload)
+    # lead-tuu5 / ADR-012 atomicity test seam: when SHOPMSG_FAIL_NEXT_OUTBOX_INSERT
+    # is set (to any non-empty value), the next Step-2 dispatch deposit raises an
+    # OutboxDepositError to simulate a postgres network drop or DB-side
+    # rejection between Steps 1 and 3 of the bd-first send protocol. The
+    # seam is consumed (the env var is cleared) so exactly one insert fails,
+    # mirroring a transient outage. Step 2 of `shop-msg send` is the lead->BC
+    # dispatch deposit, which lands as a direction='inbox' row with
+    # allow_multi_type=False; the seam fires precisely there so the bd-first
+    # Step 1 (a bd write, not a postgres write) is unaffected and the simulated
+    # failure lands at Step 2.
+    if (
+        direction == "inbox"
+        and not allow_multi_type
+        and os.environ.get("SHOPMSG_FAIL_NEXT_OUTBOX_INSERT")
+    ):
+        del os.environ["SHOPMSG_FAIL_NEXT_OUTBOX_INSERT"]
+        raise OutboxDepositError(
+            f"postgres outbox insert failed (simulated): bc={bc_root!r} "
+            f"work_id={work_id!r} message_type={message_type!r}"
+        )
     with _connect() as conn:
         with conn.cursor() as cur:
             # For inbox: enforce uniqueness.
@@ -418,6 +449,31 @@ def outbox_row_exists(bc_root: str, work_id: str, message_type: str) -> bool:
                 SELECT 1 FROM messages
                 WHERE bc = %s AND work_id = %s
                   AND direction = 'outbox' AND message_type = %s
+                LIMIT 1
+                """,
+                (bc, work_id, message_type),
+            )
+            return cur.fetchone() is not None
+
+
+def dispatch_inbox_row_exists(bc_root: str, work_id: str, message_type: str) -> bool:
+    """Return True iff the dispatch row a ``shop-msg send`` deposits exists.
+
+    A lead dispatch lands in the BC's table as a ``direction='inbox'`` row
+    (the BC reads it from its inbox). The sweeper's reconciliation question —
+    "did Step 2 land for this dispatch?" — must therefore check the inbox row
+    keyed by (bc, work_id, message_type), NOT a ``direction='outbox'`` row
+    (which is a BC RESPONSE, a different message). This is the authoritative
+    "was the message sent" check per PDR-010 decision 3.
+    """
+    bc = _bc_id(bc_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
                 LIMIT 1
                 """,
                 (bc, work_id, message_type),
