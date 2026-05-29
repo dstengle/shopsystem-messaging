@@ -114,6 +114,7 @@ from shop_msg.storage import (
     insert_message,
     insert_raw_payload,
     outbox_row_exists,
+    presence_status,
     query_pending_inbox,
     query_pending_lead_inbox,
     query_pending_outbox,
@@ -1374,6 +1375,31 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_bc_status(args: argparse.Namespace) -> int:
+    """Report presence classification of BCs from the bc_presence heartbeat table.
+
+    (PDR-010 / ADR-014.) Each BC is classified by the age of its most recent
+    heartbeat: online (<90s), stale ([90s,300s)), offline (>=300s). A BC with no
+    heartbeat row is reported offline with no last_seen_at (fail-safe rollout-window
+    posture: never observed alive => offline).
+
+    With --bc <name>, reports exactly that one BC (and synthesises an offline row
+    when it has never been watched). Without it, reports every BC with a presence
+    row, ordered by name.
+
+    Output: one line per BC of the form
+        <bc_name> <classification> <seconds_since_last_seen>
+    where the age is rendered as an integer second count, or "-" when never seen.
+    """
+    bc_name = getattr(args, "bc", None)
+    rows = presence_status(bc_name)
+    for row in rows:
+        age = row["seconds_since_last_seen"]
+        age_str = "-" if age is None else str(int(round(age)))
+        print(f"{row['bc_name']} {row['classification']} {age_str}")
+    return 0
+
+
 def _cmd_registry_add(args: argparse.Namespace) -> int:
     """Register a shop by canonical name."""
     shop_type = "lead" if getattr(args, "lead_shop", False) else "bc"
@@ -1949,6 +1975,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_removed_flag(watch, "--bc-root")
     _add_removed_flag(watch, "--lead-root")
     watch.set_defaults(func=_cmd_watch, _cwd_resolves=True)
+
+    # bc-status: presence classification from the bc_presence heartbeat table
+    # (PDR-010 / ADR-014). The lead's session-start drain calls this to surface
+    # offline BCs before accepting user work.
+    bc_status = sub.add_parser(
+        "bc-status",
+        help=(
+            "report BC presence (online/stale/offline) from the heartbeat "
+            "table; the lead's session-start liveness check"
+        ),
+    )
+    bc_status.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name to report just that BC's status (synthesises an "
+            "offline row when never watched). Omit to report all BCs with a "
+            "presence row."
+        ),
+    )
+    bc_status.set_defaults(func=_cmd_bc_status)
 
     # Registry subcommand
     registry = sub.add_parser(

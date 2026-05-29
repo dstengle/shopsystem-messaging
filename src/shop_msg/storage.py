@@ -108,12 +108,28 @@ CREATE TABLE IF NOT EXISTS shop_registry (
 );
 """
 
+# Presence heartbeat (PDR-010 / ADR-014). The watch process that holds the
+# LISTEN connection ALSO emits a liveness heartbeat into bc_presence on a
+# fixed cadence. The schema is pinned exactly by scenario c4b41c39d58ee2ef:
+# bc_name is the PRIMARY KEY (so the UPSERT collapses all ticks — and all
+# concurrent watchers — into exactly one row per BC), last_seen_at is the
+# liveness timestamp the lead classifies on, and watch_session_id is an
+# informational record of which watch process most recently ticked.
+_DDL_PRESENCE = """
+CREATE TABLE IF NOT EXISTS bc_presence (
+  bc_name         TEXT PRIMARY KEY,
+  last_seen_at    TIMESTAMPTZ NOT NULL,
+  watch_session_id UUID NOT NULL
+);
+"""
+
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(_DDL)
         cur.execute(_DDL_CONSUMED_COL)
         cur.execute(_DDL_REGISTRY)
+        cur.execute(_DDL_PRESENCE)
     conn.commit()
 
 
@@ -814,6 +830,25 @@ def registry_sync(manifest_path: str) -> None:
         conn.commit()
 
 
+def resolve_root_to_name(shop_root: str) -> str | None:
+    """Reverse-resolve a shop_root path to its canonical registered name.
+
+    Returns the name if a registry entry maps to this shop_root, else None.
+    Used by the presence heartbeat so bc_presence is keyed by canonical BC
+    name (e.g. 'shopsystem-messaging') rather than by filesystem path.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name FROM shop_registry WHERE shop_root = %s LIMIT 1",
+                (shop_root,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return row["name"]
+
+
 def resolve_shop_name(name: str) -> str | None:
     """Resolve a canonical shop name to its shop_root path.
 
@@ -1097,6 +1132,233 @@ def read_lead_inbox_message(lead_root: str, work_id: str) -> dict[str, Any] | No
 
 
 # ---------------------------------------------------------------------------
+# Presence heartbeat + classification (PDR-010 / ADR-014)
+#
+# The watch process that holds the LISTEN connection ALSO emits a liveness
+# heartbeat into bc_presence on a fixed cadence (default 30s). The load-bearing
+# property (scenario c4b41c39d58ee2ef) is that liveness is emitted by the SAME
+# process holding LISTEN, so a wedged loop (LISTEN intact but tick loop stalled)
+# is detectable by the staleness of last_seen_at.
+#
+# Classification boundaries are EXACT per ADR-014 decision 3
+# (scenario 3efb5c9d29f645d9):
+#   - age <  90s              -> "online"   (90 itself is NOT online)
+#   - 90s <= age <  300s      -> "stale"    (300 itself is NOT stale)
+#   - age >= 300s             -> "offline"
+#   - no bc_presence row      -> "offline"  (fail-safe: never observed alive)
+# ---------------------------------------------------------------------------
+
+# Default heartbeat cadence in seconds. The watch loop wakes on this interval
+# (or sooner, on a real NOTIFY) and UPSERTs the heartbeat.
+PRESENCE_TICK_SECONDS = 30
+
+# Classification thresholds (seconds). Boundaries are half-open per ADR-014
+# decision 3: online is strictly under ONLINE_MAX; stale is [ONLINE_MAX, STALE_MAX);
+# offline is at-or-beyond STALE_MAX.
+PRESENCE_ONLINE_MAX_SECONDS = 90
+PRESENCE_STALE_MAX_SECONDS = 300
+
+
+def classify_presence_age(age_seconds: float) -> str:
+    """Classify a BC by the age (seconds) of its most recent heartbeat.
+
+    Exact boundaries per ADR-014 decision 3: <90 online, [90,300) stale,
+    >=300 offline. The boundary values themselves (90, 300) fall into the
+    HIGHER-staleness band (90 is stale, 300 is offline).
+    """
+    if age_seconds < PRESENCE_ONLINE_MAX_SECONDS:
+        return "online"
+    if age_seconds < PRESENCE_STALE_MAX_SECONDS:
+        return "stale"
+    return "offline"
+
+
+def presence_upsert(
+    bc_name: str,
+    watch_session_id: str,
+    *,
+    last_seen_at: Any = None,
+) -> None:
+    """UPSERT a presence heartbeat row keyed on bc_name (PRIMARY KEY).
+
+    A single watch process calls this on each cadence tick. Because bc_name is
+    the PRIMARY KEY, repeated ticks (from the same process OR from concurrent
+    watchers) collapse into exactly one row whose last_seen_at advances to the
+    most recent tick and whose watch_session_id records the most recent ticker.
+
+    ``last_seen_at`` defaults to the database's now() (the authoritative clock
+    for liveness). Tests pass an explicit timestamp to drive the clock
+    deterministically.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            if last_seen_at is None:
+                cur.execute(
+                    """
+                    INSERT INTO bc_presence (bc_name, last_seen_at, watch_session_id)
+                    VALUES (%s, now(), %s)
+                    ON CONFLICT (bc_name) DO UPDATE
+                      SET last_seen_at = now(),
+                          watch_session_id = EXCLUDED.watch_session_id
+                    """,
+                    (bc_name, watch_session_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO bc_presence (bc_name, last_seen_at, watch_session_id)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (bc_name) DO UPDATE
+                      SET last_seen_at = EXCLUDED.last_seen_at,
+                          watch_session_id = EXCLUDED.watch_session_id
+                    """,
+                    (bc_name, last_seen_at, watch_session_id),
+                )
+        conn.commit()
+
+
+def presence_status(bc_name: str | None = None) -> list[dict[str, Any]]:
+    """Return presence classification rows.
+
+    Each row is a dict with keys:
+      bc_name            -- the BC's canonical name
+      classification     -- "online" | "stale" | "offline"
+      seconds_since_last_seen -- float age in seconds, or None when never seen
+      last_seen_at       -- the raw timestamp, or None when never seen
+
+    When ``bc_name`` is None, returns one row per bc_presence row (full
+    topology), ordered by bc_name. When ``bc_name`` is given, returns exactly
+    one row for that BC: if no bc_presence row exists, the row is synthesised
+    as "offline" with no last_seen_at (fail-safe rollout-window posture per
+    ADR-014 consequences — a BC never observed alive is treated as offline).
+
+    The age is computed against the database's now() (EXTRACT EPOCH of the
+    delta) so the liveness clock is the DB clock, consistent with the now()
+    used by presence_upsert.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            if bc_name is None:
+                cur.execute(
+                    """
+                    SELECT bc_name, last_seen_at,
+                           EXTRACT(EPOCH FROM (now() - last_seen_at)) AS age
+                    FROM bc_presence
+                    ORDER BY bc_name
+                    """
+                )
+                rows = cur.fetchall()
+                result = []
+                for row in rows:
+                    age = float(row["age"])
+                    result.append(
+                        {
+                            "bc_name": row["bc_name"],
+                            "classification": classify_presence_age(age),
+                            "seconds_since_last_seen": age,
+                            "last_seen_at": row["last_seen_at"],
+                        }
+                    )
+                return result
+
+            cur.execute(
+                """
+                SELECT bc_name, last_seen_at,
+                       EXTRACT(EPOCH FROM (now() - last_seen_at)) AS age
+                FROM bc_presence
+                WHERE bc_name = %s
+                """,
+                (bc_name,),
+            )
+            row = cur.fetchone()
+    if bc_name is not None and row is None:
+        # Fail-safe: a BC with no heartbeat row was never observed alive.
+        return [
+            {
+                "bc_name": bc_name,
+                "classification": "offline",
+                "seconds_since_last_seen": None,
+                "last_seen_at": None,
+            }
+        ]
+    age = float(row["age"])
+    return [
+        {
+            "bc_name": row["bc_name"],
+            "classification": classify_presence_age(age),
+            "seconds_since_last_seen": age,
+            "last_seen_at": row["last_seen_at"],
+        }
+    ]
+
+
+def run_presence_heartbeat(
+    bc_name: str,
+    watch_session_id: str,
+    *,
+    stop_event=None,
+    max_ticks: int | None = None,
+) -> None:
+    """Emit presence heartbeats on the cadence until ``stop_event`` is set.
+
+    Called by ``watch_inbox`` in a background daemon thread so that liveness is
+    emitted by the SAME process that holds the LISTEN connection (the load-bearing
+    property of scenario c4b41c39d58ee2ef): if the LISTEN loop or this process
+    wedges, last_seen_at stops advancing and the lead's classifier surfaces the
+    BC as stale/offline.
+
+    The first heartbeat fires immediately (so a fresh watch is observable within
+    the first cadence window, not after a full cadence delay); subsequent
+    heartbeats fire every ``PRESENCE_TICK_SECONDS`` via the ``_sleep`` seam.
+    ``watch_session_id`` is constant across ticks from this process. There is no
+    backfill of missed ticks across a stall or reconnect — each tick simply
+    UPSERTs last_seen_at = now(); the gap is informational (scenario
+    3ff862feef699480).
+
+    Test seams: ``stop_event`` (a threading.Event) lets the test stop the loop
+    after observing ticks; ``max_ticks`` bounds the loop for in-process tests
+    that drive ``_sleep`` to a no-op.
+    """
+    ticks = 0
+    while True:
+        presence_upsert(bc_name, watch_session_id)
+        ticks += 1
+        if max_ticks is not None and ticks >= max_ticks:
+            return
+        if stop_event is not None and stop_event.is_set():
+            return
+        _sleep(PRESENCE_TICK_SECONDS)
+        if stop_event is not None and stop_event.is_set():
+            return
+
+
+def _start_presence_heartbeat_thread(bc_name: str):
+    """Start a daemon heartbeat thread for ``bc_name``; return (thread, stop_event).
+
+    Generates a fresh per-process session UUID. The thread is a daemon so it
+    never blocks process exit; ``stop_event`` lets the caller stop it cleanly in
+    a finally block.
+    """
+    import threading
+    import uuid
+
+    stop_event = threading.Event()
+    session_id = str(uuid.uuid4())
+
+    def _run():
+        try:
+            run_presence_heartbeat(bc_name, session_id, stop_event=stop_event)
+        except Exception:
+            # A heartbeat failure must never crash the watch process; the lead's
+            # fail-safe classifier treats a missing/stale heartbeat as offline.
+            pass
+
+    thread = threading.Thread(target=_run, name=f"presence-{bc_name}", daemon=True)
+    thread.start()
+    return thread, stop_event
+
+
+# ---------------------------------------------------------------------------
 # LISTEN-drop reconnect (lead-m32 / supersedes lead-7v1)
 #
 # The long-running Monitor surfaces (watch_lead_inbox, watch_inbox) block on a
@@ -1365,6 +1627,20 @@ def watch_inbox(bc_root: str) -> None:
             f"Original error: {exc}"
         ) from exc
 
+    # Presence heartbeat (PDR-010 / ADR-014): liveness is emitted by the SAME
+    # process that holds this LISTEN connection. We key the heartbeat on the
+    # canonical BC name (registry reverse-lookup), falling back to the bc_root
+    # basename when the BC is not registered. The ticker runs in a daemon
+    # thread so it composes with — and never blocks — the LISTEN loop, and is
+    # stopped cleanly in the finally block.
+    import os as _os
+
+    heartbeat_thread = None
+    heartbeat_stop = None
+    presence_name = resolve_root_to_name(bc_root) or _os.path.basename(
+        bc_root.rstrip("/")
+    )
+
     try:
         # Force line-buffering on stdout so each print() reaches the pipe
         # immediately even when stdout is not a TTY (e.g. when a subprocess
@@ -1378,6 +1654,13 @@ def watch_inbox(bc_root: str) -> None:
 
         conn.execute(
             sql.SQL("LISTEN {channel}").format(channel=sql.Identifier(channel))
+        )
+
+        # Start the presence heartbeat thread now that the schema exists and
+        # LISTEN is established (so liveness only flows once the watch is fully
+        # armed). The first tick fires immediately inside the thread.
+        heartbeat_thread, heartbeat_stop = _start_presence_heartbeat_thread(
+            presence_name
         )
 
         # Step 3: drain pending inbox messages.
@@ -1429,4 +1712,6 @@ def watch_inbox(bc_root: str) -> None:
 
         _run_listen_loop_with_reconnect(conn, channel, _handle)
     finally:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
         conn.close()
