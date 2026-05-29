@@ -398,7 +398,53 @@ def _cmd_respond_clarify(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # ADR-017 decision 4 (lead-sn1e): the BC bead paired with this work_id
+    # flips to "blocked" and gets a note summarizing the question, as a CLI
+    # side effect of the same respond invocation. Best-effort and scoped to
+    # the BC's own bd workspace; never overturns the successful emission.
+    _apply_bc_bead_response(
+        bc_root,
+        args.work_id,
+        message_type="clarify",
+        note=f"clarify: {args.question}",
+        op_name="respond clarify",
+    )
     return 0
+
+
+def _apply_bc_bead_response(
+    bc_root: str,
+    work_id: str,
+    *,
+    message_type: str,
+    note: str | None = None,
+    status: str | None = None,
+    op_name: str = "respond",
+) -> None:
+    """Apply the ADR-017 decision-4 BC-bead status side effect for a respond.
+
+    Runs AFTER the messaging emission has succeeded. Best-effort: a bd hiccup
+    is reported on stderr but does not change the command's exit status, since
+    the primary messaging action (the lead-inbox deposit) already landed.
+    """
+    bc_root_path = Path(bc_root)
+    if not bd_facade.bd_available(bc_root_path):
+        return
+    try:
+        bd_facade.apply_response_side_effect(
+            bc_root_path,
+            work_id,
+            message_type=message_type,
+            status=status,
+            note=note,
+        )
+    except bd_facade.BdFacadeError as exc:
+        print(
+            f"shop-msg {op_name}: messaging emission succeeded but the BC-side "
+            f"bead status side effect failed for work_id={work_id!r}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _cmd_respond_work_done(args: argparse.Namespace) -> int:
@@ -441,6 +487,16 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # ADR-017 decision 4 (lead-sn1e): work_done(complete) -> BC bead closed;
+    # work_done(blocked|partial) -> blocked. CLI side effect of the emission.
+    _apply_bc_bead_response(
+        bc_root,
+        args.work_id,
+        message_type="work_done",
+        status=args.status,
+        op_name="respond work_done",
+    )
     return 0
 
 
@@ -495,6 +551,19 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # ADR-017 decision 4 (lead-sn1e): mechanism_observation leaves the BC
+    # bead's status UNCHANGED but appends a note recording the observation.
+    # (The scenario illustrates this with a "--note" flag; the real CLI
+    # carries the observation as --subject/--body, so the appended note is
+    # composed from those — see lead-sn1e mechanism_observation surfacing.)
+    _apply_bc_bead_response(
+        bc_root,
+        args.work_id,
+        message_type="mechanism_observation",
+        note=f"mechanism_observation: {args.subject} — {args.body}",
+        op_name="respond mechanism_observation",
+    )
     return 0
 
 
@@ -1008,9 +1077,49 @@ def _cmd_pending_inbox(args: argparse.Namespace) -> int:
         )
         return 1
     rows = query_pending_inbox(bc_root)
+    bc_root_path = Path(bc_root)
+    bd_ok = bd_facade.bd_available(bc_root_path)
     for work_id, message_type in rows:
+        # ADR-017 / lead-sn1e: observing an unprocessed inbox row creates a
+        # paired BC-side bead in the BC's OWN bd workspace as a CLI side
+        # effect (bead-creation-on-FIRST-observation-only; idempotent on
+        # re-observation). The bead's type follows the message_type mapping
+        # and its title is derived from the inbox payload. Best-effort: a
+        # bd-less environment just lists the rows (pre-lead-sn1e behavior).
+        if bd_ok:
+            try:
+                title = _bc_bead_title(bc_root, work_id, message_type)
+                bd_facade.create_bc_bead_on_observation(
+                    bc_root_path,
+                    work_id,
+                    message_type=message_type,
+                    title=title,
+                )
+            except bd_facade.BdFacadeError as exc:
+                print(
+                    f"shop-msg pending inbox: listed the inbox row for "
+                    f"work_id={work_id!r} but BC-side bead creation failed: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
         print(f"{work_id} {message_type}")
     return 0
+
+
+def _bc_bead_title(bc_root: str, work_id: str, message_type: str) -> str:
+    """Derive a BC-bead title from the inbox payload (ADR-017 decision 2).
+
+    For message types carrying a ``description`` (request_bugfix,
+    request_maintenance) the title is the description text. assign_scenarios
+    carries no description, so the title falls back to a stable label naming
+    the message type and the lead work_id.
+    """
+    raw = read_inbox_message(bc_root, work_id)
+    if isinstance(raw, dict):
+        desc = raw.get("description")
+        if isinstance(desc, str) and desc.strip():
+            return desc.strip()
+    return f"{message_type} from lead ({work_id})"
 
 
 def _cmd_pending_lead_inbox(args: argparse.Namespace) -> int:

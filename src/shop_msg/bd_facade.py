@@ -62,6 +62,208 @@ STATE_CLOSED = "closed"
 DEFAULT_SWEEP_THRESHOLD_SECONDS = 60
 
 
+# ---------------------------------------------------------------------------
+# BC-side bead creation on inbox observation (PDR-010 / ADR-017 / lead-sn1e).
+#
+# Per ADR-017's 2026-05-29 revision + ADR-016 decision 2, the shop-msg CLI
+# ITSELF creates a paired bead in the BC's OWN bd workspace as a side effect
+# of the BC observing an inbox row (`shop-msg pending inbox --bc <name>`), and
+# flips that bead's status as a side effect of the BC's `shop-msg respond`
+# emissions. The agent never runs `bd create` / `bd update` by hand.
+#
+# Cross-shop contract is LOOSE (PDR-010 decision 4 / ADR-017 decisions 3 & 6):
+# the BC bead lives in the BC's local namespace (e.g. shopsystem-messaging-<nanoid>),
+# is keyed on the BC's own id (never on the lead work_id), and the ONLY link
+# back to the lead is the note line "Lead work_id: <work_id>". The lead never
+# learns the BC bead id and never pulls BC bd state.
+#
+# The cross-reference is carried two ways on the BC bead:
+#   * a human-readable NOTES line "Lead work_id: <work_id>" (the contract the
+#     scenarios pin verbatim), AND
+#   * a metadata key ``lead_work_id=<work_id>`` so idempotency lookup is a
+#     deterministic ``bd list --metadata-field lead_work_id=<work_id>`` query
+#     (the notes field is not server-side queryable; metadata is).
+# ---------------------------------------------------------------------------
+
+# Metadata key carrying the lead work_id cross-reference on the BC bead.
+KEY_LEAD_WORK_ID = "lead_work_id"
+
+# Cross-reference note prefix (the verbatim line the scenarios pin).
+LEAD_WORK_ID_NOTE_PREFIX = "Lead work_id: "
+
+# ADR-017 decision 2 message_type -> BC bead type mapping. request_bugfix is a
+# "bug"; assign_scenarios is a "feature"; the flat / nudge kinds are "task".
+MESSAGE_TYPE_TO_BEAD_TYPE = {
+    "request_bugfix": "bug",
+    "assign_scenarios": "feature",
+    "request_maintenance": "task",
+    "nudge": "task",
+}
+DEFAULT_BEAD_TYPE = "task"
+
+# ADR-017 decision 4 response-message_type -> BC bead status transition.
+# work_done depends on status, so it is handled by ``status_for_response``.
+RESPONSE_TO_STATUS = {
+    "clarify": "blocked",
+    # mechanism_observation -> unchanged + note (handled specially: None means
+    # "do not flip status, append a note instead").
+    "mechanism_observation": None,
+}
+
+# bd title length ceiling; titles are truncated to fit (ADR-017 decision 2
+# allows a truncated form when bd's constraints apply).
+BC_BEAD_TITLE_MAX = 200
+
+
+def cross_reference_note(work_id: str) -> str:
+    """Return the verbatim cross-reference note line for ``work_id``."""
+    return f"{LEAD_WORK_ID_NOTE_PREFIX}{work_id}"
+
+
+def status_for_response(message_type: str, status: str | None = None) -> str | None:
+    """Return the BC bead status for a BC ``shop-msg respond`` emission.
+
+    Returns None when the response should NOT flip the bead's status
+    (mechanism_observation -> unchanged + note). work_done maps on its
+    ``status`` field: complete -> closed; blocked/partial -> blocked.
+    """
+    if message_type == "work_done":
+        return "closed" if status == "complete" else "blocked"
+    return RESPONSE_TO_STATUS.get(message_type, None)
+
+
+def find_bc_bead_id(bc_root: Path, work_id: str) -> str | None:
+    """Return the id of the BC bead cross-referencing ``work_id``, or None.
+
+    Idempotency primitive: a BC bead "already exists for this work_id" iff a
+    bead in the BC workspace carries the ``lead_work_id=<work_id>`` metadata
+    key. Uses ``bd list --metadata-field lead_work_id=<work_id> --all`` so
+    closed beads are matched too (a re-observation after the work closed must
+    still not create a duplicate).
+    """
+    proc = _run_bd(
+        [
+            "list",
+            "--metadata-field",
+            f"{KEY_LEAD_WORK_ID}={work_id}",
+            "--all",
+            "--json",
+        ],
+        cwd=bc_root,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    rows = data if isinstance(data, list) else data.get("issues", [])
+    for row in rows:
+        if isinstance(row, dict) and row.get("id"):
+            return row["id"]
+    return None
+
+
+def create_bc_bead_on_observation(
+    bc_root: Path,
+    work_id: str,
+    *,
+    message_type: str,
+    title: str,
+) -> str | None:
+    """Create a paired BC-side bead for ``work_id`` if none exists yet.
+
+    Idempotent: returns the existing bead id (creating nothing) when a bead
+    already cross-references ``work_id``; otherwise creates one in the BC's
+    own bd workspace, carrying:
+      * type derived from ``message_type`` (ADR-017 decision 2 mapping),
+      * the note line "Lead work_id: <work_id>",
+      * the metadata key ``lead_work_id=<work_id>`` for deterministic lookup,
+    and returns the new bead's local id.
+
+    Best-effort: returns None when bd is unavailable in this environment so a
+    bd-less invocation still performs the messaging-layer observation.
+    """
+    if not bd_available(bc_root):
+        return None
+    existing = find_bc_bead_id(bc_root, work_id)
+    if existing is not None:
+        return existing
+    bead_type = MESSAGE_TYPE_TO_BEAD_TYPE.get(message_type, DEFAULT_BEAD_TYPE)
+    clean_title = (title or f"BC work for {work_id}").strip()
+    if len(clean_title) > BC_BEAD_TITLE_MAX:
+        clean_title = clean_title[:BC_BEAD_TITLE_MAX]
+    proc = _run_bd(
+        [
+            "create",
+            clean_title,
+            "--type",
+            bead_type,
+            "--notes",
+            cross_reference_note(work_id),
+            "--metadata",
+            json.dumps({KEY_LEAD_WORK_ID: work_id}),
+            "--force",
+            "--json",
+        ],
+        cwd=bc_root,
+    )
+    try:
+        rec = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return find_bc_bead_id(bc_root, work_id)
+    if isinstance(rec, list):
+        rec = rec[0] if rec else {}
+    new_id = rec.get("id") if isinstance(rec, dict) else None
+    _fsync_workspace(bc_root)
+    return new_id or find_bc_bead_id(bc_root, work_id)
+
+
+def apply_response_side_effect(
+    bc_root: Path,
+    work_id: str,
+    *,
+    message_type: str,
+    status: str | None = None,
+    note: str | None = None,
+) -> None:
+    """Flip the BC bead's status (and/or append a note) for a BC response.
+
+    ADR-017 decision 4 status-transition contract, realized mechanically:
+      clarify                -> blocked    (+ note summarizing the question)
+      work_done(complete)    -> closed
+      work_done(blocked)     -> blocked
+      mechanism_observation  -> unchanged  (+ note recording the observation)
+
+    Best-effort and a no-op when bd is unavailable or no paired BC bead
+    exists for ``work_id`` (e.g. a respond whose inbox row was never observed
+    via ``pending inbox``). Never raises into the respond path: a bd hiccup
+    must not block the primary messaging emission.
+    """
+    if not bd_available(bc_root):
+        return
+    bead_id = find_bc_bead_id(bc_root, work_id)
+    if bead_id is None:
+        return
+    new_status = status_for_response(message_type, status)
+    args = ["update", bead_id]
+    if new_status is not None:
+        args += ["--status", new_status]
+    if note:
+        args += ["--append-notes", note]
+    if len(args) == 2:
+        # Nothing to change (mechanism_observation with no note text).
+        return
+    try:
+        _run_bd(args, cwd=bc_root)
+        _fsync_workspace(bc_root)
+    except BdFacadeError:
+        # Messaging emission already succeeded; surface nothing fatal here.
+        # (The CLI layer logs a warning; see _cmd_respond_*.)
+        raise
+
+
 class BdFacadeError(RuntimeError):
     """Raised when a bd invocation fails in a way the CLI must surface."""
 
