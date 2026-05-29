@@ -96,10 +96,12 @@ from catalog.schemas import (
     Clarify,
     LeadMessage,
     MechanismObservation,
+    Nudge,
     RequestBugfix,
     RequestMaintenance,
     ScenarioPayload,
     WorkDone,
+    _nudge_payload_rejects_scenario_state,
 )
 from shop_msg import bd_facade
 from shop_msg.storage import (
@@ -112,6 +114,7 @@ from shop_msg.storage import (
     inbox_row_exists,
     insert_bc_response,
     insert_message,
+    insert_nudge,
     insert_raw_payload,
     outbox_row_exists,
     presence_status,
@@ -990,6 +993,167 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         bc_origin_main_commit=_bc_origin_main_commit(bc_root),
         payload_ref=getattr(args, "payload", None),
         queue_on_dependency=getattr(args, "queue_on_dependency", False),
+    )
+
+
+_NUDGE_REASONS = ("stuck-on-you", "status-check", "predecessor-landed", "general")
+
+
+def _do_nudge(
+    *,
+    command: str,
+    recipient_root: str,
+    work_id: str | None,
+    reason: str,
+    note: str | None,
+    payload_file: str | None,
+    sender_name: str | None,
+) -> int:
+    """Shared body for `shop-msg nudge` (BC->lead) and `shop-msg send nudge`
+    (lead->BC).
+
+    Both surfaces share the same delivery semantics (ADR-015 / lead-xp5f):
+      * validate the reason against the closed 4-value enum,
+      * require --note iff reason=general,
+      * reject any payload carrying scenario_hashes (transmission-layer only),
+      * store a direction='nudge' row at the recipient (multi-delivery; never
+        collides with the dispatch row or with a prior nudge),
+      * append exactly one canonical bd note to the lead's bead for work_id,
+        WITHOUT touching dispatch_state.
+
+    The messaging BC's responsibility ends at delivery + bd note appending
+    (lead-xp5f decision 3): no receiver-reply / one-reply-cap logic here.
+    """
+    # Closed reason enum enforcement at the CLI surface (ADR-015 decision 2).
+    # argparse `choices` already rejects bad reasons, but we re-check so the
+    # error message names the invalid value AND lists the four valid ones,
+    # exactly as scenario 1ff42687 pins it (and so a --payload path that
+    # smuggles a reason is caught too).
+    if reason not in _NUDGE_REASONS:
+        print(
+            f"shop-msg {command}: invalid reason {reason!r}. Valid reasons are: "
+            f"{', '.join(_NUDGE_REASONS)}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Payload-file path: the file is the content source but MUST NOT carry
+    # scenario state. We reject scenario_hashes BEFORE building the model, so
+    # the error names the rejected field (scenario eab77aec).
+    if payload_file:
+        raw = yaml.safe_load(Path(payload_file).read_text()) or {}
+        try:
+            _nudge_payload_rejects_scenario_state(raw)
+        except ValueError as exc:
+            print(f"shop-msg {command}: {exc}", file=sys.stderr)
+            return 2
+        if isinstance(raw, dict):
+            # The file may override note/reason; flags still win for keys the
+            # operator passed explicitly.
+            note = note if note is not None else raw.get("note")
+            reason = raw.get("reason", reason) if reason is None else reason
+
+    # Build & validate the Nudge model. The schema enforces --note-iff-general
+    # and the path-safe work_id shape; surface its message verbatim.
+    try:
+        message = Nudge(
+            message_type="nudge",
+            reason=reason,
+            work_id=work_id,
+            note=note,
+            from_shop=sender_name,
+        )
+    except ValidationError as exc:
+        # Name --note explicitly for the general-without-note case so the
+        # error matches scenario 4abbd813's expectation.
+        if reason == "general" and not (note and note.strip()):
+            print(
+                f"shop-msg {command}: --note is required when --reason=general "
+                f"(the 'general' reason carries no semantics of its own).",
+                file=sys.stderr,
+            )
+        else:
+            print(f"shop-msg {command}: {exc}", file=sys.stderr)
+        return 2
+
+    payload = message.model_dump(exclude_none=True)
+
+    # Delivery: store the direction='nudge' row at the recipient. Never
+    # collides (nudge is outside the inbox/outbox partial unique index), so a
+    # second nudge against the same (recipient, work_id) is storable.
+    insert_nudge(recipient_root, work_id, payload)
+
+    # bd note: append exactly one canonical note to the LEAD's bead for
+    # work_id, leaving dispatch_state untouched. The bead lives in the lead
+    # shop's bd workspace. Best-effort: a missing lead workspace or missing
+    # bead is a no-op (bd_available / bd note guards), never blocking delivery.
+    if work_id:
+        lead_root_str = _resolve_registered_lead()
+        if lead_root_str is not None:
+            at = (
+                __import__("datetime")
+                .datetime.now(__import__("datetime").timezone.utc)
+                .isoformat()
+            )
+            note_text = bd_facade.nudge_note_text(reason, work_id, at)
+            try:
+                bd_facade.append_note(work_id, note_text, root=Path(lead_root_str))
+            except bd_facade.BdFacadeError as exc:
+                # Delivery already succeeded; the bd note is a secondary
+                # artefact. Surface a warning but do not fail the nudge.
+                print(
+                    f"shop-msg {command}: nudge delivered but bd note append "
+                    f"failed: {exc}",
+                    file=sys.stderr,
+                )
+
+    recipient_desc = f" against work_id={work_id!r}" if work_id else ""
+    print(f"shop-msg {command}: nudge ({reason}) delivered{recipient_desc}.")
+    return 0
+
+
+def _cmd_nudge(args: argparse.Namespace) -> int:
+    """`shop-msg nudge` — BC -> lead operational-liveness signal.
+
+    The recipient is the registered lead shop; the sender is the BC resolved
+    from CWD (or --bc). The nudge row is stored at the LEAD's root.
+    """
+    # The --bc flag names the BC (sender); the recipient is the lead.
+    sender_name = args.bc or _resolve_send_sender()
+    lead_root_str = _resolve_registered_lead()
+    if lead_root_str is None:
+        print(
+            "shop-msg nudge: no lead shop is registered; cannot address a "
+            "BC->lead nudge. Register the lead with 'shop-msg registry add'.",
+            file=sys.stderr,
+        )
+        return 1
+    return _do_nudge(
+        command="nudge",
+        recipient_root=lead_root_str,
+        work_id=getattr(args, "work_id", None),
+        reason=args.reason,
+        note=getattr(args, "note", None),
+        payload_file=getattr(args, "payload", None),
+        sender_name=sender_name,
+    )
+
+
+def _cmd_send_nudge(args: argparse.Namespace) -> int:
+    """`shop-msg send nudge` — lead -> BC operational-liveness signal.
+
+    The recipient is the BC named by --bc; the sender is the lead resolved
+    from CWD. The nudge row is stored at the BC's root.
+    """
+    bc_root = _resolve_bc(args)
+    return _do_nudge(
+        command="send nudge",
+        recipient_root=bc_root,
+        work_id=getattr(args, "work_id", None),
+        reason=args.reason,
+        note=getattr(args, "note", None),
+        payload_file=getattr(args, "payload", None),
+        sender_name=_resolve_send_sender(),
     )
 
 
@@ -2074,6 +2238,87 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     request_bugfix.set_defaults(func=_cmd_send_request_bugfix)
+
+    send_nudge = send_sub.add_parser(
+        "nudge",
+        help="send a lead->BC operational-liveness nudge (ADR-015)",
+    )
+    send_nudge.add_argument(
+        "--bc", required=True, help="canonical BC name (recipient; resolved via registry)"
+    )
+    _add_removed_flag(send_nudge, "--bc-root")
+    send_nudge.add_argument(
+        "--reason",
+        required=True,
+        choices=list(_NUDGE_REASONS),
+        help=(
+            "closed reason enum (ADR-015 decision 2): stuck-on-you, "
+            "status-check, predecessor-landed, general"
+        ),
+    )
+    send_nudge.add_argument(
+        "--work-id",
+        default=None,
+        help="lead dispatch work_id this nudge references (optional)",
+    )
+    send_nudge.add_argument(
+        "--note",
+        default=None,
+        help="free-form note; REQUIRED when --reason=general, optional otherwise",
+    )
+    send_nudge.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the nudge body; rejected if it "
+            "carries a scenario_hashes field (nudge is transmission-layer only)"
+        ),
+    )
+    send_nudge.set_defaults(func=_cmd_send_nudge)
+
+    nudge = sub.add_parser(
+        "nudge",
+        help="send a BC->lead operational-liveness nudge (ADR-015)",
+    )
+    nudge.add_argument(
+        "--bc",
+        default=None,
+        help=(
+            "canonical BC name of the SENDER (resolved via registry). "
+            "Optional: when omitted, the BC name is resolved from CWD via "
+            ".claude/shop/ marker walk-up (PDR-008). The recipient is the "
+            "registered lead shop."
+        ),
+    )
+    _add_removed_flag(nudge, "--bc-root")
+    nudge.add_argument(
+        "--reason",
+        required=True,
+        choices=list(_NUDGE_REASONS),
+        help=(
+            "closed reason enum (ADR-015 decision 2): stuck-on-you, "
+            "status-check, predecessor-landed, general"
+        ),
+    )
+    nudge.add_argument(
+        "--work-id",
+        default=None,
+        help="lead dispatch work_id this nudge references (optional)",
+    )
+    nudge.add_argument(
+        "--note",
+        default=None,
+        help="free-form note; REQUIRED when --reason=general, optional otherwise",
+    )
+    nudge.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the nudge body; rejected if it "
+            "carries a scenario_hashes field (nudge is transmission-layer only)"
+        ),
+    )
+    nudge.set_defaults(func=_cmd_nudge, _cwd_resolves=True)
 
     read = sub.add_parser("read", help="read a message from a BC's mailboxes")
     read_sub = read.add_subparsers(dest="read_target", required=True)

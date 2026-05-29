@@ -18,12 +18,29 @@ Schema (DDL emitted once per connect):
     id          BIGSERIAL PRIMARY KEY,
     bc          TEXT NOT NULL,
     work_id     TEXT NOT NULL,
-    direction   TEXT NOT NULL CHECK (direction IN ('inbox','outbox')),
+    direction   TEXT NOT NULL CHECK (direction IN ('inbox','outbox','nudge')),
     message_type TEXT NOT NULL,
     payload     JSONB NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (bc, work_id, direction, message_type)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
   );
+
+Uniqueness (lead-xp5f / ADR-015 nudge direction):
+  The one-message-per-(bc,work_id,direction,message_type) invariant that
+  inbox/outbox collision detection (respond collision/--force, consume)
+  depends on is enforced by a PARTIAL unique index scoped to direction IN
+  ('inbox','outbox') ONLY:
+
+    CREATE UNIQUE INDEX messages_inbox_outbox_uq
+      ON messages (bc, work_id, direction, message_type)
+      WHERE direction IN ('inbox','outbox');
+
+  direction='nudge' rows are deliberately OUTSIDE that index, so a second
+  (or Nth) nudge against the same (bc, work_id) is storable — a nudge is
+  auxiliary signaling, not subject to the dispatch lifecycle (ADR-015
+  decision 6 / lead-1w7r decision 1). The discriminator distinguishing
+  multiple nudges is the BIGSERIAL ``id`` + ``created_at``. The partial
+  index is scoped so inbox/outbox collision/--force/consume behavior is
+  byte-for-byte preserved.
 
 Collision handling:
   INSERT ... ON CONFLICT DO NOTHING returns 0 rows affected. The
@@ -86,12 +103,82 @@ CREATE TABLE IF NOT EXISTS messages (
   id           BIGSERIAL PRIMARY KEY,
   bc           TEXT NOT NULL,
   work_id      TEXT NOT NULL,
-  direction    TEXT NOT NULL CHECK (direction IN ('inbox','outbox')),
+  direction    TEXT NOT NULL CHECK (direction IN ('inbox','outbox','nudge')),
   message_type TEXT NOT NULL,
   payload      JSONB NOT NULL,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (bc, work_id, direction, message_type)
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+"""
+
+# Migration (lead-xp5f / ADR-015): widen the direction CHECK to admit
+# 'nudge'. On a fresh DB the CREATE above already includes 'nudge'; on a
+# pre-existing production table the original CHECK only allows
+# ('inbox','outbox'), so we drop-and-recreate the constraint by name. Both
+# the named constraint (older tables) and the anonymous form are handled by
+# probing pg_constraint and recreating a known-named one. Idempotent.
+_DDL_DIRECTION_CHECK_MIGRATION = """
+DO $$
+DECLARE
+  conname text;
+BEGIN
+  -- Drop any existing CHECK constraint on the direction column whose
+  -- definition does NOT already permit 'nudge'.
+  FOR conname IN
+    SELECT c.conname
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    WHERE t.relname = 'messages'
+      AND c.contype = 'c'
+      AND pg_get_constraintdef(c.oid) LIKE '%direction%'
+      AND pg_get_constraintdef(c.oid) NOT LIKE '%nudge%'
+  LOOP
+    EXECUTE format('ALTER TABLE messages DROP CONSTRAINT %I', conname);
+  END LOOP;
+  -- Ensure a widened named CHECK exists.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    WHERE t.relname = 'messages' AND c.conname = 'messages_direction_check_nudge'
+  ) THEN
+    ALTER TABLE messages
+      ADD CONSTRAINT messages_direction_check_nudge
+      CHECK (direction IN ('inbox','outbox','nudge'));
+  END IF;
+END $$;
+"""
+
+# Uniqueness migration (lead-xp5f / ADR-015): the inbox/outbox
+# one-row-per-(bc,work_id,direction,message_type) invariant is enforced by a
+# PARTIAL unique index scoped to direction IN ('inbox','outbox'). nudge rows
+# are deliberately outside it (multi-delivery). On a pre-existing table the
+# original table-level UNIQUE(bc,work_id,direction,message_type) covered ALL
+# directions; we drop that anonymous/auto-named UNIQUE constraint (it would
+# otherwise block a second nudge) and replace it with the partial index.
+# Idempotent: re-running drops nothing once the table-wide UNIQUE is gone and
+# CREATE UNIQUE INDEX IF NOT EXISTS is a no-op once present.
+_DDL_PARTIAL_UNIQUE_MIGRATION = """
+DO $$
+DECLARE
+  conname text;
+BEGIN
+  -- Drop any UNIQUE constraint over the full (bc,work_id,direction,message_type)
+  -- tuple that is NOT scoped to inbox/outbox (i.e. the legacy table-wide one).
+  FOR conname IN
+    SELECT c.conname
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    WHERE t.relname = 'messages'
+      AND c.contype = 'u'
+  LOOP
+    EXECUTE format('ALTER TABLE messages DROP CONSTRAINT %I', conname);
+  END LOOP;
+END $$;
+"""
+
+_DDL_PARTIAL_UNIQUE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS messages_inbox_outbox_uq
+  ON messages (bc, work_id, direction, message_type)
+  WHERE direction IN ('inbox','outbox');
 """
 
 _DDL_CONSUMED_COL = """
@@ -128,6 +215,14 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(_DDL)
         cur.execute(_DDL_CONSUMED_COL)
+        # Order matters: widen the direction CHECK and drop the legacy
+        # table-wide UNIQUE before creating the partial unique index, so a
+        # pre-existing production table is migrated to the nudge-admitting
+        # shape (lead-xp5f / ADR-015) without weakening inbox/outbox
+        # collision detection.
+        cur.execute(_DDL_DIRECTION_CHECK_MIGRATION)
+        cur.execute(_DDL_PARTIAL_UNIQUE_MIGRATION)
+        cur.execute(_DDL_PARTIAL_UNIQUE_INDEX)
         cur.execute(_DDL_REGISTRY)
         cur.execute(_DDL_PRESENCE)
     conn.commit()
@@ -269,11 +364,19 @@ def insert_message(
                         f"work_id={work_id!r}"
                     )
 
+            # ON CONFLICT targets the PARTIAL unique index (scoped to
+            # direction IN ('inbox','outbox')); the index predicate must be
+            # restated in the conflict target for postgres to infer it.
+            # insert_message is only ever called with inbox/outbox directions
+            # (nudges go through insert_nudge), so every row this statement
+            # inserts is covered by the partial index — collision detection is
+            # byte-for-byte the same as the prior table-wide UNIQUE.
             cur.execute(
                 """
                 INSERT INTO messages (bc, work_id, direction, message_type, payload)
                 VALUES (%s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (bc, work_id, direction, message_type) DO NOTHING
+                ON CONFLICT (bc, work_id, direction, message_type)
+                  WHERE direction IN ('inbox','outbox') DO NOTHING
                 """,
                 (bc, work_id, direction, message_type, payload_json),
             )
@@ -319,6 +422,104 @@ def insert_message(
                     payload=sql.Literal(work_id),
                 )
             )
+
+
+def insert_nudge(
+    recipient_root: str,
+    work_id: str | None,
+    payload: dict[str, Any],
+) -> int:
+    """Insert a direction='nudge' row and return its row id.
+
+    A nudge is auxiliary signaling (ADR-015 decision 6 / lead-xp5f): it is
+    stored at direction='nudge', which is OUTSIDE the partial unique index
+    that enforces inbox/outbox collision. As a result a SECOND (or Nth) nudge
+    against the same (recipient, work_id) is storable — never raises
+    CollisionError. The discriminator distinguishing multiple nudges is the
+    BIGSERIAL ``id`` (returned here) plus ``created_at``.
+
+    The ``recipient_root`` is the path of the shop the nudge is addressed TO
+    (the lead for a BC->lead nudge, the BC for a lead->BC nudge); it becomes
+    the ``bc`` column value, consistent with how dispatch rows key on the
+    recipient's path. ``work_id`` may be None for a bare liveness nudge that
+    references no in-flight dispatch; it is stored as the empty string so the
+    NOT NULL column is satisfied while remaining distinguishable.
+
+    This function NEVER touches inbox/outbox rows: the original
+    direction='inbox' dispatch row for the same (recipient, work_id) is left
+    byte-identical (lead-xp5f decision 1 invariant (c)).
+    """
+    bc = _bc_id(recipient_root)
+    payload_json = json.dumps(payload)
+    work_id_col = work_id if work_id is not None else ""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO messages (bc, work_id, direction, message_type, payload)
+                VALUES (%s, %s, 'nudge', 'nudge', %s::jsonb)
+                RETURNING id
+                """,
+                (bc, work_id_col, payload_json),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    # row is a dict (dict_row factory); the RETURNING column is "id".
+    return int(row["id"]) if isinstance(row, dict) else int(row[0])
+
+
+def count_nudges(recipient_root: str, work_id: str | None = None) -> int:
+    """Return the number of direction='nudge' rows for a recipient.
+
+    When ``work_id`` is supplied, counts only nudges keyed to that work_id;
+    otherwise counts every nudge addressed to ``recipient_root``. Used by the
+    scenarios to assert multi-delivery (a second nudge raises the count to 2)
+    and rejection (a rejected send leaves the count at 0).
+    """
+    bc = _bc_id(recipient_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            if work_id is None:
+                cur.execute(
+                    "SELECT count(*) AS n FROM messages "
+                    "WHERE bc = %s AND direction = 'nudge'",
+                    (bc,),
+                )
+            else:
+                cur.execute(
+                    "SELECT count(*) AS n FROM messages "
+                    "WHERE bc = %s AND direction = 'nudge' AND work_id = %s",
+                    (bc, work_id),
+                )
+            row = cur.fetchone()
+    return int(row["n"]) if isinstance(row, dict) else int(row[0])
+
+
+def read_nudge_rows(recipient_root: str, work_id: str | None = None) -> list[dict[str, Any]]:
+    """Return all direction='nudge' rows for a recipient, oldest-first.
+
+    Each row dict carries id, work_id, message_type, payload, created_at.
+    Used by step defs to assert the stored reason / note / work_id and to
+    distinguish a second nudge from the first by its id discriminator.
+    """
+    bc = _bc_id(recipient_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            if work_id is None:
+                cur.execute(
+                    "SELECT id, work_id, message_type, payload, created_at "
+                    "FROM messages WHERE bc = %s AND direction = 'nudge' "
+                    "ORDER BY id ASC",
+                    (bc,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, work_id, message_type, payload, created_at "
+                    "FROM messages WHERE bc = %s AND direction = 'nudge' "
+                    "AND work_id = %s ORDER BY id ASC",
+                    (bc, work_id),
+                )
+            return list(cur.fetchall())
 
 
 def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
@@ -1043,12 +1244,15 @@ def insert_bc_response(
                         f"message_type={message_type!r}"
                     )
 
-            # 1. Write to lead inbox.
+            # 1. Write to lead inbox. (ON CONFLICT restates the partial-index
+            # predicate; both writes here are inbox/outbox so they are covered
+            # by messages_inbox_outbox_uq — lead-xp5f.)
             cur.execute(
                 """
                 INSERT INTO messages (bc, work_id, direction, message_type, payload)
                 VALUES (%s, %s, 'inbox', %s, %s::jsonb)
-                ON CONFLICT (bc, work_id, direction, message_type) DO NOTHING
+                ON CONFLICT (bc, work_id, direction, message_type)
+                  WHERE direction IN ('inbox','outbox') DO NOTHING
                 """,
                 (lead_bc_id, work_id, message_type, payload_json),
             )
@@ -1059,7 +1263,8 @@ def insert_bc_response(
                 """
                 INSERT INTO messages (bc, work_id, direction, message_type, payload)
                 VALUES (%s, %s, 'outbox', %s, %s::jsonb)
-                ON CONFLICT (bc, work_id, direction, message_type) DO NOTHING
+                ON CONFLICT (bc, work_id, direction, message_type)
+                  WHERE direction IN ('inbox','outbox') DO NOTHING
                 """,
                 (bc_bc_id, work_id, message_type, payload_json),
             )

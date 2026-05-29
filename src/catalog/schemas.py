@@ -143,6 +143,76 @@ class RequestBugfix(BaseModel):
     from_shop: str | None = None
 
 
+class Nudge(BaseModel):
+    """Operational-liveness signal between lead and BC (ADR-015 / lead-1w7r).
+
+    A nudge is an auxiliary signal — "are you stuck?", "I'm stuck", "the
+    predecessor landed", or a general heads-up — that is NOT subject to the
+    dispatch lifecycle (ADR-015 decision 6). It carries no scenario state
+    (ADR-015 decision 7): a nudge that references a work_id references the
+    dispatch by ID only and makes no claim about scenario coverage.
+
+    Closed reason enum (ADR-015 decision 2):
+      stuck-on-you       -- the sender is blocked waiting on the recipient
+      status-check       -- the sender is asking for a liveness/progress ping
+      predecessor-landed -- a dependency the recipient was waiting on has landed
+      general            -- catch-all; the reason itself carries no semantics,
+                            so --note is REQUIRED for this value only.
+
+    The `--note` requirement is asymmetric (lead-1w7r decision, scenario
+    4abbd813c588af06): mandatory for ``general`` (where the reason alone
+    communicates nothing), opportunistic for the three semantic reasons.
+
+    Transmission-layer purity (ADR-015 decision 7): the schema has no
+    ``scenario_hashes`` field, and a payload carrying one is rejected at
+    construction by ``_reject_scenario_state``.
+    """
+    message_type: Literal["nudge"]
+    reason: Literal[
+        "stuck-on-you", "status-check", "predecessor-landed", "general"
+    ]
+    # work_id is optional: a nudge MAY reference an in-flight dispatch by id,
+    # but a bare liveness ping need not. When present it is path-safe-shaped,
+    # matching Clarify.work_id (lead-008 hardening).
+    work_id: str | None = Field(default=None, min_length=1, pattern=r"^[a-zA-Z0-9-]+$")
+    note: str | None = None
+    # See RequestMaintenance.from_shop. Populated by `shop-msg` when the
+    # sender is resolved implicitly from CWD (PDR-008).
+    from_shop: str | None = None
+
+    @model_validator(mode="after")
+    def _note_required_for_general(self) -> "Nudge":
+        # ADR-015 decision 2 / lead-1w7r: --note is mandatory only for the
+        # catch-all reason "general", where the reason itself communicates no
+        # semantics. The three semantic reasons accept but do not require it.
+        if self.reason == "general" and not (self.note and self.note.strip()):
+            raise ValueError(
+                "Nudge with reason='general' requires a non-empty note: the "
+                "'general' reason carries no semantics of its own, so the note "
+                "is the only signal. Supply --note."
+            )
+        return self
+
+
+def _nudge_payload_rejects_scenario_state(data: object) -> None:
+    """Reject a nudge payload that carries scenario state (ADR-015 decision 7).
+
+    Nudges are purely transmission-layer: they MUST NOT carry a
+    ``scenario_hashes`` field. The Nudge model itself has no such field, so a
+    plain ``Nudge(**data)`` would silently *drop* an extra key rather than
+    reject it. This helper is the explicit guard the CLI invokes on the raw
+    payload dict BEFORE constructing the model, so an adversarial payload file
+    that smuggles ``scenario_hashes`` is named and rejected at the surface.
+    """
+    if isinstance(data, dict) and "scenario_hashes" in data:
+        raise ValueError(
+            "nudge payload carries a 'scenario_hashes' field, but a nudge MUST "
+            "NOT carry scenario state per ADR-015 decision 7. A nudge that "
+            "references a work_id references the dispatch lifecycle by ID only "
+            "and makes no claim about scenario coverage. Remove 'scenario_hashes'."
+        )
+
+
 class Clarify(BaseModel):
     message_type: Literal["clarify"]
     # work_id is constrained to a safe identifier shape: alphanumerics and
@@ -203,5 +273,9 @@ class MechanismObservation(BaseModel):
     )
 
 
-LeadMessage = Union[RequestMaintenance, AssignScenarios, RequestBugfix]
-BCResponse = Union[Clarify, WorkDone, MechanismObservation]
+# A nudge is auxiliary signaling that flows BOTH directions: lead -> BC
+# (`shop-msg send nudge`) and BC -> lead (`shop-msg nudge`). It is therefore
+# a member of both message unions. It is NOT a dispatch (no lifecycle) and
+# not a work-response (no scenario state) — ADR-015 decisions 6 & 7.
+LeadMessage = Union[RequestMaintenance, AssignScenarios, RequestBugfix, Nudge]
+BCResponse = Union[Clarify, WorkDone, MechanismObservation, Nudge]

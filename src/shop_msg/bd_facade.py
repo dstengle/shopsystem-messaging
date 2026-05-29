@@ -264,6 +264,46 @@ def apply_response_side_effect(
         raise
 
 
+def nudge_note_text(reason: str, work_id: str, at_iso8601_utc: str) -> str:
+    """Return the canonical nudge note string (ADR-015 / lead-xp5f decision 2).
+
+    The EXACT format pinned by the scenarios is::
+
+        nudge: reason=<reason> work_id=<work_id> at=<iso8601_utc>
+
+    A single mechanism, a single format. The three structured fields
+    (reason, work_id, at) are substring-parsable, which is what the scenario
+    Then-steps assert. ``work_id`` is rendered verbatim; a bare nudge with no
+    work_id passes the empty string here, but the nudge scenarios always
+    carry a work_id when they assert the note.
+    """
+    return f"nudge: reason={reason} work_id={work_id} at={at_iso8601_utc}"
+
+
+def append_note(work_id: str, text: str, *, root: Path) -> None:
+    """Append ``text`` to bead ``work_id``'s notes field via ``bd note``.
+
+    Wraps bd's native ``bd note <id> <text>`` command (shorthand for
+    ``bd update <id> --append-notes``), which appends to the bead's notes
+    field without disturbing any other field — in particular it does NOT
+    touch ``dispatch_state`` or any ADR-011 canonical metadata key (lead-xp5f
+    scenarios 9d0aee49 / e236edb2 / 4cc30de3: a nudge leaves dispatch_state
+    unchanged and the bd record receives ONLY an appended note).
+
+    ``root`` is the shop root whose ``.beads`` workspace holds the bead
+    (the lead shop for a nudge that references a lead dispatch work_id).
+
+    Best-effort guard: when bd is unavailable in this environment the call is
+    a no-op, mirroring the other bd side-effect helpers — the messaging-layer
+    delivery (the postgres nudge row) must not be blocked by a bd hiccup.
+    Raises BdFacadeError only when bd is present but the note command fails.
+    """
+    if not bd_available(root):
+        return
+    _run_bd(["note", work_id, text], cwd=root)
+    _fsync_workspace(root)
+
+
 class BdFacadeError(RuntimeError):
     """Raised when a bd invocation fails in a way the CLI must surface."""
 
