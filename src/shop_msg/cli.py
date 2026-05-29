@@ -532,6 +532,7 @@ def _bd_first_send(
     depends_on_dispatch: str | None,
     bc_origin_main_commit: str | None,
     payload_ref: str | None,
+    queue_on_dependency: bool = False,
 ) -> int:
     """Run the bd-first 3-step send protocol (PDR-010 / ADR-012).
 
@@ -554,6 +555,59 @@ def _bd_first_send(
     lead_root_str = _resolve_registered_lead()
     use_bd = lead_root_str is not None and bd_facade.bd_available(Path(lead_root_str))
     lead_root = Path(lead_root_str) if lead_root_str else None
+
+    # Dispatch-dependency consultation (PDR-010 / ADR-013). Before any write,
+    # consult the bd depends-on edges of this work_id. The graph is invariantly
+    # acyclic by construction (ADR-013 decision 8: bd rejects cycles, shop-msg
+    # does NOT re-check), so a one-hop predecessor enumeration is safe.
+    if use_bd:
+        unmet = bd_facade.first_unclosed_predecessor(lead_root, work_id)
+        if unmet is not None:
+            predecessor, pred_state = unmet
+            if not queue_on_dependency:
+                # Strict mode (default): TOTAL refusal — no postgres artifact
+                # and no bd artifact. We refuse BEFORE Step 1 so re-running
+                # after the predecessor closes is the same as a first run.
+                print(
+                    f"shop-msg send {command}: refusing to dispatch "
+                    f"{work_id!r}: predecessor {predecessor!r} is at "
+                    f"dispatch_state={pred_state!r}, not 'closed'. "
+                    f"Use --queue-on-dependency to defer until it closes.",
+                    file=sys.stderr,
+                )
+                return 1
+            # Queued mode (ADR-013 decision 4): defer the postgres deposit.
+            # Write the queued intent to bd alone, as a single atomic
+            # `bd create --metadata` payload (ADR-012 atomicity), then return.
+            outbox_pending_at = (
+                __import__("datetime")
+                .datetime.now(__import__("datetime").timezone.utc)
+            ).isoformat()
+            try:
+                bd_facade.create_queued_dispatch_bead(
+                    lead_root,
+                    work_id,
+                    dispatched_to_bc=bc_name,
+                    dispatch_message_type=message_type,
+                    pending_dependency=predecessor,
+                    scenario_hashes_pinned=scenario_hashes_pinned,
+                    bc_origin_main_commit_at_dispatch=bc_origin_main_commit,
+                    payload_ref=payload_ref,
+                    outbox_pending_at=outbox_pending_at,
+                )
+            except bd_facade.BdFacadeError as exc:
+                print(
+                    f"shop-msg send {command}: queued-mode bd write failed: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"shop-msg send {command}: dispatch {work_id!r} queued behind "
+                f"{predecessor!r}; postgres deposit deferred until it closes "
+                f"(run `shop-msg promote` after closing the predecessor)."
+            )
+            return 0
 
     # Step 1: bd write (durable) BEFORE any postgres write.
     if use_bd:
@@ -697,6 +751,7 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
         depends_on_dispatch=getattr(args, "depends_on", None),
         bc_origin_main_commit=_bc_origin_main_commit(bc_root),
         payload_ref=getattr(args, "payload", None),
+        queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
 
 
@@ -763,6 +818,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
             depends_on_dispatch=getattr(args, "depends_on", None),
             bc_origin_main_commit=_bc_origin_main_commit(bc_root),
             payload_ref=args.payload,
+            queue_on_dependency=getattr(args, "queue_on_dependency", False),
         )
 
     if args.description is None:
@@ -809,6 +865,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
         depends_on_dispatch=getattr(args, "depends_on", None),
         bc_origin_main_commit=_bc_origin_main_commit(bc_root),
         payload_ref=getattr(args, "payload", None),
+        queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
 
 
@@ -828,6 +885,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
             depends_on_dispatch=getattr(args, "depends_on", None),
             bc_origin_main_commit=_bc_origin_main_commit(bc_root),
             payload_ref=args.payload,
+            queue_on_dependency=getattr(args, "queue_on_dependency", False),
         )
 
     if not args.scenario_file or args.feature_title is None or args.bc_tag is None:
@@ -862,6 +920,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         depends_on_dispatch=getattr(args, "depends_on", None),
         bc_origin_main_commit=_bc_origin_main_commit(bc_root),
         payload_ref=getattr(args, "payload", None),
+        queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
 
 
@@ -1126,6 +1185,22 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
             continue
         if not _sweep_is_stale(metadata, threshold):
             continue
+        # ADR-013 sweep/queued-dispatch interaction (lead-p0ez): a queued bead
+        # carries pending_dependency AND ages into outbox_pending staleness
+        # naturally. Sweep MUST NOT promote it past an open predecessor — that
+        # would silently defeat ADR-013's central dependency-gating guarantee.
+        # If pending_dependency is set AND that predecessor is NOT at
+        # dispatch_state=closed, skip the bead entirely: no postgres deposit,
+        # no bd state mutation. (A normal stuck outbox_pending bead with NO
+        # pending_dependency is still swept/recovered exactly as before per
+        # lead-tuu5.)
+        pending_dependency = metadata.get(bd_facade.KEY_PENDING_DEPENDENCY)
+        if pending_dependency:
+            predecessor_state = bd_facade.predecessor_dispatch_state(
+                shop_root, pending_dependency
+            )
+            if predecessor_state != bd_facade.STATE_CLOSED:
+                continue
         work_id = bead.get("id")
         bc_name = metadata.get(bd_facade.KEY_DISPATCHED_TO_BC)
         message_type = metadata.get(bd_facade.KEY_DISPATCH_MESSAGE_TYPE)
@@ -1185,6 +1260,155 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
         recovered += 1
 
     print(f"shop-msg sweep: recovered {recovered} outbox_pending bead(s).")
+    return 0
+
+
+def _promote_one(
+    shop_root: Path, bead: dict, closed_work_id: str
+) -> str:
+    """Attempt to promote a single queued bead whose pending_dependency is
+    the just-closed predecessor. Returns one of: "promoted", "still-queued",
+    "noop". Idempotent: an already-dispatched bead is a no-op.
+
+    A queued bead is released only when ALL of its depends-on edges are at
+    dispatch_state=closed (ADR-013 decision 6). When the closing predecessor
+    was one of several open predecessors, the pending_dependency pointer for
+    the closed one is cleared but the bead remains outbox_pending if any OTHER
+    predecessor is still not closed.
+    """
+    metadata = bead.get("metadata") or {}
+    work_id = bead.get("id")
+    state = metadata.get(bd_facade.KEY_DISPATCH_STATE)
+    pending = metadata.get(bd_facade.KEY_PENDING_DEPENDENCY)
+
+    # Idempotency: only outbox_pending beads pointing at the closed predecessor
+    # are candidates. An already-promoted (dispatched) bead is a no-op.
+    if state != bd_facade.STATE_OUTBOX_PENDING or pending != closed_work_id:
+        return "noop"
+
+    # Re-consult ALL depends-on edges: release only if every predecessor is
+    # now closed.
+    unmet = bd_facade.first_unclosed_predecessor(shop_root, work_id)
+    if unmet is not None:
+        # Another predecessor is still open. Clear the pointer for the closed
+        # one (it is satisfied) but leave the bead queued behind the remaining
+        # open predecessor.
+        remaining_pred, _state = unmet
+        # Re-point pending_dependency at the still-open predecessor so the
+        # next close of THAT predecessor re-triggers this bead.
+        bd_facade._run_bd(
+            [
+                "update",
+                work_id,
+                "--set-metadata",
+                f"{bd_facade.KEY_PENDING_DEPENDENCY}={remaining_pred}",
+            ],
+            cwd=shop_root,
+        )
+        return "still-queued"
+
+    # All predecessors closed: deposit the deferred postgres row, flip to
+    # dispatched, and clear pending_dependency.
+    bc_name = metadata.get(bd_facade.KEY_DISPATCHED_TO_BC)
+    message_type = metadata.get(bd_facade.KEY_DISPATCH_MESSAGE_TYPE)
+    payload_ref = metadata.get(bd_facade.KEY_PAYLOAD_REF)
+    if not (bc_name and message_type and payload_ref):
+        print(
+            f"shop-msg promote: queued bead {work_id} is missing a "
+            f"dispatched_to_bc / dispatch_message_type / payload_ref needed to "
+            f"deposit; skipping.",
+            file=sys.stderr,
+        )
+        return "noop"
+    bc_root_str = resolve_shop_name(bc_name)
+    if bc_root_str is None:
+        print(
+            f"shop-msg promote: bead {work_id} references unregistered BC "
+            f"{bc_name!r}; skipping.",
+            file=sys.stderr,
+        )
+        return "noop"
+    bc_root = str(Path(bc_root_str).resolve())
+    if not Path(payload_ref).exists():
+        print(
+            f"shop-msg promote: bead {work_id} payload reference "
+            f"{payload_ref!r} no longer exists; skipping.",
+            file=sys.stderr,
+        )
+        return "noop"
+    try:
+        payload = _load_payload_file(payload_ref, message_type, work_id)
+    except (ValueError, ValidationError, OSError) as exc:
+        print(
+            f"shop-msg promote: bead {work_id} payload reconstruction failed: "
+            f"{exc}; skipping.",
+            file=sys.stderr,
+        )
+        return "noop"
+    try:
+        insert_message(bc_root, work_id, "inbox", message_type, payload, notify=True)
+    except CollisionError:
+        # A prior promote already deposited this row (idempotency under the
+        # postgres UNIQUE constraint). Proceed to ensure the bd state is
+        # consistent (flip + clear) so a partially-completed prior promote is
+        # finished.
+        pass
+    bd_facade.set_dispatch_state(shop_root, work_id, bd_facade.STATE_DISPATCHED)
+    bd_facade.clear_pending_dependency(shop_root, work_id)
+    return "promoted"
+
+
+def _cmd_promote(args: argparse.Namespace) -> int:
+    """Promote queued dispatches whose predecessor has just closed.
+
+    The trigger event is the closure of a predecessor bead (PDR-010 /
+    ADR-013): the architect runs `bd close <predecessor>` (transitioning its
+    dispatch_state to closed), then this scan enumerates every bd entry with
+    pending_dependency=<predecessor> and, for each whose depends-on edges are
+    ALL closed, deposits the deferred postgres outbox row and flips the bead
+    from outbox_pending to dispatched (decision 6 idempotency: a second
+    invocation is a no-op on already-dispatched beads).
+
+    --set-closed marks the predecessor's dispatch_state=closed as part of the
+    same command (the deterministic seam the close-triggers-promote contract
+    relies on), so a test does not depend on a native bd-close hook.
+    """
+    shop_root_str = resolve_shop_name(args.shop)
+    if shop_root_str is None:
+        print(
+            f"shop-msg promote: shop name {args.shop!r} is not registered in "
+            f"the registry.",
+            file=sys.stderr,
+        )
+        return 1
+    shop_root = Path(shop_root_str).resolve()
+    if not bd_facade.bd_available(shop_root):
+        print(
+            f"shop-msg promote: no reachable bd workspace under {shop_root!r}; "
+            f"nothing to promote.",
+            file=sys.stderr,
+        )
+        return 0
+
+    closed_work_id = args.closed
+
+    # Optionally mark the predecessor's dispatch_state=closed (the architect's
+    # close-step). Idempotent: setting closed when already closed is harmless.
+    if getattr(args, "set_closed", False):
+        if bd_facade.get_dispatch_bead(shop_root, closed_work_id) is not None:
+            bd_facade.set_dispatch_state(
+                shop_root, closed_work_id, bd_facade.STATE_CLOSED
+            )
+
+    promoted = 0
+    for bead in bd_facade.list_dispatch_beads(shop_root):
+        outcome = _promote_one(shop_root, bead, closed_work_id)
+        if outcome == "promoted":
+            promoted += 1
+    print(
+        f"shop-msg promote: closed {closed_work_id!r}; promoted {promoted} "
+        f"queued dispatch(es)."
+    )
     return 0
 
 
@@ -1611,6 +1835,17 @@ def build_parser() -> argparse.ArgumentParser:
             "lead bd entry as depends_on_dispatch metadata"
         ),
     )
+    request_maintenance.add_argument(
+        "--queue-on-dependency",
+        action="store_true",
+        help=(
+            "when a bd depends-on predecessor is not yet at "
+            "dispatch_state=closed, defer the postgres deposit: write a queued "
+            "bd entry (dispatch_state=outbox_pending, pending_dependency=<pred>) "
+            "instead of refusing. The deposit lands via `shop-msg promote` once "
+            "the predecessor closes (PDR-010 / ADR-013 decision 4)"
+        ),
+    )
     request_maintenance.set_defaults(func=_cmd_send_request_maintenance)
 
     assign_scenarios = send_sub.add_parser(
@@ -1659,6 +1894,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--depends-on",
         default=None,
         help="work_id of a prior dispatch this one depends on (bd metadata)",
+    )
+    assign_scenarios.add_argument(
+        "--queue-on-dependency",
+        action="store_true",
+        help=(
+            "when a bd depends-on predecessor is not yet at "
+            "dispatch_state=closed, defer the postgres deposit and write a "
+            "queued bd entry instead of refusing (PDR-010 / ADR-013 decision 4)"
+        ),
     )
     assign_scenarios.set_defaults(func=_cmd_send_assign_scenarios)
 
@@ -1710,6 +1954,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--depends-on",
         default=None,
         help="work_id of a prior dispatch this one depends on (bd metadata)",
+    )
+    request_bugfix.add_argument(
+        "--queue-on-dependency",
+        action="store_true",
+        help=(
+            "when a bd depends-on predecessor is not yet at "
+            "dispatch_state=closed, defer the postgres deposit and write a "
+            "queued bd entry instead of refusing (PDR-010 / ADR-013 decision 4)"
+        ),
     )
     request_bugfix.set_defaults(func=_cmd_send_request_bugfix)
 
@@ -1892,6 +2145,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sweep.set_defaults(func=_cmd_sweep)
+
+    promote = sub.add_parser(
+        "promote",
+        help=(
+            "promote queued dispatches whose predecessor has just closed: "
+            "deposit the deferred postgres outbox row and flip the bd entry "
+            "from outbox_pending to dispatched (PDR-010 / ADR-013)"
+        ),
+    )
+    promote.add_argument(
+        "--shop",
+        required=True,
+        help=(
+            "canonical shop name whose bd workspace holds the queued entries "
+            "(resolved via registry)"
+        ),
+    )
+    promote.add_argument(
+        "--closed",
+        required=True,
+        help="work_id of the predecessor that just closed (the promote trigger)",
+    )
+    promote.add_argument(
+        "--set-closed",
+        action="store_true",
+        help=(
+            "also mark the predecessor's dispatch_state=closed as part of this "
+            "command (the architect's close-step)"
+        ),
+    )
+    promote.set_defaults(func=_cmd_promote)
 
     prime = sub.add_parser(
         "prime",

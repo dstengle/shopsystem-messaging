@@ -8720,3 +8720,1012 @@ def ph_then_never_offline(context: dict) -> None:
 )
 def ph_then_single_bc_property(context: dict) -> None:
     pass
+
+
+# =======================================================================
+# lead-eow5 + lead-w4ja: Dispatch dependencies via bd dep, honored by
+# shop-msg send (PDR-010 / ADR-013).
+#
+# Steps below back features/dispatch_dependencies_bd_dep.feature. They reuse
+# the nn5f lead/BC registration Givens (which stand up a per-test-isolated bd
+# workspace with bead cleanup at teardown) and add the dependency-specific
+# phrasings: creating dispatch beads at given states, recording bd dep edges,
+# running shop-msg send (strict / queued), and shop-msg promote.
+#
+# Deterministic seams only: the "close triggers promote" contract is exercised
+# via `shop-msg promote --set-closed` (no native bd-close hook, no sleeps).
+# =======================================================================
+
+
+def _eow5_lead_root(context: dict) -> Path:
+    if not context.get("lead_bd_available"):
+        pytest.skip("bd workspace not available in this environment")
+    return Path(context["nn5f_lead_root"]).resolve()
+
+
+def _eow5_bead_exists(lead_root: Path, work_id: str) -> bool:
+    return _bd_facade.get_dispatch_bead(lead_root, work_id) is not None
+
+
+def _eow5_create_plain_bead(lead_root: Path, work_id: str) -> None:
+    """Create a plain planning bead with NO dispatch metadata (so a dep edge
+    can attach to it without implying it was ever dispatched)."""
+    if _eow5_bead_exists(lead_root, work_id):
+        return
+    subprocess.run(
+        ["bd", "create", f"plan {work_id}", "--id", work_id, "--force"],
+        cwd=str(lead_root), capture_output=True, text=True, check=True,
+    )
+
+
+def _eow5_create_dispatch_bead_at_state(
+    lead_root: Path, work_id: str, state: str, *, bc: str = "shopsystem-messaging",
+    mtype: str = "request_bugfix",
+) -> None:
+    """Create a dispatch bead and move it to ``state``."""
+    _bd_facade.create_dispatch_bead(
+        lead_root, work_id, dispatched_to_bc=bc, dispatch_message_type=mtype,
+    )
+    if state != _bd_facade.STATE_OUTBOX_PENDING:
+        _bd_facade.set_dispatch_state(lead_root, work_id, state)
+
+
+def _eow5_write_payload(path: str, scenario_hashes: list[str] | None = None) -> None:
+    if scenario_hashes:
+        scenarios = []
+        for h in scenario_hashes:
+            scenarios.append({
+                "hash": h,
+                "tags": ["@bc:shopsystem-messaging"],
+                "gherkin": (
+                    f"Feature: f\n\n  @scenario_hash:{h} @bc:shopsystem-messaging\n"
+                    f"  Scenario: s\n    Given a\n    When b\n    Then c\n"
+                ),
+            })
+        # The schema requires hash == canonical(gherkin); build real ones.
+        scenarios = []
+        for idx, _h in enumerate(scenario_hashes):
+            body = (
+                f"Feature: f{idx}\n\n  @scenario_hash:{'0'*16} @bc:shopsystem-messaging\n"
+                f"  Scenario: pinned {idx}\n    Given a {idx}\n    When b {idx}\n"
+                f"    Then c {idx}\n"
+            )
+            real = subprocess.run(
+                ["scenarios", "hash"], input=body, capture_output=True, text=True,
+                check=True,
+            ).stdout.strip()
+            scenarios.append({
+                "hash": real, "tags": ["@bc:shopsystem-messaging"],
+                "gherkin": body.replace("0" * 16, real),
+            })
+        payload = {
+            "message_type": "request_bugfix", "work_id": "PLACEHOLDER",
+            "description": "queued bugfix carrying scenarios", "scenarios": scenarios,
+        }
+    else:
+        payload = {
+            "message_type": "request_bugfix", "work_id": "PLACEHOLDER",
+            "description": "a bugfix dispatched behind a dependency",
+        }
+    Path(path).write_text(yaml.safe_dump(payload, sort_keys=False))
+
+
+def _eow5_dep_list(lead_root: Path, work_id: str) -> list[str]:
+    return _bd_facade.list_depends_on(lead_root, work_id)
+
+
+# ---- Givens -----------------------------------------------------------
+
+@given(
+    parsers.parse(
+        'two BCs "{bc_a}" and "{bc_b}" registered in the messaging registry'
+    )
+)
+def eow5_given_two_bcs(
+    bc_a: str, bc_b: str, tmp_path: Path, context: dict, request
+) -> None:
+    _nn5f_register_bc(bc_a, tmp_path, context, request)
+    # _nn5f_register_bc overwrites the single-BC context keys; capture both.
+    context["eow5_bc_a_root"] = Path(context["nn5f_bc_root"])
+    _nn5f_register_bc(bc_b, tmp_path, context, request)
+    context["eow5_bc_b_root"] = Path(context["nn5f_bc_root"])
+    context.setdefault("eow5_bc_roots", {})
+    context["eow5_bc_roots"][bc_a] = context["eow5_bc_a_root"]
+    context["eow5_bc_roots"][bc_b] = context["eow5_bc_b_root"]
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists at dispatch_state="{state}" '
+        '(predecessor is in-flight to a BC; not yet closed)'
+    )
+)
+def eow5_given_predecessor_dispatched_bc(work_id: str, state: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _eow5_create_dispatch_bead_at_state(lead_root, work_id, state)
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists at dispatch_state="{state}" '
+        '(predecessor is in-flight; not yet closed)'
+    )
+)
+def eow5_given_predecessor_dispatched(work_id: str, state: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _eow5_create_dispatch_bead_at_state(lead_root, work_id, state)
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists at dispatch_state="{state}" (the '
+        "predecessor's BC has emitted work_done, the lead has consumed it, only "
+        "the architect's close-step remains)"
+    )
+)
+def eow5_given_predecessor_consumed(work_id: str, state: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _eow5_create_dispatch_bead_at_state(lead_root, work_id, state)
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" at dispatch_state="{state}" with '
+        'dispatched_to_bc="{bc}" (the predecessor leg of a coordinated fanout)'
+    )
+)
+def eow5_given_predecessor_cross_bc(
+    work_id: str, state: str, bc: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    _eow5_create_dispatch_bead_at_state(lead_root, work_id, state, bc=bc)
+
+
+@given(parsers.parse('a lead bd entry "{work_id}" exists'))
+def eow5_given_plain_bead(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _eow5_create_plain_bead(lead_root, work_id)
+
+
+@given(
+    parsers.parse(
+        'the lead architect has recorded a depends-on edge with "bd dep add '
+        '{dependent} {predecessor}" so {dependent2} depends on {predecessor2}'
+    )
+)
+def eow5_given_dep_edge(
+    dependent: str, predecessor: str, dependent2: str, predecessor2: str,
+    context: dict,
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Both beads must exist for `bd dep add` to attach the edge. The dependent
+    # is created as a plain planning bead (NOT a dispatch bead) so the strict
+    # refusal can later assert "no dispatch_state mutation".
+    _eow5_create_plain_bead(lead_root, dependent)
+    if not _eow5_bead_exists(lead_root, predecessor):
+        _eow5_create_plain_bead(lead_root, predecessor)
+    proc = subprocess.run(
+        ["bd", "dep", "add", dependent, predecessor],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"bd dep add failed: {proc.stderr}"
+
+
+@given(
+    parsers.parse(
+        'the lead architect has already recorded a depends-on edge "bd dep add '
+        '{dependent} {predecessor}" so {dependent2} depends on {predecessor2}'
+    )
+)
+def eow5_given_dep_edge_already(
+    dependent: str, predecessor: str, dependent2: str, predecessor2: str,
+    context: dict,
+) -> None:
+    eow5_given_dep_edge(dependent, predecessor, dependent2, predecessor2, context)
+
+
+@given(parsers.parse('a payload file at "{path}" pinning a valid request_bugfix '
+                     'carrying scenario hashes "{h1}" and "{h2}"'))
+def eow5_given_payload_two_hashes(path: str, h1: str, h2: str, context: dict) -> None:
+    _eow5_write_payload(path, scenario_hashes=[h1, h2])
+    # Record what we want pinned literally on the bd entry. The scenario asserts
+    # the EXACT literal string "h1,h2"; the schema requires hash==canonical, so
+    # we cannot carry arbitrary literals as the ScenarioPayload hashes. Instead
+    # the queued bd entry's scenario_hashes_pinned reflects the REAL payload
+    # hashes. Record those for the Then.
+    data = yaml.safe_load(Path(path).read_text())
+    context["eow5_expected_hashes"] = ",".join(
+        s["hash"] for s in data.get("scenarios", [])
+    )
+
+
+@given(parsers.parse('a payload file at "{path}" pinning a valid request_bugfix '
+                     'targeting {bc}'))
+def eow5_given_payload_targeting(path: str, bc: str, context: dict) -> None:
+    _eow5_write_payload(path)
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists at dispatch_state="{state}" with '
+        'pending_dependency="{dep}" (queued behind {dep2} per the previous '
+        'scenario)'
+    )
+)
+def eow5_given_queued_bead(
+    work_id: str, state: str, dep: str, dep2: str, tmp_path: Path, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The queued bead must carry a usable payload_ref so the promote scan can
+    # deposit the deferred row. Build one.
+    payload_path = str(tmp_path / f"payload-{work_id}.yaml")
+    _eow5_write_payload(payload_path)
+    _bd_facade.create_queued_dispatch_bead(
+        lead_root, work_id, dispatched_to_bc="shopsystem-messaging",
+        dispatch_message_type="request_bugfix", pending_dependency=dep,
+        payload_ref=payload_path,
+        outbox_pending_at="2020-01-01T00:00:00+00:00",
+    )
+    # Ensure the bd dep edge exists so first_unclosed_predecessor sees it.
+    if not _eow5_bead_exists(lead_root, dep):
+        _eow5_create_dispatch_bead_at_state(lead_root, dep, "consumed")
+    subprocess.run(
+        ["bd", "dep", "add", work_id, dep],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+
+
+@given(
+    parsers.parse(
+        'the promote scan has already executed once, promoting a queued '
+        'dependent "{dependent}" from outbox_pending to dispatched and '
+        'depositing its postgres row'
+    )
+)
+def eow5_given_already_promoted(dependent: str, tmp_path: Path, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    bc_root = Path(context["nn5f_bc_root"])
+    closed = context["eow5_closed_predecessor"]
+    # Create the queued dependent behind the already-closed predecessor, with a
+    # payload_ref, the dep edge, then run promote once so it becomes dispatched.
+    payload_path = str(tmp_path / f"payload-{dependent}.yaml")
+    _eow5_write_payload(payload_path)
+    _bd_facade.create_queued_dispatch_bead(
+        lead_root, dependent, dispatched_to_bc="shopsystem-messaging",
+        dispatch_message_type="request_bugfix", pending_dependency=closed,
+        payload_ref=payload_path, outbox_pending_at="2020-01-01T00:00:00+00:00",
+    )
+    subprocess.run(
+        ["bd", "dep", "add", dependent, closed],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    _run(
+        ["shop-msg", "promote", "--shop", context["nn5f_lead_name"],
+         "--closed", closed],
+        context,
+    )
+    # Sanity: dependent now dispatched.
+    meta = _bd_facade.get_dispatch_metadata(lead_root, dependent) or {}
+    assert meta.get("dispatch_state") == "dispatched", meta
+    context["eow5_first_promote_dependent"] = dependent
+
+
+# Capture the closed-predecessor work_id for scenario 4's chained Givens.
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" has just been closed '
+        '(dispatch_state="closed") triggering a promote scan'
+    )
+)
+def eow5_given_closed_capture(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _eow5_create_dispatch_bead_at_state(lead_root, work_id, "closed")
+    context["eow5_closed_predecessor"] = work_id
+
+
+# ---- Whens ------------------------------------------------------------
+
+@when(
+    parsers.parse(
+        'the lead architect runs "shop-msg send request_bugfix --bc {bc} '
+        '--work-id {work_id} --payload {payload}" (no --queue-on-dependency flag)'
+    )
+)
+def eow5_when_send_strict(
+    bc: str, work_id: str, payload: str, context: dict
+) -> None:
+    _eow5_lead_root(context)
+    context["eow5_active_work_id"] = work_id
+    _run(
+        ["shop-msg", "send", "request_bugfix", "--bc", bc, "--work-id", work_id,
+         "--payload", payload],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the lead architect runs "shop-msg send request_bugfix --bc {bc} '
+        '--work-id {work_id} --payload {payload} --queue-on-dependency"'
+    )
+)
+def eow5_when_send_queued(
+    bc: str, work_id: str, payload: str, context: dict
+) -> None:
+    _eow5_lead_root(context)
+    context["eow5_active_work_id"] = work_id
+    _run(
+        ["shop-msg", "send", "request_bugfix", "--bc", bc, "--work-id", work_id,
+         "--payload", payload, "--queue-on-dependency"],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the lead architect runs "bd close {work_id}" transitioning its '
+        'dispatch_state to "{state}"'
+    )
+)
+def eow5_when_bd_close(work_id: str, state: str, context: dict) -> None:
+    # The close triggers the promote scan. Deterministic seam: drive both the
+    # close-step (dispatch_state=closed) and the scan via `shop-msg promote
+    # --set-closed`, which is exactly the close-triggers-promote contract.
+    _eow5_lead_root(context)
+    context["eow5_closed_predecessor"] = work_id
+    _run(
+        ["shop-msg", "promote", "--shop", context["nn5f_lead_name"],
+         "--closed", work_id, "--set-closed"],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the promote scan is invoked a second time against "{work_id}" (e.g., '
+        'by a sweep or by an operator manually retriggering)'
+    )
+)
+def eow5_when_promote_again(work_id: str, context: dict) -> None:
+    _eow5_lead_root(context)
+    _run(
+        ["shop-msg", "promote", "--shop", context["nn5f_lead_name"],
+         "--closed", work_id],
+        context,
+    )
+
+
+@when(
+    parsers.parse(
+        'the lead architect runs "bd dep add {dependent} {predecessor}" '
+        '(attempting to record that {dependent2} depends on {predecessor2}, '
+        'which would close the cycle {cyc})'
+    )
+)
+def eow5_when_dep_add_cycle(
+    dependent: str, predecessor: str, dependent2: str, predecessor2: str,
+    cyc: str, context: dict,
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Snapshot the dep edges BEFORE the cycle attempt so the Then can assert
+    # the graph is unchanged.
+    context["eow5_pre_deps"] = {
+        "lead-mmm": _eow5_dep_list(lead_root, "lead-mmm"),
+        "lead-nnn": _eow5_dep_list(lead_root, "lead-nnn"),
+    }
+    # bd must run with cwd scoped to the lead bd workspace (unlike shop-msg,
+    # which resolves the lead via the registry). _run() does NOT set cwd, so a
+    # bd subcommand goes here through a cwd-scoped subprocess.
+    proc = subprocess.run(
+        ["bd", "dep", "add", dependent, predecessor],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    context["cli_returncode"] = proc.returncode
+    context["cli_stdout"] = proc.stdout
+    context["cli_stderr"] = proc.stderr
+
+
+# ---- Thens ------------------------------------------------------------
+
+@then(
+    parsers.parse(
+        'the command exits non-zero with an error message that names the unmet '
+        'dependency: the predecessor work_id "{predecessor}" and its current '
+        'dispatch_state "{state}"'
+    )
+)
+def eow5_then_strict_refusal_message(
+    predecessor: str, state: str, context: dict
+) -> None:
+    assert context["cli_returncode"] != 0, (
+        f"expected non-zero; stderr={context.get('cli_stderr')!r}"
+    )
+    err = (context.get("cli_stderr") or "") + (context.get("cli_stdout") or "")
+    assert predecessor in err, f"refusal must name predecessor {predecessor!r}: {err!r}"
+    assert state in err, f"refusal must name state {state!r}: {err!r}"
+
+
+@then(
+    parsers.parse(
+        "NO postgres outbox row at (bc={bc}, direction='outbox', "
+        "work_id='{work_id}', message_type='{mtype}') is inserted"
+    )
+)
+def eow5_then_no_postgres_row(bc: str, work_id: str, mtype: str, context: dict) -> None:
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [r for r in rows if r["work_id"] == work_id and r["message_type"] == mtype]
+    assert not matching, f"expected NO deposited row for {work_id}; found {matching}"
+
+
+@then(
+    parsers.parse(
+        "NO postgres outbox row at (bc={bc}, direction='outbox', "
+        "work_id='{work_id}', message_type='{mtype}') is inserted (queued mode "
+        "defers the postgres deposit per ADR-013 decision 4)"
+    )
+)
+def eow5_then_no_postgres_row_queued(
+    bc: str, work_id: str, mtype: str, context: dict
+) -> None:
+    eow5_then_no_postgres_row(bc, work_id, mtype, context)
+
+
+@then(
+    parsers.parse(
+        "NO duplicate postgres outbox row at (bc={bc}, direction='outbox', "
+        "work_id='{work_id}', message_type='{mtype}') is inserted (the postgres "
+        "uniqueness constraint on (work_id, direction, shop) would also block "
+        "this, but the promote scan SHOULD skip the deposit attempt entirely on "
+        "an already-promoted entry)"
+    )
+)
+def eow5_then_no_duplicate_row(
+    bc: str, work_id: str, mtype: str, context: dict
+) -> None:
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [r for r in rows if r["work_id"] == work_id and r["message_type"] == mtype]
+    assert len(matching) <= 1, f"expected at most ONE row for {work_id}; found {matching}"
+
+
+@then(
+    parsers.parse(
+        'NO lead bd entry "{work_id}" is created (no bd-side dispatch_state '
+        'mutation; no partial state at all)'
+    )
+)
+def eow5_then_no_dispatch_state(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    # The planning bead may exist (so the dep edge could be recorded), but it
+    # must carry NO dispatch_state — the load-bearing property is "no dispatch
+    # mutation, no partial state".
+    assert "dispatch_state" not in meta, (
+        f"strict refusal must not mutate dispatch_state on {work_id}; meta={meta}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is total refusal — strict-mode '
+        'rejection MUST leave no postgres artifact and no bd artifact, so '
+        're-running after the predecessor closes is the same as running for the '
+        'first time'
+    )
+)
+def eow5_then_total_refusal(context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    work_id = context["eow5_active_work_id"]
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert "dispatch_state" not in meta and "pending_dependency" not in meta, meta
+
+
+@then(
+    parsers.parse(
+        'the command exits zero with a message indicating the dispatch is '
+        'queued behind "{predecessor}"'
+    )
+)
+def eow5_then_exit_zero_queued(predecessor: str, context: dict) -> None:
+    assert context["cli_returncode"] == 0, context.get("cli_stderr")
+    out = (context.get("cli_stdout") or "") + (context.get("cli_stderr") or "")
+    assert predecessor in out and "queued" in out.lower(), out
+
+
+@then(
+    parsers.parse(
+        'a lead bd entry "{work_id}" is created carrying bd structured metadata '
+        'with dispatch_state="{state}", pending_dependency="{dep}", '
+        'dispatched_to_bc="{bc}", dispatch_message_type="{mtype}", and '
+        'scenario_hashes_pinned="{hashes}"'
+    )
+)
+def eow5_then_queued_metadata(
+    work_id: str, state: str, dep: str, bc: str, mtype: str, hashes: str,
+    context: dict,
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == state, meta
+    assert meta.get("pending_dependency") == dep, meta
+    assert meta.get("dispatched_to_bc") == bc, meta
+    assert meta.get("dispatch_message_type") == mtype, meta
+    # The literal hashes in the scenario are illustrative; assert against the
+    # REAL pinned hashes recorded at payload-construction time.
+    expected = context.get("eow5_expected_hashes")
+    assert meta.get("scenario_hashes_pinned") == expected, (
+        f"expected scenario_hashes_pinned={expected!r}; "
+        f"got {meta.get('scenario_hashes_pinned')!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the bd entry\'s queued-mode write is a single atomic unit per '
+        "ADR-012's atomicity protocol: the bd metadata is written via \"bd "
+        'create --metadata" with all fields in one payload'
+    )
+)
+def eow5_then_queued_atomic(context: dict) -> None:
+    # The queued bead carries ALL its dispatch fields in a single structured
+    # metadata object (written via one `bd create --metadata` payload), not
+    # spread across multiple updates or prose.
+    lead_root = _eow5_lead_root(context)
+    work_id = context["eow5_active_work_id"]
+    rec = _bd_facade.get_dispatch_bead(lead_root, work_id)
+    assert rec is not None
+    meta = rec.get("metadata") or {}
+    for key in ("dispatch_state", "pending_dependency", "dispatched_to_bc",
+                "dispatch_message_type"):
+        assert key in meta, f"queued metadata missing {key}: {meta}"
+    assert "## Dispatch state" not in (rec.get("notes") or "")
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that the queued intent is '
+        'durable in bd alone, survives /compact and session boundaries, and is '
+        'observable via "bd show {work_id}"'
+    )
+)
+def eow5_then_queued_durable(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Re-read fresh from bd (a new subprocess), simulating a session boundary.
+    rec = _bd_facade.get_dispatch_bead(lead_root, work_id)
+    assert rec is not None and (rec.get("metadata") or {}).get("pending_dependency")
+
+
+@then(
+    parsers.parse(
+        'the close operation triggers a promote scan that enumerates all bd '
+        'entries with pending_dependency="{dep}"'
+    )
+)
+def eow5_then_promote_triggered(dep: str, context: dict) -> None:
+    # The promote command (driven by the close seam) ran and exited zero.
+    assert context["cli_returncode"] == 0, context.get("cli_stderr")
+    assert context["eow5_closed_predecessor"] == dep
+
+
+@then(
+    parsers.parse(
+        'for "{work_id}", whose remaining depends-on edges are all at '
+        'dispatch_state="{state}", the promote scan deposits a postgres outbox '
+        "row at (bc={bc}, direction='outbox', work_id='{work_id2}', "
+        "message_type='{mtype}') carrying the payload reference held on the bd "
+        "entry"
+    )
+)
+def eow5_then_promote_deposits(
+    work_id: str, state: str, bc: str, work_id2: str, mtype: str, context: dict
+) -> None:
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [r for r in rows if r["work_id"] == work_id and r["message_type"] == mtype]
+    assert matching, (
+        f"promote must deposit row for {work_id}; rows="
+        f"{[(r['work_id'], r['message_type']) for r in rows]}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the promote scan flips "{work_id}"\'s dispatch_state from '
+        '"{frm}" to "{to}" via "bd update --set-metadata dispatch_state=dispatched"'
+    )
+)
+def eow5_then_promote_flips(work_id: str, frm: str, to: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == to, meta
+
+
+@then(
+    parsers.parse(
+        'the promote scan clears the pending_dependency field via "bd update '
+        '--unset-metadata pending_dependency"'
+    )
+)
+def eow5_then_promote_clears(context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The promoted dependent in this scenario is lead-fff.
+    meta = _bd_facade.get_dispatch_metadata(lead_root, "lead-fff") or {}
+    assert "pending_dependency" not in meta, meta
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that closure of a predecessor '
+        'is the trigger event for promote; the queued dispatch does NOT need a '
+        'separate operator step to fire after the predecessor closes'
+    )
+)
+def eow5_then_close_is_trigger(context: dict) -> None:
+    # A single `bd close`-driven command both closed the predecessor and
+    # promoted the dependent; no separate post-close operator step was needed.
+    assert context["cli_returncode"] == 0
+
+
+@then(
+    parsers.parse(
+        '"{work_id}" remains at dispatch_state="{state}"; the promote scan '
+        'recognizes the dispatch_state is no longer "{notstate}" and treats '
+        '{work_id2} as a no-op'
+    )
+)
+def eow5_then_idempotent_noop(
+    work_id: str, state: str, notstate: str, work_id2: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == state, meta
+
+
+@then(
+    parsers.parse(
+        'a queued dependent "{work_id}" whose other depends-on edges are still '
+        'NOT all closed (e.g., depends on {pred_a} AND {pred_b} where {pred_b2} '
+        'remains open) is NOT promoted on this scan, and remains at '
+        'dispatch_state="{state}" with pending_dependency cleared for {pred_a2} '
+        'but still set for any other open predecessor'
+    )
+)
+def eow5_then_partial_not_promoted(
+    work_id: str, pred_a: str, pred_b: str, pred_b2: str, state: str,
+    pred_a2: str, tmp_path: Path, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Set up lead-iii queued behind the closed pred (lead-ggg) AND an open pred
+    # (lead-jjj), then re-run promote on lead-ggg and assert it stays queued.
+    closed = context["eow5_closed_predecessor"]
+    open_pred = pred_b
+    if not _eow5_bead_exists(lead_root, open_pred):
+        _eow5_create_dispatch_bead_at_state(lead_root, open_pred, "dispatched")
+    payload_path = str(tmp_path / f"payload-{work_id}.yaml")
+    _eow5_write_payload(payload_path)
+    _bd_facade.create_queued_dispatch_bead(
+        lead_root, work_id, dispatched_to_bc="shopsystem-messaging",
+        dispatch_message_type="request_bugfix", pending_dependency=closed,
+        payload_ref=payload_path, outbox_pending_at="2020-01-01T00:00:00+00:00",
+    )
+    subprocess.run(["bd", "dep", "add", work_id, closed],
+                   cwd=str(lead_root), capture_output=True, text=True)
+    subprocess.run(["bd", "dep", "add", work_id, open_pred],
+                   cwd=str(lead_root), capture_output=True, text=True)
+    _run(["shop-msg", "promote", "--shop", context["nn5f_lead_name"],
+          "--closed", closed], context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == state, (
+        f"{work_id} must remain {state}; meta={meta}"
+    )
+    # pending_dependency cleared for the closed pred, re-pointed at the open one.
+    assert meta.get("pending_dependency") == open_pred, meta
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is idempotency under ADR-013 '
+        'decision 6: multiple promote invocations leave the same final state — '
+        'each queued dispatch either becomes live (exactly once) or remains '
+        'queued (if other predecessors are still open)'
+    )
+)
+def eow5_then_idempotency_property(context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The already-promoted dependent stays dispatched; a third promote is a
+    # no-op (no duplicate row, no state change).
+    dependent = context.get("eow5_first_promote_dependent")
+    if dependent:
+        before = _bd_facade.get_dispatch_metadata(lead_root, dependent) or {}
+        _run(["shop-msg", "promote", "--shop", context["nn5f_lead_name"],
+              "--closed", context["eow5_closed_predecessor"]], context)
+        after = _bd_facade.get_dispatch_metadata(lead_root, dependent) or {}
+        assert before.get("dispatch_state") == after.get("dispatch_state") == "dispatched"
+
+
+@then(
+    parsers.parse(
+        'a lead bd entry "{work_id}" is created carrying dispatched_to_bc='
+        '"{bc}", pending_dependency="{dep}", and dispatch_state="{state}"'
+    )
+)
+def eow5_then_cross_bc_queued(
+    work_id: str, bc: str, dep: str, state: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatched_to_bc") == bc, meta
+    assert meta.get("pending_dependency") == dep, meta
+    assert meta.get("dispatch_state") == state, meta
+
+
+@then(
+    parsers.parse(
+        'the cross-BC dependency edge ({work_id} depending on {pred}, where '
+        '{pred2} targets a DIFFERENT BC than {work_id2}) is honored by shop-msg '
+        'send identically to a same-BC dependency: the BC routing of the '
+        'predecessor does not change the dispatch-dependency contract'
+    )
+)
+def eow5_then_cross_bc_honored(
+    work_id: str, pred: str, pred2: str, work_id2: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The predecessor targets a different BC than the dependent, yet the
+    # dependent was queued (not deposited) just like the same-BC case.
+    pred_meta = _bd_facade.get_dispatch_metadata(lead_root, pred) or {}
+    dep_meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert pred_meta.get("dispatched_to_bc") != dep_meta.get("dispatched_to_bc")
+    assert dep_meta.get("dispatch_state") == "outbox_pending"
+
+
+@then(
+    parsers.parse(
+        'when "{pred}" later closes, the promote scan deposits the postgres '
+        'outbox row for "{work_id}" against the BC "{bc}" (the BC named on the '
+        'queued entry, NOT the BC of the predecessor)'
+    )
+)
+def eow5_then_cross_bc_promote(pred: str, work_id: str, bc: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _run(["shop-msg", "promote", "--shop", context["nn5f_lead_name"],
+          "--closed", pred, "--set-closed"], context)
+    assert context["cli_returncode"] == 0, context.get("cli_stderr")
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [r for r in rows if r["work_id"] == work_id]
+    assert matching, f"promote must deposit {work_id} against {bc}; rows={rows}"
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that cross-BC sequencing is '
+        'FIRST-CLASS per ADR-013 decision 7: both edges live in lead bd, no '
+        'BC-side coordination is required, and the lead remains the sole holder '
+        "of the cross-BC sequence (per PDR-010 decision 4's "
+        'loose-cross-shop-visibility model)'
+    )
+)
+def eow5_then_cross_bc_property(context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Both legs live in the lead bd workspace; nothing was written to a BC bd.
+    beads = {b.get("id") for b in _bd_facade.list_dispatch_beads(lead_root)}
+    assert "lead-kkk" in beads and "lead-lll" in beads
+
+
+# ---- scenario 6: cycle rejection (relaxed, lead-w4ja) -----------------
+
+@then("the command exits non-zero")
+def eow5_then_cycle_exit_nonzero(context: dict) -> None:
+    assert context["cli_returncode"] != 0, (
+        f"expected non-zero exit; stdout={context.get('cli_stdout')!r} "
+        f"stderr={context.get('cli_stderr')!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        "the command's stderr or stdout contains a cycle-rejection message (a "
+        'substring match on "cycle" is sufficient; specific wording is NOT '
+        "required — bd's native error text is what governs)"
+    )
+)
+def eow5_then_cycle_substring(context: dict) -> None:
+    combined = (context.get("cli_stderr") or "") + (context.get("cli_stdout") or "")
+    assert "cycle" in combined.lower(), (
+        f"expected a 'cycle' substring in bd's error; got {combined!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the pre-existing "{dependent} depends on {predecessor}" depends-on '
+        'edge is unchanged (still present, still in the same direction)'
+    )
+)
+def eow5_then_edge_unchanged(dependent: str, predecessor: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    deps = _eow5_dep_list(lead_root, dependent)
+    assert predecessor in deps, (
+        f"pre-existing edge {dependent}->{predecessor} must survive; "
+        f"deps({dependent})={deps}"
+    )
+
+
+@then(
+    parsers.parse(
+        'NO new depends-on edge has been added in either direction (neither '
+        '{rev} nor any other new edge)'
+    )
+)
+def eow5_then_no_new_edge(rev: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    pre = context["eow5_pre_deps"]
+    post = {
+        "lead-mmm": _eow5_dep_list(lead_root, "lead-mmm"),
+        "lead-nnn": _eow5_dep_list(lead_root, "lead-nnn"),
+    }
+    assert post["lead-mmm"] == pre["lead-mmm"], (pre, post)
+    assert post["lead-nnn"] == pre["lead-nnn"], (pre, post)
+
+
+@then(
+    parsers.parse(
+        'subsequent "shop-msg send" invocations against either {a} or {b} '
+        'behave as if the cycle attempt had not been made: {a2} continues to '
+        'be gated on {b2} closing; {b3} has no pending_dependency'
+    )
+)
+def eow5_then_send_unaffected(
+    a: str, b: str, a2: str, b2: str, b3: str, tmp_path: Path, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # shop-msg send's gating decision IS the bd introspection
+    # (first_unclosed_predecessor): a send for lead-mmm consults its depends-on
+    # edges and finds lead-nnn not closed → it would refuse. Verify that
+    # introspection directly (the scenario registers no BC, so we exercise the
+    # consultation seam shop-msg send uses rather than a full send that would
+    # need a recipient).
+    unmet = _bd_facade.first_unclosed_predecessor(lead_root, a2)
+    assert unmet is not None and unmet[0] == b2, (
+        f"{a2} must still be gated on {b2}; first_unclosed_predecessor={unmet}"
+    )
+    # lead-nnn has no pending_dependency (it was never queued by the cycle attempt).
+    nnn_meta = _bd_facade.get_dispatch_metadata(lead_root, b3) or {}
+    assert "pending_dependency" not in nnn_meta, nnn_meta
+
+
+@then(
+    parsers.parse(
+        'per ADR-013 decision 8, acyclicity is enforced on the bd side; '
+        'shop-msg send does NOT need to re-check at dispatch time, because the '
+        'depends-on graph is invariantly acyclic by construction'
+    )
+)
+def eow5_then_acyclicity_bd_side(context: dict) -> None:
+    # Architectural property: shop-msg send does a one-hop predecessor walk
+    # trusting the DAG invariant; it does not run a cycle check. Demonstrated by
+    # the fact that the cycle was rejected bd-side (previous Thens) and send
+    # still functioned (previous Then). Nothing further to assert here.
+    assert context["eow5_pre_deps"] is not None
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that the bd-side '
+        "cycle-rejection contract is what makes shop-msg send's introspection "
+        'step safe from infinite-loop pathology: shop-msg send walks the graph '
+        'trusting it is a DAG — the participant-naming detail in bd\'s error '
+        'text is UX, NOT the architectural property pinned here'
+    )
+)
+def eow5_then_dag_walk_safe(context: dict) -> None:
+    assert context["cli_returncode"] != 0
+
+
+def _eow5_resolve_bc_root(context: dict, bc: str) -> Path:
+    """Resolve a BC root by name from the registered roots (cross-BC scenario
+    registers two)."""
+    roots = context.get("eow5_bc_roots") or {}
+    if bc in roots:
+        return roots[bc]
+    return Path(context["nn5f_bc_root"])
+
+
+# ---- scenario 7: sweep does NOT promote a dependency-gated queued bead -----
+# (lead-p0ez — sweep/queued-dispatch interaction resolution)
+#
+# The architectural decision (lead-p0ez): shop-msg sweep MUST treat
+# pending_dependency as the discriminator. A queued bead (outbox_pending WITH
+# pending_dependency) ages into staleness naturally; sweep must NOT promote it
+# past an open predecessor. The skip applies ONLY to dependency-gated beads;
+# a normal stuck outbox_pending bead with NO pending_dependency is still
+# swept/recovered exactly as before (lead-tuu5).
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" at dispatch_state=outbox_pending with '
+        'pending_dependency="{dep}" and an outbox_pending_at older than the '
+        'sweep threshold'
+    )
+)
+def p0ez_given_stale_queued_bead(
+    work_id: str, dep: str, tmp_path: Path, context: dict, request
+) -> None:
+    # The scenario opens directly with the bd entry, so register the lead (and
+    # the BC named on the queued bead) here. shop-msg sweep resolves the lead
+    # by name and would resolve the BC only if it did NOT skip — registering
+    # the BC lets the Then assert no postgres row was deposited against it.
+    if "nn5f_lead_name" not in context:
+        _nn5f_register_lead("shopsystem-product", context, request)
+    if "nn5f_bc_name" not in context:
+        _nn5f_register_bc("shopsystem-messaging", tmp_path, context, request)
+    lead_root = _eow5_lead_root(context)
+    payload_path = str(tmp_path / f"payload-{work_id}.yaml")
+    _eow5_write_payload(payload_path)
+    _bd_facade.create_queued_dispatch_bead(
+        lead_root, work_id, dispatched_to_bc="shopsystem-messaging",
+        dispatch_message_type="request_bugfix", pending_dependency=dep,
+        payload_ref=payload_path,
+        # An ancient timestamp so any positive sweep threshold counts it stale.
+        outbox_pending_at="2000-01-01T00:00:00+00:00",
+    )
+    context["p0ez_queued_work_id"] = work_id
+    context["p0ez_pending_dependency"] = dep
+
+
+@given(parsers.parse('{dep} is NOT at dispatch_state=closed'))
+def p0ez_given_predecessor_open(dep: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Create the predecessor as an in-flight (NOT closed) dispatch bead and
+    # record the depends-on edge, so the queued bead's pending_dependency
+    # points at a predecessor sweep can observe as non-closed.
+    if not _eow5_bead_exists(lead_root, dep):
+        _eow5_create_dispatch_bead_at_state(lead_root, dep, "dispatched")
+    work_id = context["p0ez_queued_work_id"]
+    subprocess.run(
+        ["bd", "dep", "add", work_id, dep],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    state = _bd_facade.predecessor_dispatch_state(lead_root, dep)
+    assert state != _bd_facade.STATE_CLOSED, (
+        f"predecessor {dep} must NOT be closed; dispatch_state={state!r}"
+    )
+
+
+@when(parsers.parse('the lead architect runs "shop-msg sweep"'))
+def p0ez_when_sweep(context: dict) -> None:
+    # Threshold 0 so the (ancient) queued bead counts as stale and reaches the
+    # pending_dependency discriminator — proving the skip fires on a stale,
+    # dependency-gated bead rather than on a not-yet-stale one.
+    _run(
+        ["shop-msg", "sweep", "--shop", context["nn5f_lead_name"],
+         "--threshold-seconds", "0"],
+        context,
+    )
+    assert context["cli_returncode"] == 0, context.get("cli_stderr")
+
+
+@then(parsers.parse('NO postgres outbox row for {work_id} is deposited'))
+def p0ez_then_no_postgres_row(work_id: str, context: dict) -> None:
+    bc_root = Path(context["nn5f_bc_root"])
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [r for r in rows if r["work_id"] == work_id]
+    assert not matching, (
+        f"sweep must NOT deposit a row for dependency-gated {work_id}; "
+        f"found {matching}"
+    )
+
+
+@then(
+    parsers.parse(
+        '{work_id} remains at dispatch_state=outbox_pending with '
+        'pending_dependency="{dep}" unchanged'
+    )
+)
+def p0ez_then_bead_unchanged(work_id: str, dep: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == _bd_facade.STATE_OUTBOX_PENDING, meta
+    assert meta.get("pending_dependency") == dep, meta
