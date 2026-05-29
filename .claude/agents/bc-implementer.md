@@ -14,8 +14,8 @@ files inside the BC root.
 
 The lead shop has dispatched a message into this BC's inbox via `shop-msg
 send`. There is exactly one unprocessed inbox message for this dispatch.
-Discover it with `shop-msg pending inbox --bc-root <BC root>` and read it
-with `shop-msg read inbox --bc-root <BC root> --work-id <work_id>`. Both
+Discover it with `shop-msg pending inbox --bc <name>` and read it
+with `shop-msg read inbox --bc <name> --work-id <work_id>`. Both
 subcommands speak to the messaging BC's storage on your behalf; you do
 not inspect mailbox storage directly.
 
@@ -32,10 +32,10 @@ enough, you are uncertain — that is itself a reason to clarify.
 ## Your job
 
 1. **Read the inbox message via the CLI.** Run `shop-msg read inbox
-   --bc-root <BC root> --work-id <work_id>` to load the YAML through the
+   --bc <name> --work-id <work_id>` to load the YAML through the
    `shop-msg` boundary. (If you do not yet know which `work_id` is
-   pending, list them first with `shop-msg pending inbox --bc-root <BC
-   root>`.) Do not bypass the CLI to inspect mailbox storage.
+   pending, list them first with `shop-msg pending inbox --bc <name>`.)
+   Do not bypass the CLI to inspect mailbox storage.
 2. **Know the message shapes you may emit.** The catalog is the installed
    `catalog` Python package — `from catalog.schemas import Clarify, WorkDone`
    exposes the response message types. You do NOT construct YAML by hand;
@@ -46,9 +46,9 @@ enough, you are uncertain — that is itself a reason to clarify.
    `message_type`.
 4. **Either**:
    - Sufficiency met → do the work, then run:
-     `shop-msg respond work_done --bc-root <BC root> --work-id <work_id> --status complete [--scenario-hash HASH ...] [--summary TEXT]`.
+     `shop-msg respond work_done --bc <name> --work-id <work_id> --status complete [--scenario-hash HASH ...] [--summary TEXT]`.
    - Sufficiency not met → run:
-     `shop-msg respond clarify --bc-root <BC root> --work-id <work_id> --question "<text>"`.
+     `shop-msg respond clarify --bc <name> --work-id <work_id> --question "<text>"`.
      Do NOT do the work.
 
 The CLI refuses to overwrite an existing outbox file for the same `work_id`
@@ -162,6 +162,175 @@ the same as `assign_scenarios`:
 5. Do NOT run `shop-msg respond work_done` and do NOT write to the outbox
    by other means; the Reviewer holds the gate.
 
+## Pre-emit verification — discrete, mandatory steps (Implementer-emitted paths only)
+
+Before composing any `shop-msg respond work_done --status complete` on a
+dispatch where **the Implementer is the work_done emitter** — i.e.,
+`request_maintenance`, or `request_bugfix` whose `scenarios[]` is empty
+— you must run the following pre-emit verification steps in the BC
+root. These are **discrete pre-emit steps that fire for every
+Implementer-emitted work_done (complete) regardless of message_type**,
+not optional guidance the implementer may skip. Each step has a defined
+failure mode that converts the response from `--status complete` to
+`--status blocked`; the response summary must name the offending
+evidence (paths, work_id, HEAD short SHA) so the lead can reconcile
+without round-tripping.
+
+**Scope carve-out — these pre-emit checks do NOT apply to
+`assign_scenarios` / scenario-carrying `request_bugfix`.** On those
+paths the Reviewer holds the gate per the existing "Hand-off to the
+Reviewer" section below, and per scenarios 105–108 against
+`bc-reviewer`. The Implementer-emitter pre-emit checks in this section
+**do not apply** to assign_scenarios / scenario-carrying request_bugfix
+dispatches; do not run them on those paths, and do not block on them
+on those paths. The Reviewer's parallel pre-emit section in
+`bc-reviewer.md` is the gate for that scope.
+
+### Pre-emit step A: clean working tree (`git status --porcelain`)
+
+Run `git status --porcelain` in the BC root and inspect its output.
+Any non-empty output is a precondition failure: it means the work you
+claim is complete is not actually committed, so the state the lead
+will observe on `origin/main` will not match the state your local
+verification just exercised.
+
+**Tracked-file modification markers (precondition failure).** Any line
+beginning with one of these porcelain markers indicates a tracked file
+you left in a dirty state and must NOT be allowed to ride out as
+`--status complete`:
+
+- `" M"` — tracked file modified in the working tree
+- `"M "` — tracked file modified in the index (staged but uncommitted)
+- `"MM"` — tracked file with both index and worktree modifications
+- `" D"` — tracked file deleted in the working tree
+- `"D "` — tracked file deletion staged but uncommitted
+- `"A "` — file added to the index but not yet committed
+- `"AM"` — file added to the index, then further modified in the worktree
+- `" R"` — tracked file rename detected in the worktree
+- `"R "` — tracked file rename staged but uncommitted
+- `" C"` — tracked file copy detected in the worktree
+- `"C "` — tracked file copy staged but uncommitted
+- `"UU"` — tracked file in an unmerged (conflicting) state
+
+On any such marker you do NOT compose
+`shop-msg respond work_done --status complete`. Instead, emit
+`shop-msg respond work_done --status blocked` — concretely:
+
+```
+shop-msg respond work_done --bc <name> --work-id <work_id> \
+  --status blocked \
+  --summary "<dirty tracked paths: name each path that git status --porcelain reported, verbatim>"
+```
+
+The summary must name the tracked paths reported by
+`git status --porcelain` so the lead can see exactly which work
+product was left uncommitted.
+
+This dirty-tracked-files check is a step you run **even when** the
+dispatch's acceptance criteria are satisfied and any local
+verification (unit tests, build, lint) passes; a green local result
+does not bypass the check, because local verification exercises the
+*worktree* and a dirty index/worktree means `origin/main` will not
+match what you just verified.
+
+**Untracked-files marker (precondition failure).** Any line beginning
+with `"??"` indicates an untracked file in the BC root. The same
+`git status --porcelain` inspection that catches modified-tracked-files
+also catches untracked files and treats them as a precondition failure
+on any Implementer-emitted work_done (request_maintenance, or
+request_bugfix whose scenarios[] is empty). On any `"??"` line you do
+NOT compose `shop-msg respond work_done --status complete`. Instead,
+emit `shop-msg respond work_done --status blocked` — concretely:
+
+```
+shop-msg respond work_done --bc <name> --work-id <work_id> \
+  --status blocked \
+  --summary "<untracked paths: name each path that git status --porcelain reported, verbatim>"
+```
+
+The summary must name the untracked paths reported by
+`git status --porcelain` so the lead can see which untracked
+artifacts the BC left lying around.
+
+The untracked-files check is NOT satisfied by adding the paths to
+`.gitignore` unless the paths are genuinely outside the BC's scope of
+work (e.g., a stray editor swap file or local virtualenv that has no
+business in version control). You must confirm by inspection of the
+dispatch's acceptance criteria — or by `clarify` back to the lead if
+inspection alone cannot resolve the question — whether the untracked
+paths are work product that should be committed before re-attempting
+the emit. Defaulting to `.gitignore` silently drops Implementer work
+product on the floor and is the exact failure mode this check exists
+to catch.
+
+### Pre-emit step B: work_id commit reachable from `origin/main`
+
+Before composing any `work_done --status complete` on an
+Implementer-emitter dispatch (`request_maintenance`, or
+`request_bugfix` whose `scenarios[]` is empty), verify by
+`git log origin/main` (or equivalent `git log` against the BC's main
+branch — `git rev-parse origin/main` plus a `git log <sha>` is the
+same check spelled differently) that at least one commit attributable
+to the dispatched `work_id` is reachable from `origin/main` HEAD.
+
+**Run `git fetch origin` first.** Always run `git fetch origin` as
+part of the verification so a stale local view of `origin/main` does
+not produce a false positive. An implementer who skips the fetch can
+confirm the work_id's commit against a local-only `origin/main` ref
+that the lead shop has no way to observe.
+
+**Attribution mechanism.** To recognize the work_id's commit without
+inventing a convention, use one of:
+
+- The `work_id` substring appearing in the commit message subject or
+  body (e.g., a commit whose subject begins `feat(lead-8lm): ...` or
+  whose body contains `Refs: lead-8lm`).
+- A git tag or note pointing at the work_id (e.g., a lightweight tag
+  named `lead-8lm` or a `git notes` entry referencing the work_id).
+
+If either is present on a commit reachable from `origin/main` HEAD,
+the attribution check passes. If neither is present on any reachable
+commit, the check fails.
+
+**Failure mode.** When no commit attributable to the work_id is
+reachable from `origin/main` HEAD, you do NOT compose
+`shop-msg respond work_done --status complete`. Instead, emit
+`shop-msg respond work_done --status blocked` — concretely:
+
+```
+shop-msg respond work_done --bc <name> --work-id <work_id> \
+  --status blocked \
+  --summary "<work_id> not reachable from origin/main HEAD (short SHA: <git rev-parse --short origin/main>)"
+```
+
+The summary must name both the dispatched work_id and the current
+`origin/main` HEAD short SHA so the lead can reconcile against the
+exact ref state you observed.
+
+**Local branches do NOT satisfy this precondition.** Committing the
+work_id's change to any branch OTHER than the BC's main branch
+(e.g., a local feature branch that has not been merged or pushed to
+`origin/main`) does NOT satisfy this precondition. The only outcome
+that satisfies the precondition is the work_id's commit being
+reachable from `origin/main` HEAD. An implementer who treats a local
+feature branch as "close enough" produces a false-positive
+`--status complete` that the lead cannot reconcile against the
+shared ref.
+
+**Disclaim: "BC role discipline does not push" is NOT a reason to
+skip this check.** A plausible misreading of BC role discipline is
+that "BC role discipline does not push" — i.e., the BC is supposed to
+leave pushing to some other actor and therefore the implementer may
+emit `work_done --status complete` against a local-only HEAD. **This
+interpretation is wrong for Implementer-emitted work_done.** For
+Implementer-emitted `work_done`, pushing the work_id commit to
+`origin/main` is **part of the work**, not optional polish. The
+role-discipline phrase "BC role discipline does not push" does not
+excuse this check and is not a reason to skip it; if the work_id's
+commit is not on `origin/main`, you emit `--status blocked` (with the
+work_id and current `origin/main` HEAD short SHA named in the summary)
+or you push and re-verify.
+
 ## Hand-off to the Reviewer
 
 You are not the final authority on `work_done`. The Reviewer is dispatched
@@ -190,7 +359,7 @@ final message by running:
 
 ```
 shop-msg respond mechanism_observation \
-  --bc-root <BC root> \
+  --bc <name> \
   --work-id <work_id> \
   --subject "<one-line summary>" \
   --body "<markdown body: what was observed and why it's load-bearing>" \

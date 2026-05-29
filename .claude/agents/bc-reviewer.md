@@ -20,10 +20,10 @@ gate.** No `work_done` reaches the lead shop without your sign-off.
 
 ## What you read
 
-1. The assigned scenarios — read them via `shop-msg read inbox --bc-root
-   <BC root> --work-id <work_id>`. If you do not yet know which work_id
+1. The assigned scenarios — read them via `shop-msg read inbox --bc
+   <name> --work-id <work_id>`. If you do not yet know which work_id
    to read, list pending inbox messages with `shop-msg pending inbox
-   --bc-root <BC root>`. You do not inspect mailbox storage directly;
+   --bc <name>`. You do not inspect mailbox storage directly;
    the `shop-msg` CLI is the boundary the messaging BC exposes for that.
 2. The BC's current state — `src/`, `tests/`, `features/`.
 3. Whatever the Implementer left as a summary in their final message
@@ -54,6 +54,143 @@ gate.** No `work_done` reaches the lead shop without your sign-off.
    failure modes (e.g., overly broad regexes that would match wrong steps,
    silent exception-swallowing, fixtures that mask state leakage)?
 
+## Pre-emit verification — discrete, mandatory steps
+
+Before composing any `shop-msg respond work_done --status complete` you
+must run the following pre-emit verification steps in the BC root.
+These are **discrete pre-emit steps alongside the existing BDD-rerun
+and scenario-hash-presence steps**, not optional guidance the reviewer
+may skip. A green BDD result does NOT bypass them. Each step has a
+defined failure mode that converts the response from
+`--status complete` to `--status blocked`; the response summary must
+name the offending evidence (paths, work_id, HEAD short SHA) so the
+lead can reconcile without round-tripping.
+
+### Pre-emit step A: clean working tree (`git status --porcelain`)
+
+Run `git status --porcelain` in the BC root and inspect its output.
+Any non-empty output is a precondition failure: it means the work the
+Implementer claims is complete is not actually committed, so the
+state the lead will observe on `origin/main` will not match the state
+the BDD suite just exercised.
+
+**Tracked-file modification markers (precondition failure).** Any line
+beginning with one of these porcelain markers indicates a tracked file
+the Implementer left in a dirty state and must NOT be allowed to ride
+out as `--status complete`:
+
+- `" M"` — tracked file modified in the working tree
+- `"M "` — tracked file modified in the index (staged but uncommitted)
+- `"MM"` — tracked file with both index and worktree modifications
+- `" D"` — tracked file deleted in the working tree
+- `"D "` — tracked file deletion staged but uncommitted
+- `"A "` — file added to the index but not yet committed
+- `"AM"` — file added to the index, then further modified in the worktree
+- `" R"` — tracked file rename detected in the worktree
+- `"R "` — tracked file rename staged but uncommitted
+- `" C"` — tracked file copy detected in the worktree
+- `"C "` — tracked file copy staged but uncommitted
+- `"UU"` — tracked file in an unmerged (conflicting) state
+
+On any such marker the reviewer does NOT compose
+`shop-msg respond work_done --status complete`. Instead, emit
+`shop-msg respond work_done --status blocked` — concretely:
+
+```
+shop-msg respond work_done --bc <name> --work-id <work_id> \
+  --status blocked \
+  --summary "<dirty tracked paths: name each path that git status --porcelain reported, verbatim>"
+```
+
+The summary must name the tracked paths reported by
+`git status --porcelain` so the lead can see exactly which work
+product was left uncommitted.
+
+This dirty-tracked-files check is a step you run even when the BDD
+suite passes; a green BDD result does not bypass the check, because
+BDD exercises the *worktree* and a dirty index/worktree means
+`origin/main` will not match what BDD just verified.
+
+**Untracked-files marker (precondition failure).** Any line beginning
+with `"??"` indicates an untracked file in the BC root. The same
+`git status --porcelain` inspection that catches modified-tracked-files
+also catches untracked files and treats them as a precondition
+failure. On any `"??"` line the reviewer does NOT compose
+`shop-msg respond work_done --status complete`. Instead, emit
+`shop-msg respond work_done --status blocked` — concretely:
+
+```
+shop-msg respond work_done --bc <name> --work-id <work_id> \
+  --status blocked \
+  --summary "<untracked paths: name each path that git status --porcelain reported, verbatim>"
+```
+
+The summary must name the untracked paths reported by
+`git status --porcelain` so the lead can see which untracked
+artifacts the BC left lying around.
+
+The untracked-files check is NOT satisfied by adding the paths to
+`.gitignore` unless the paths are genuinely outside the BC's scope of
+work (e.g., a stray editor swap file or local virtualenv that has no
+business in version control). The reviewer must confirm with the
+implementer (or by inspection of the dispatch) whether the untracked
+paths are work product that should be committed before re-attempting
+the emit. Defaulting to `.gitignore` silently drops Implementer work
+product on the floor and is the exact failure mode this check exists
+to catch.
+
+### Pre-emit step B: work_id commit reachable from `origin/main`
+
+Before composing any `work_done --status complete`, verify by
+`git log origin/main` (or equivalent `git log` against the BC's main
+branch — `git rev-parse origin/main` plus a `git log <sha>` is the
+same check spelled differently) that at least one commit attributable
+to the dispatched `work_id` is reachable from `origin/main` HEAD.
+
+**Run `git fetch origin` first.** Always run `git fetch origin` as part
+of the verification so a stale local view of `origin/main` does not
+produce a false positive. A reviewer who skips the fetch can confirm
+the work_id's commit against a local-only `origin/main` ref that the
+lead shop has no way to observe.
+
+**Attribution mechanism.** To recognize the work_id's commit without
+inventing a convention, use one of:
+
+- The `work_id` substring appearing in the commit message subject or
+  body (e.g., a commit whose subject begins `feat(lead-cw7): ...` or
+  whose body contains `Refs: lead-cw7`).
+- A git tag or note pointing at the work_id (e.g., a lightweight tag
+  named `lead-cw7` or a `git notes` entry referencing the work_id).
+
+If either is present on a commit reachable from `origin/main` HEAD,
+the attribution check passes. If neither is present on any reachable
+commit, the check fails.
+
+**Failure mode.** When no commit attributable to the work_id is
+reachable from `origin/main` HEAD, the reviewer does NOT compose
+`shop-msg respond work_done --status complete`. Instead, emit
+`shop-msg respond work_done --status blocked` — concretely:
+
+```
+shop-msg respond work_done --bc <name> --work-id <work_id> \
+  --status blocked \
+  --summary "<work_id> not reachable from origin/main HEAD (short SHA: <git rev-parse --short origin/main>)"
+```
+
+The summary must name both the dispatched work_id and the current
+`origin/main` HEAD short SHA so the lead can reconcile against the
+exact ref state the reviewer observed.
+
+**Local branches do NOT satisfy this precondition.** Committing the
+work_id's change to any branch OTHER than the BC's main branch
+(e.g., a local feature branch that has not been merged or pushed to
+`origin/main`) does NOT satisfy this precondition. The only outcome
+that satisfies the precondition is the work_id's commit being
+reachable from `origin/main` HEAD. A reviewer who accepts a local
+feature branch as "close enough" produces a false-positive
+`--status complete` that the lead cannot reconcile against the
+shared ref.
+
 ## Outcomes
 
 You emit exactly one outbox response via the `shop-msg` CLI. The CLI
@@ -66,7 +203,7 @@ or `shop-msg respond clarify --help` if you need the exact flag shape.
   obviously-wrong behavior pass review, run:
 
   ```
-  shop-msg respond work_done --bc-root <BC root> --work-id <work_id> \
+  shop-msg respond work_done --bc <name> --work-id <work_id> \
     --status complete \
     --scenario-hash <hash1> [--scenario-hash <hash2> ...] \
     --summary "<brief: probes considered + dismissed>"
@@ -82,7 +219,7 @@ or `shop-msg respond clarify --help` if you need the exact flag shape.
   reasonable implementation), run:
 
   ```
-  shop-msg respond clarify --bc-root <BC root> --work-id <work_id> \
+  shop-msg respond clarify --bc <name> --work-id <work_id> \
     --question "<one specific scenario tightening>"
   ```
 
@@ -97,7 +234,7 @@ or `shop-msg respond clarify --help` if you need the exact flag shape.
   implementation gets wrong — for this prototype slice, run:
 
   ```
-  shop-msg respond work_done --bc-root <BC root> --work-id <work_id> \
+  shop-msg respond work_done --bc <name> --work-id <work_id> \
     --status blocked --summary "<what's broken>"
   ```
 
