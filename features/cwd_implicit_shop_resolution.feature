@@ -48,16 +48,6 @@ Feature: Implicit CWD-based shop resolution for shop-msg
   And stderr contains a diagnostic naming that the shop marker at the resolved ".claude/shop/" directory is incomplete (missing "type.md")
   And the command does NOT silently treat the partial marker as either shop type
 
-  @scenario_hash:305c6fc26c7f1bfe @bc:shopsystem-messaging
-  Scenario: bare "shop-msg prime" exits non-zero when the CWD-derived shop name is not registered in the messaging registry
-  Given a BC shop directory tree containing ".claude/shop/name.md" with literal content "unregistered-bc" and ".claude/shop/type.md" with literal content "bc"
-  And no shop named "unregistered-bc" is registered in the messaging registry
-  And my current working directory is the BC shop directory or a descendant
-  When I run "shop-msg prime" with no addressing flags
-  Then the command exits non-zero
-  And stderr contains a diagnostic naming that shop "unregistered-bc" is not registered in the registry
-  And the diagnostic is the same shape as the diagnostic produced by an explicit "shop-msg prime --bc unregistered-bc" invocation
-
   @scenario_hash:2e0dd03be908e0fe @bc:shopsystem-messaging
   Scenario: an explicit "--bc <name>" or "--lead <name>" flag takes precedence over the CWD-implicit lookup
   Given a BC shop directory tree containing ".claude/shop/name.md" with literal content "shopsystem-docs" and ".claude/shop/type.md" with literal content "bc"

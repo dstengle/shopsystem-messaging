@@ -4873,37 +4873,202 @@ def then_partial_marker_not_silently_treated(context: dict) -> None:
     )
 
 
-@then(
+# NOTE (lead-t8v8): the step defs that served scenario 34
+# (@scenario_hash dc9981afe5f997cc — "bare prime exits non-zero when the
+# CWD-derived shop name is not registered") were removed when that scenario
+# was retired. Those phrasings ("stderr contains a diagnostic naming that
+# shop ... is not registered in the registry" and "the diagnostic is the
+# same shape as the diagnostic produced by an explicit ... invocation") were
+# used only by scenario 34; bare prime now warns-and-continues instead of
+# hard-exiting (scenarios 1368c39655a314fc / 63d10cdd53fab6bb).
+
+
+# -----------------------------------------------------------------------
+# lead-t8v8: prime orients unconditionally + slug-form fallback
+# (scenarios 1368c39655a314fc / 63d10cdd53fab6bb)
+# -----------------------------------------------------------------------
+
+
+@given(
     parsers.re(
-        r'stderr contains a diagnostic naming that shop "(?P<name>[^"]+)" '
-        r'is not registered in the registry$'
+        r'a shop directory tree containing "\.claude/shop/name\.md" '
+        r'with literal content "(?P<name>[^"]+)" and "\.claude/shop/type\.md" '
+        r'with literal content "(?P<shop_type>[^"]+)"$'
+    ),
+    target_fixture="cwd_shop_root",
+)
+def given_bare_shop_dir(
+    tmp_path: Path, name: str, shop_type: str, context: dict
+) -> Path:
+    # Type-neutral variant of the "a BC/lead shop directory tree" givens used
+    # by scenario 1368c39655a314fc, whose Given names neither shop type
+    # prefix (the type is carried only by type.md content).
+    root = _make_shop_dir(tmp_path, name, shop_type)
+    context["cwd_shop_name"] = name
+    context["cwd_shop_type"] = shop_type
+    context["cwd_shop_root"] = root
+    return root
+
+
+@given("the messaging registry's database is reachable")
+def given_registry_db_reachable() -> None:
+    # The ephemeral test DB is created and reachable for the whole session
+    # (see the DB lifecycle fixtures at module top). Probe defensively so the
+    # scenario fails fast with a clear message if the DB is down.
+    from shop_msg.storage import probe_db_reachable
+
+    probe_db_reachable()
+
+
+@given(
+    "my current working directory is the lead shop directory or a descendant"
+)
+def given_cwd_is_lead_shop_or_descendant(context: dict) -> None:
+    context["cwd_for_subprocess"] = context["cwd_shop_root"]
+
+
+@given(
+    parsers.re(
+        r'no shop with canonical name "(?P<name>[^"]+)" \(with a literal '
+        r'space\) is registered in the messaging registry$'
     )
 )
-def then_stderr_not_registered(name: str, context: dict) -> None:
+def given_no_space_shop_registered(
+    name: str, context: dict, request
+) -> None:
+    # The session-scoped autouse fixture registers BOTH "shopsystem-product"
+    # (hyphen) and "shopsystem product" (space) to the session lead root so
+    # response routing is deterministic. Scenario 63d10cdd53fab6bb requires
+    # the literal-space form to be ABSENT so the slug fallback is exercised.
+    #
+    # Restore the LIVE pre-test mapping at teardown via addfinalizer (the
+    # canonical pattern used by given_lead_registered). The generic
+    # _per_test_registry_restore would instead reset this name to the
+    # session-START baseline, severing the session-lead alias and breaking
+    # later resolve_lead_shop() routing tests — so this name is deliberately
+    # NOT routed through _PER_TEST_MUTATED_NAMES.
+    saved = _registry_lookup(name)
+    registry_remove(name)
+    request.addfinalizer(lambda: _registry_restore(name, saved))
+
+
+@given(
+    parsers.re(
+        r'a shop with canonical name "(?P<name>[^"]+)" \(with a hyphen\) is '
+        r'registered in the messaging registry as a lead$'
+    )
+)
+def given_hyphen_shop_registered_lead(
+    name: str, context: dict, request
+) -> None:
+    # Register the hyphenated canonical name at the scenario's lead shop root
+    # so that BOTH the bare prime (slug-resolved) and the explicit
+    # `prime --lead <name>` comparison resolve this same root and their
+    # orientation stdout agrees. Restore the LIVE pre-test mapping at
+    # teardown via addfinalizer (same rationale as given_no_space_shop_
+    # registered: avoid the session-start-baseline reset that would sever the
+    # session-lead alias).
+    saved = _registry_lookup(name)
+    root = context["cwd_shop_root"]
+    registry_add(name, str(root.resolve()), shop_type="lead")
+    _test_registry[str(root.resolve())] = name
+    request.addfinalizer(lambda: _registry_restore(name, saved))
+
+
+@then("stdout includes the registry's DSN string")
+def then_stdout_includes_dsn(context: dict) -> None:
+    from shop_msg.storage import _get_dsn
+
+    stdout = context.get("cli_stdout", "")
+    dsn = _get_dsn()
+    assert "DSN:" in stdout, f"expected a DSN line in stdout; got:\n{stdout}"
+    assert dsn in stdout, (
+        f"expected the DSN value {dsn!r} in stdout; got:\n{stdout}"
+    )
+
+
+@then(
+    "stdout includes a DB-health line indicating the registry database "
+    "is reachable"
+)
+def then_stdout_db_health(context: dict) -> None:
+    stdout = context.get("cli_stdout", "")
+    assert "DB reachable: yes" in stdout, (
+        f"expected a DB-health line 'DB reachable: yes' in stdout; "
+        f"got:\n{stdout}"
+    )
+
+
+@then(
+    parsers.re(
+        r'stdout includes a CLI-catalog reminder naming at least the '
+        r'subcommands "send", "read", "pending", "watch", "registry"$'
+    )
+)
+def then_stdout_cli_catalog(context: dict) -> None:
+    stdout = context.get("cli_stdout", "")
+    for sub in ("send", "read", "pending", "watch", "registry"):
+        assert f"shop-msg {sub}" in stdout, (
+            f"expected the CLI-catalog reminder to name subcommand "
+            f"{sub!r} (as 'shop-msg {sub}'); got:\n{stdout}"
+        )
+
+
+@then(
+    parsers.re(
+        r'stderr contains a warning naming that the CWD-derived shop name '
+        r'"(?P<name>[^"]+)" did not resolve against the registry$'
+    )
+)
+def then_stderr_warns_unresolved(name: str, context: dict) -> None:
     stderr = context.get("cli_stderr", "")
     assert name in stderr, (
-        f"expected stderr to name shop {name!r}; got:\n{stderr}"
+        f"expected stderr to name the unresolved CWD-derived shop name "
+        f"{name!r}; got:\n{stderr}"
     )
-    assert "not registered" in stderr, (
-        f"expected stderr to say 'not registered'; got:\n{stderr}"
+    assert "warning" in stderr.lower(), (
+        f"expected stderr to carry a warning; got:\n{stderr}"
+    )
+    assert (
+        "did not resolve" in stderr
+        or "not resolve" in stderr
+        or "not registered" in stderr
+    ), (
+        f"expected stderr to say the name did not resolve against the "
+        f"registry; got:\n{stderr}"
+    )
+
+
+@then(
+    "the warning does not abort prime: the orientation output above is "
+    "still emitted in full"
+)
+def then_warning_does_not_abort(context: dict) -> None:
+    rc = context.get("cli_returncode")
+    stdout = context.get("cli_stdout", "")
+    assert rc == 0, (
+        f"expected prime to exit zero despite the unresolved-name warning; "
+        f"got rc={rc}"
+    )
+    # The full orientation set: DSN, DB-health, and the CLI catalog reminder.
+    assert "DSN:" in stdout, f"orientation DSN missing; stdout:\n{stdout}"
+    assert "DB reachable: yes" in stdout, (
+        f"orientation DB-health missing; stdout:\n{stdout}"
+    )
+    assert "Key commands:" in stdout, (
+        f"orientation CLI catalog missing; stdout:\n{stdout}"
     )
 
 
 @then(
     parsers.re(
-        r'the diagnostic is the same shape as the diagnostic produced '
-        r'by an explicit "(?P<explicit_cmd>[^"]+)" invocation$'
+        r'stdout is the same orientation output that an explicit '
+        r'"(?P<explicit_cmd>[^"]+)" invocation from outside the shop '
+        r'directory would produce$'
     )
 )
-def then_diagnostic_same_shape(explicit_cmd: str, context: dict) -> None:
-    """Verify the bare-invocation diagnostic matches the explicit-flag one.
-
-    "Same shape" means the explicit invocation produces a stderr message
-    that the bare invocation's stderr also contains (or vice versa).  The
-    diagnostic text is owned by _resolve_bc / _resolve_lead, which both
-    paths route through, so an exact-equality assertion is appropriate.
-    """
-    bare_stderr = context.get("cli_stderr", "")
+def then_stdout_matches_explicit(explicit_cmd: str, context: dict) -> None:
+    bare_stdout = context.get("cli_stdout", "")
     explicit_argv = explicit_cmd.split()
     result = subprocess.run(
         explicit_argv,
@@ -4911,12 +5076,45 @@ def then_diagnostic_same_shape(explicit_cmd: str, context: dict) -> None:
         capture_output=True,
         text=True,
     )
-    explicit_stderr = result.stderr
-    # Both should be non-empty and contain the same registry-not-found
-    # phrasing. Strict equality after stripping trailing whitespace.
-    assert bare_stderr.strip() == explicit_stderr.strip(), (
-        f"bare and explicit diagnostics differ.\n"
-        f"bare:\n{bare_stderr}\nexplicit:\n{explicit_stderr}"
+    explicit_stdout = result.stdout
+
+    def _norm(s: str) -> list[str]:
+        return [ln.rstrip() for ln in s.splitlines() if ln.strip()]
+
+    assert _norm(bare_stdout) == _norm(explicit_stdout), (
+        f"bare (slug-resolved) and explicit prime stdout differ.\n"
+        f"bare:\n{bare_stdout}\n---\nexplicit:\n{explicit_stdout}"
+    )
+
+
+@then(
+    parsers.re(
+        r'stderr contains a one-line advisory that the literal CWD-derived '
+        r'name "(?P<literal>[^"]+)" was normalized to slug "(?P<slug>[^"]+)" '
+        r'to resolve against the registry$'
+    )
+)
+def then_stderr_normalization_advisory(
+    literal: str, slug: str, context: dict
+) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert literal in stderr, (
+        f"expected stderr to name the literal CWD-derived name {literal!r}; "
+        f"got:\n{stderr}"
+    )
+    assert slug in stderr, (
+        f"expected stderr to name the normalized slug {slug!r}; got:\n{stderr}"
+    )
+    assert "normalized" in stderr, (
+        f"expected stderr to use the word 'normalized'; got:\n{stderr}"
+    )
+    # "one-line advisory": the advisory occupies a single stderr line.
+    advisory_lines = [
+        ln for ln in stderr.splitlines() if literal in ln and slug in ln
+    ]
+    assert len(advisory_lines) == 1, (
+        f"expected exactly one advisory line naming both {literal!r} and "
+        f"{slug!r}; got {len(advisory_lines)}:\n{stderr}"
     )
 
 

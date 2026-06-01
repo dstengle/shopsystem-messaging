@@ -98,6 +98,20 @@ def _connect() -> psycopg.Connection:
     return conn
 
 
+def probe_db_reachable() -> None:
+    """Open and close a connection to verify the registry DB is reachable.
+
+    Used by ``shop-msg prime`` on the orient-without-a-resolved-shop path
+    (lead-t8v8 scenario 48): when the CWD-derived shop name does not resolve
+    against the registry there is no bc_root to query pending inbox rows for,
+    but prime must still report DB reachability. Raises ``RuntimeError`` (via
+    ``_connect``) when the DSN is unreachable, preserving the DB-unreachable
+    hard-exit shape used elsewhere.
+    """
+    conn = _connect()
+    conn.close()
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS messages (
   id           BIGSERIAL PRIMARY KEY,

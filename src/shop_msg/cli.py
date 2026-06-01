@@ -248,16 +248,45 @@ def _apply_cwd_resolution(args: argparse.Namespace) -> None:
     from type.md (PDR-008).
 
     No-op when one of the flags is already set (explicit-flag precedence).
+
+    Slug-form fallback (lead-t8v8 scenario 49): the literal name read from
+    ``.claude/shop/name.md`` may differ from the registered canonical name
+    only by literal spaces where the canonical form uses hyphens (e.g.
+    ``"shopsystem product"`` on disk vs the registered ``"shopsystem-product"``).
+    When the literal form does not match a registered canonical name but its
+    slug form (literal spaces replaced with hyphens) does, the slug form is
+    used to resolve identity and a one-line normalization advisory is written
+    to stderr (composes with lead-yi0k canonical-name source-of-truth:
+    surface the drift, do not silently accept it).
     """
     bc = getattr(args, "bc", None)
     lead = getattr(args, "lead", None)
     if bc is not None or lead is not None:
         return
     name, shop_type = _walk_up_resolve_shop()
+
+    # Record that this invocation's addressing was derived from the CWD
+    # walk-up (vs an explicit --bc/--lead flag). prime uses this to
+    # warn-and-continue rather than hard-exit when a CWD-derived name does
+    # not resolve against the registry (lead-t8v8 scenario 48).
+    args._cwd_derived = True
+    args._cwd_derived_literal_name = name
+
+    resolved_name = name
+    if resolve_shop_name(name) is None:
+        slug = name.replace(" ", "-")
+        if slug != name and resolve_shop_name(slug) is not None:
+            print(
+                f"shop-msg: CWD-derived shop name {name!r} was normalized to "
+                f"slug {slug!r} to resolve against the registry.",
+                file=sys.stderr,
+            )
+            resolved_name = slug
+
     if shop_type == "lead":
-        args.lead = name
+        args.lead = resolved_name
     else:
-        args.bc = name
+        args.bc = resolved_name
 
 
 def _resolve_bc(args: argparse.Namespace) -> str:
@@ -1699,10 +1728,42 @@ def _cmd_prime(args: argparse.Namespace) -> int:
 
     Exit 0 when DB is reachable; non-zero when unreachable.
     """
-    from shop_msg.storage import _get_dsn, query_pending_inbox
+    from shop_msg.storage import _get_dsn, probe_db_reachable, query_pending_inbox
+
+    bc_name = args.bc
+
+    # CWD-derived name that does not resolve against the registry: prime must
+    # still orient (DSN, DB-health, CLI catalog) so the agent is not left
+    # blind. The name-resolution miss becomes a stderr warning, not a hard
+    # exit (lead-t8v8 scenario 48). Explicit --bc <name> retains the hard
+    # exit via _resolve_bc below. The DB-unreachable hard exit is preserved
+    # in both paths.
+    cwd_derived = getattr(args, "_cwd_derived", False)
+    unresolved = cwd_derived and resolve_shop_name(bc_name) is None
+
+    if unresolved:
+        dsn = _get_dsn()
+        print(f"DSN: {dsn}")
+        try:
+            probe_db_reachable()
+        except Exception as exc:
+            print(f"DB reachable: no — {exc}")
+            print()
+            _print_prime_reminder(bc_name)
+            return 1
+        print("DB reachable: yes")
+        print()
+        print(
+            f"shop-msg: warning: CWD-derived shop name {bc_name!r} did not "
+            f"resolve against the registry; orientation is shown but inbox "
+            f"counts are unavailable until the shop is registered "
+            f"(run 'shop-msg registry add').",
+            file=sys.stderr,
+        )
+        _print_prime_reminder(bc_name)
+        return 0
 
     bc_root = _resolve_bc(args)
-    bc_name = args.bc
     dsn = _get_dsn()
 
     print(f"DSN: {dsn}")
@@ -1736,7 +1797,10 @@ def _print_prime_reminder(bc_name: str) -> None:
         "Key commands:\n"
         f"  shop-msg pending inbox --bc {bc_name}\n"
         f"  shop-msg read inbox --bc {bc_name} --work-id <id>\n"
-        "  shop-msg respond clarify | work_done | mechanism_observation ..."
+        "  shop-msg respond clarify | work_done | mechanism_observation ...\n"
+        "  shop-msg send ...        # lead-side dispatch into a BC inbox\n"
+        f"  shop-msg watch --bc {bc_name}    # LISTEN/NOTIFY inbox watcher\n"
+        "  shop-msg registry ...    # add | remove | list shop registrations"
     )
 
 
@@ -1752,10 +1816,47 @@ def _cmd_prime_lead(args: argparse.Namespace) -> int:
 
     Exit 0 when DB is reachable; non-zero when unreachable.
     """
-    from shop_msg.storage import _get_dsn, query_pending_lead_inbox
+    from shop_msg.storage import (
+        _get_dsn,
+        probe_db_reachable,
+        query_pending_lead_inbox,
+    )
+
+    lead_name = args.lead
+
+    # CWD-derived lead name that does not resolve against the registry:
+    # orient (DSN, DB-health, CLI catalog) and warn on stderr rather than
+    # hard-exit (lead-t8v8 scenario 48 — type.md content is "lead", so the
+    # bare-prime invocation dispatches through the lead branch). Explicit
+    # --lead <name> retains the hard exit via _resolve_lead below. The
+    # DB-unreachable hard exit is preserved in both paths.
+    cwd_derived = getattr(args, "_cwd_derived", False)
+    unresolved = cwd_derived and resolve_shop_name(lead_name) is None
+
+    if unresolved:
+        literal = getattr(args, "_cwd_derived_literal_name", lead_name)
+        dsn = _get_dsn()
+        print(f"DSN: {dsn}")
+        try:
+            probe_db_reachable()
+        except Exception as exc:
+            print(f"DB reachable: no — {exc}")
+            print()
+            _print_prime_lead_reminder(lead_name)
+            return 1
+        print("DB reachable: yes")
+        print()
+        print(
+            f"shop-msg: warning: CWD-derived shop name {literal!r} did not "
+            f"resolve against the registry; orientation is shown but inbox "
+            f"counts are unavailable until the shop is registered "
+            f"(run 'shop-msg registry add').",
+            file=sys.stderr,
+        )
+        _print_prime_lead_reminder(lead_name)
+        return 0
 
     lead_root = _resolve_lead(args)
-    lead_name = args.lead
     dsn = _get_dsn()
 
     print(f"DSN: {dsn}")
@@ -1790,7 +1891,10 @@ def _print_prime_lead_reminder(lead_name: str) -> None:
         f"  shop-msg pending inbox --lead {lead_name}\n"
         f"  shop-msg read inbox --lead {lead_name} --work-id <id>\n"
         "  shop-msg respond clarify  # lead answers BC questions\n"
-        "  shop-msg respond work_done | mechanism_observation ..."
+        "  shop-msg respond work_done | mechanism_observation ...\n"
+        "  shop-msg send ...        # dispatch into a BC inbox\n"
+        f"  shop-msg watch --lead {lead_name}    # LISTEN/NOTIFY outbox watcher\n"
+        "  shop-msg registry ...    # add | remove | list shop registrations"
     )
 
 
