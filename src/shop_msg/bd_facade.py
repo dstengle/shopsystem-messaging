@@ -319,6 +319,14 @@ def bd_available(cwd: Path) -> bool:
     """
     if not _bd_on_path():
         return False
+    # ADR-018 / lead-mxxm: on the lead host a BC's registered shop_root is
+    # load-bearing for nothing and need not exist on disk. `_run_bd` scopes
+    # cwd to that path, and subprocess raises (FileNotFoundError /
+    # NotADirectoryError) — not the BdFacadeError callers catch — when cwd is
+    # absent. A non-existent path can carry no `.beads` workspace, so treat it
+    # as "no bd workspace reachable" rather than letting the probe raise.
+    if not cwd.is_dir():
+        return False
     # `bd list` exits non-zero if no workspace is discoverable.
     proc = _run_bd(["list", "--json"], cwd=cwd, check=False)
     return proc.returncode == 0

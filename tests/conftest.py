@@ -10996,3 +10996,339 @@ for _ln in _NUDGE_LOADBEARING_LINES:
     @then(parsers.parse(_ln))
     def _nudge_loadbearing_noop(context: dict) -> None:
         pass
+
+
+# ---------------------------------------------------------------------------
+# lead-mxxm / ADR-018: name-addressed BC ops do not require shop_root to exist
+# on the lead host. The messaging registry's shop_root column is load-bearing
+# for nothing on the lead host (BCs run as bc-launcher containers; the clone
+# lives inside the container), so the former existence guard was removed. The
+# step defs below register a BC whose shop_root path does NOT exist on the
+# filesystem and assert that send/read/pending/registry operations succeed with
+# no "does not exist on disk" / "registry may be stale" warning.
+# ---------------------------------------------------------------------------
+
+_MXXM_WARN_DISK = "does not exist on disk"
+_MXXM_WARN_STALE = "registry may be stale"
+
+
+@given(
+    parsers.parse(
+        'a BC named "{bc_name}" is registered with a shop_root path that '
+        'does not exist on the lead host'
+    )
+)
+def given_bc_registered_with_nonexistent_root(
+    bc_name: str, tmp_path: Path, context: dict, request
+) -> None:
+    """Register bc_name in the messaging registry pointing at a path that is
+    guaranteed NOT to exist on the lead filesystem.
+
+    The path is under the pytest tmp dir (so prior-run cleanup logic treats it
+    as a test path) but is never created, mirroring the lead-host reality where
+    the BC's shop_root column points into /workspaces/.../repos/<bc> that the
+    lead never materializes.
+    """
+    saved = _registry_lookup(bc_name, ignore_test_paths=True)
+    nonexistent_root = tmp_path / "repos" / bc_name
+    assert not nonexistent_root.exists(), (
+        f"precondition violated: {nonexistent_root} unexpectedly exists"
+    )
+    registry_add(bc_name, str(nonexistent_root), shop_type="bc")
+    context["mxxm_bc_name"] = bc_name
+    context["mxxm_bc_root"] = nonexistent_root
+    context.setdefault("mxxm_stderr_log", [])
+    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
+
+
+def _mxxm_record(context: dict, result) -> None:
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    context.setdefault("mxxm_stderr_log", []).append(result.stderr)
+    context.setdefault("mxxm_rc_log", []).append(result.returncode)
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg send assign_scenarios for that BC with work-id "{work_id}"'
+    )
+)
+def when_mxxm_send_assign_scenarios(work_id: str, context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    result = subprocess.run(
+        [
+            "shop-msg", "send", "assign_scenarios",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--feature-title", "lead-mxxm ADR-018 reachability probe",
+            "--bc-tag", bc_name,
+            "--scenario-file", str(_mxxm_scenario_body_file(context)),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+def _mxxm_scenario_body_file(context: dict) -> Path:
+    """Write a minimal well-formed scenario body to a tmp file and return it."""
+    root = context["mxxm_bc_root"].parent.parent  # the pytest tmp_path
+    root.mkdir(parents=True, exist_ok=True)
+    body = (
+        "  @scenario_hash:0000000000000000 @bc:probe\n"
+        "  Scenario: ADR-018 reachability probe\n"
+        "    Given the messaging registry resolves a BC by name\n"
+        "    When a name-addressed op runs against an absent shop_root\n"
+        "    Then it succeeds without a staleness warning\n"
+    )
+    path = root / "mxxm_scenario_body.txt"
+    path.write_text(body)
+    return path
+
+
+@then(
+    parsers.parse(
+        'shop-msg pending inbox for that BC includes work-id "{work_id}"'
+    )
+)
+def then_mxxm_pending_inbox_includes(work_id: str, context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+    assert result.returncode == 0, (
+        f"pending inbox exited {result.returncode}; stderr:\n{result.stderr}"
+    )
+    assert work_id in result.stdout, (
+        f"expected pending inbox to include {work_id!r}; stdout:\n{result.stdout}"
+    )
+
+
+@then(
+    parsers.parse(
+        'stderr contains no "points to path ... which does not exist on disk" warning'
+    )
+)
+def then_mxxm_no_disk_warning(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert _MXXM_WARN_DISK not in stderr, (
+        f"unexpected 'does not exist on disk' warning in stderr:\n{stderr}"
+    )
+
+
+@then(parsers.parse('stderr contains no "registry may be stale" warning'))
+def then_mxxm_no_stale_warning(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert _MXXM_WARN_STALE not in stderr, (
+        f"unexpected 'registry may be stale' warning in stderr:\n{stderr}"
+    )
+
+
+@given(
+    parsers.parse('an inbox message with work-id "{work_id}" is present for that BC')
+)
+def given_mxxm_inbox_present(work_id: str, context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    result = subprocess.run(
+        [
+            "shop-msg", "send", "request_maintenance",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--description", "lead-mxxm ADR-018 inbox seed",
+            "--acceptance-criterion", "the inbox row is readable by name",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"inbox seed failed: rc={result.returncode}; stderr:\n{result.stderr}"
+    )
+
+
+@given(
+    parsers.parse('an outbox response with work-id "{work_id}" is present for that BC')
+)
+def given_mxxm_outbox_present(work_id: str, context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    # Seed an inbox row first so respond has a dispatch to answer, then respond
+    # work_done to populate the BC's outbox namespace.
+    seed = subprocess.run(
+        [
+            "shop-msg", "send", "request_maintenance",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--description", "lead-mxxm ADR-018 outbox seed",
+            "--acceptance-criterion", "the outbox row is readable by name",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert seed.returncode == 0, (
+        f"outbox seed (inbox) failed: rc={seed.returncode}; stderr:\n{seed.stderr}"
+    )
+    resp = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--status", "complete",
+            "--summary", "lead-mxxm ADR-018 outbox seed response",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert resp.returncode == 0, (
+        f"outbox seed (respond) failed: rc={resp.returncode}; stderr:\n{resp.stderr}"
+    )
+
+
+@when(parsers.parse('I run shop-msg read inbox for that BC with work-id "{work_id}"'))
+def when_mxxm_read_inbox(work_id: str, context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    result = subprocess.run(
+        ["shop-msg", "read", "inbox", "--bc", bc_name, "--work-id", work_id],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+@when(parsers.parse('I run shop-msg read outbox for that BC with work-id "{work_id}"'))
+def when_mxxm_read_outbox(work_id: str, context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    result = subprocess.run(
+        ["shop-msg", "read", "outbox", "--bc", bc_name, "--work-id", work_id],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+@when('I run shop-msg pending inbox for that BC')
+def when_mxxm_pending_inbox(context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+@when('I run shop-msg pending outbox for that BC')
+def when_mxxm_pending_outbox(context: dict) -> None:
+    bc_name = context["mxxm_bc_name"]
+    # Resolve the lead by the stable session lead NAME (registered for the whole
+    # session, never removed by per-test finalizers) rather than re-deriving a
+    # possibly-stale cached name from the path, which can race with another
+    # test's registry-restore finalizer.
+    lead_name = get_session_lead_name()
+    result = subprocess.run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name, "--bc-name", bc_name],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+@then('every one of those commands exits zero')
+def then_mxxm_every_command_zero(context: dict) -> None:
+    rc_log = context.get("mxxm_rc_log", [])
+    assert rc_log, "no commands were recorded for the multi-command scenario"
+    for i, rc in enumerate(rc_log):
+        assert rc == 0, (
+            f"command #{i} exited {rc}; "
+            f"stderr:\n{context.get('mxxm_stderr_log', [''])[i]}"
+        )
+
+
+@then(
+    parsers.parse(
+        'none of those commands wrote a "points to path ... which does not '
+        'exist on disk" warning to stderr'
+    )
+)
+def then_mxxm_none_wrote_disk_warning(context: dict) -> None:
+    for i, stderr in enumerate(context.get("mxxm_stderr_log", [])):
+        assert _MXXM_WARN_DISK not in stderr, (
+            f"command #{i} wrote a 'does not exist on disk' warning:\n{stderr}"
+        )
+
+
+@then(
+    parsers.parse(
+        'none of those commands wrote a "registry may be stale" warning to stderr'
+    )
+)
+def then_mxxm_none_wrote_stale_warning(context: dict) -> None:
+    for i, stderr in enumerate(context.get("mxxm_stderr_log", [])):
+        assert _MXXM_WARN_STALE not in stderr, (
+            f"command #{i} wrote a 'registry may be stale' warning:\n{stderr}"
+        )
+
+
+@given(
+    parsers.parse('no shop named "{bc_name}" is registered in the messaging registry')
+)
+def given_mxxm_no_shop_registered(bc_name: str, context: dict, request) -> None:
+    saved = _registry_lookup(bc_name, ignore_test_paths=True)
+    registry_remove(bc_name)
+    context["mxxm_registry_add_name"] = bc_name
+    context.setdefault("mxxm_stderr_log", [])
+    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
+
+
+@given(
+    parsers.parse('the filesystem path "{path}" does not exist on the lead host')
+)
+def given_mxxm_path_absent(path: str, context: dict) -> None:
+    assert not Path(path).exists(), (
+        f"precondition violated: {path} unexpectedly exists on the lead host"
+    )
+    context["mxxm_registry_add_root"] = path
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg registry add with canonical name "{bc_name}" and '
+        'shop_root "{shop_root}"'
+    )
+)
+def when_mxxm_registry_add(bc_name: str, shop_root: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "registry", "add", bc_name, shop_root],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+@when('I run shop-msg registry list')
+def when_mxxm_registry_list(context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "registry", "list"],
+        capture_output=True,
+        text=True,
+    )
+    _mxxm_record(context, result)
+
+
+@then(
+    parsers.parse(
+        'stdout includes an entry for "{bc_name}" with shop_root "{shop_root}"'
+    )
+)
+def then_mxxm_registry_list_includes(bc_name: str, shop_root: str, context: dict) -> None:
+    stdout = context.get("cli_stdout", "")
+    matching = [
+        ln for ln in stdout.splitlines()
+        if ln.startswith(f"{bc_name} ") and shop_root in ln
+    ]
+    assert matching, (
+        f"expected a registry list entry for {bc_name!r} with shop_root "
+        f"{shop_root!r}; stdout:\n{stdout}"
+    )

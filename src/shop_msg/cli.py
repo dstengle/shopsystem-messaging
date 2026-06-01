@@ -1221,27 +1221,29 @@ def _cmd_pending_inbox(args: argparse.Namespace) -> int:
     Queries Postgres using the pending-query SQL that replaces the old
     directory-glob walk.
 
-    Registry staleness guard: before querying, verify that the path
-    resolved from the registry actually exists on disk.  If it does not,
-    the registry entry is stale (e.g. a test fixture overwrote it with a
-    tmp path that has since been deleted) and the query would silently
-    return zero rows even though the real inbox messages live under a
-    different path.  Emitting a clear error surfaces the problem instead
-    of hiding it.
+    No shop_root existence check is performed (ADR-018, lead-mxxm). On the
+    lead host the BC's registered shop_root column is load-bearing for
+    nothing: BCs run as bc-launcher containers and the clone lives inside
+    the container, so the lead never reads or runs that path. A name ->
+    bc_id resolution is all the Postgres-backed pending query needs; the
+    path's existence on the lead filesystem is irrelevant to whether the
+    query returns the right rows. The former staleness guard refused
+    name-addressed operations whenever the path was absent, which is
+    doctrine-incoherent on the lead host. The bc_id used by the query is
+    derived from the registered name, not from probing the filesystem, so
+    dropping the check does not reintroduce the silent-zero-rows failure it
+    was written to prevent.
     """
     bc_root = _resolve_bc(args)
-    resolved = Path(bc_root)
-    if not resolved.exists():
-        print(
-            f"shop-msg: registry entry for {args.bc!r} points to path "
-            f"{bc_root!r} which does not exist on disk.  The registry may "
-            f"be stale.  Re-register the BC with:\n"
-            f"  shop-msg registry add {args.bc} <correct-path>",
-            file=sys.stderr,
-        )
-        return 1
     rows = query_pending_inbox(bc_root)
     bc_root_path = Path(bc_root)
+    # ADR-018 / lead-mxxm: the BC-side bead side effect (ADR-017) runs `bd`
+    # with cwd scoped to the registered shop_root. On the lead host that path
+    # is load-bearing for nothing and need not exist; bd_available() now
+    # returns False for an absent path (rather than letting `bd` raise on a
+    # non-existent cwd), so the pending rows are still enumerated and the bead
+    # side effect is correctly skipped — best-effort by design (a bd-less or
+    # path-less environment simply lists the rows, pre-lead-sn1e behavior).
     bd_ok = bd_facade.bd_available(bc_root_path)
     for work_id, message_type in rows:
         # ADR-017 / lead-sn1e: observing an unprocessed inbox row creates a
