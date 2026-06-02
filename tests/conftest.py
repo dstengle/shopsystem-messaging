@@ -11682,3 +11682,154 @@ def then_pw41_imports_in_process() -> None:
         "shop_msg.cli._compute_scenario_hash does not delegate to "
         "scenarios.hash.compute_scenario_hash in-process"
     )
+
+
+# ---------------------------------------------------------------------------
+# lead-4ibl: release workflow issues a repository_dispatch to bc-launcher
+# (scenario hash a83760dcc40c57e6).
+#
+# These step defs statically verify the GitHub Actions release workflow file
+# rather than invoking GitHub. They parse .github/workflows/release.yml and
+# assert it triggers on a version tag push and issues a repository_dispatch
+# targeting the shopsystem-bc-launcher repository with a dispatch-authorized
+# credential. This matches the repo's existing pattern of pinning static
+# artifacts (e.g. inspecting source/YAML) instead of exercising side effects.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@given("the shopsystem-messaging source repository")
+def given_4ibl_source_repo(context: dict) -> None:
+    context["repo_root"] = _REPO_ROOT
+
+
+@given(parsers.parse('a tag named "{tag}" is pushed to its "{branch}" branch'))
+def given_4ibl_version_tag_pushed(context: dict, tag: str, branch: str) -> None:
+    # The push event is represented statically by the workflow's trigger
+    # configuration; we record the operands the When/Then steps verify
+    # against the workflow file.
+    context["release_tag"] = tag
+    context["release_branch"] = branch
+
+
+@when(
+    "the shopsystem-messaging release workflow associated with that tag "
+    "push runs to successful completion"
+)
+def when_4ibl_release_workflow_runs(context: dict) -> None:
+    workflows_dir = context["repo_root"] / ".github" / "workflows"
+    candidates = sorted(workflows_dir.glob("*.yml")) + sorted(
+        workflows_dir.glob("*.yaml")
+    )
+
+    release_wf = None
+    for path in candidates:
+        try:
+            spec = yaml.safe_load(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        # YAML parses the bare `on:` key as boolean True; accept both.
+        triggers = spec.get("on", spec.get(True))
+        tag_globs = _4ibl_tag_globs(triggers)
+        if tag_globs:
+            release_wf = (path, spec, tag_globs)
+            break
+
+    assert release_wf is not None, (
+        "no GitHub Actions workflow under .github/workflows/ triggers on a "
+        "version-tag push; the release workflow pinned by lead-4ibl "
+        "(scenario a83760dcc40c57e6) is missing"
+    )
+
+    path, spec, tag_globs = release_wf
+    tag = context.get("release_tag", "v0.2.0")
+    assert _4ibl_tag_matches_any(tag, tag_globs), (
+        f"release workflow {path.name} tag triggers {tag_globs!r} do not "
+        f"match the pushed version tag {tag!r}"
+    )
+
+    context["release_workflow_path"] = path
+    context["release_workflow_spec"] = spec
+
+
+def _4ibl_tag_globs(triggers) -> list:
+    """Extract the tag glob list from an Actions `on:` block, if any."""
+    if not isinstance(triggers, dict):
+        return []
+    push = triggers.get("push")
+    if not isinstance(push, dict):
+        return []
+    tags = push.get("tags")
+    if isinstance(tags, str):
+        return [tags]
+    if isinstance(tags, list):
+        return [t for t in tags if isinstance(t, str)]
+    return []
+
+
+def _4ibl_tag_matches_any(tag: str, globs: list) -> bool:
+    import fnmatch
+    import re as _re
+
+    for g in globs:
+        if fnmatch.fnmatch(tag, g):
+            return True
+        # Actions tag filters support character ranges like v[0-9]+.* which
+        # are not plain fnmatch; accept the canonical vMAJOR.MINOR.PATCH form
+        # against the common "v[0-9]+.[0-9]+.[0-9]+" filter shape.
+        if g.startswith("v") and _re.match(r"^v\d+\.\d+\.\d+$", tag):
+            return True
+    return False
+
+
+@then(
+    parsers.parse(
+        'the workflow performs a "{api_call}" API call targeting the '
+        '"{target_repo}" repository'
+    )
+)
+def then_4ibl_dispatch_targets_bc_launcher(
+    context: dict, api_call: str, target_repo: str
+) -> None:
+    assert api_call == "repository_dispatch", api_call
+    path = context["release_workflow_path"]
+    text = path.read_text()
+
+    # The GitHub REST repository_dispatch endpoint is
+    # /repos/{owner}/{repo}/dispatches. Verify the workflow targets the
+    # named bc-launcher repository's dispatches endpoint.
+    assert "/dispatches" in text, (
+        f"release workflow {path.name} contains no /dispatches API call; it "
+        f"does not perform a repository_dispatch"
+    )
+    assert f"{target_repo}/dispatches" in text, (
+        f"release workflow {path.name} does not target the "
+        f"{target_repo}/dispatches endpoint; its repository_dispatch is not "
+        f"aimed at {target_repo}"
+    )
+
+
+@then(
+    "that dispatch call carries a credential authorized to dispatch to the "
+    "bc-launcher repository"
+)
+def then_4ibl_dispatch_carries_credential(context: dict) -> None:
+    path = context["release_workflow_path"]
+    text = path.read_text()
+
+    # A cross-repo repository_dispatch cannot use the default GITHUB_TOKEN
+    # (repo-scoped); it must present an explicitly provisioned secret. Verify
+    # the dispatch step references a secret-backed credential and uses it as
+    # the Authorization bearer for the dispatch call.
+    assert "secrets." in text, (
+        f"release workflow {path.name} references no secrets.* credential; a "
+        f"cross-repo repository_dispatch needs a dispatch-authorized token, "
+        f"not the repo-scoped GITHUB_TOKEN"
+    )
+    assert "Authorization" in text, (
+        f"release workflow {path.name} sends no Authorization header on its "
+        f"dispatch call; the repository_dispatch is unauthenticated"
+    )
