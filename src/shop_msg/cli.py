@@ -26,9 +26,9 @@ Subcommands:
                           --bc-tag NAME --scenario-file PATH ...
         Writes an AssignScenarios message to the Postgres messages table.
         Each --scenario-file becomes one ScenarioPayload. The hash for
-        each scenario is computed by shelling out to the `scenarios hash`
-        CLI (the canonicalization rule lives in the scenarios package,
-        not here).
+        each scenario is computed in-process via
+        scenarios.hash.compute_scenario_hash (the canonicalization rule
+        lives in the scenarios package, not here).
     send request_bugfix --bc-root PATH --work-id ID --description TEXT
                         [--feature-title TEXT --bc-tag NAME
                          --scenario-file PATH ...]
@@ -103,6 +103,7 @@ from catalog.schemas import (
     WorkDone,
     _nudge_payload_rejects_scenario_state,
 )
+from scenarios.hash import compute_scenario_hash as _canonical_scenario_hash
 from shop_msg import bd_facade
 from shop_msg.storage import (
     CollisionError,
@@ -362,20 +363,38 @@ def _resolve_registered_lead() -> str | None:
 
 
 def _compute_scenario_hash(gherkin_body: str) -> str:
-    """Shell out to `scenarios hash` to canonicalize and hash a scenario body.
+    """Canonicalize and hash a scenario body in-process.
 
-    The package boundary is intentional: the canonicalization rule belongs
-    to the scenarios package, and shop-msg composes it as an external tool
-    just like any other consumer would.
+    Delegates to ``scenarios.hash.compute_scenario_hash`` directly rather
+    than shelling out to the ``scenarios`` binary. The canonicalization
+    rule belongs to the scenarios package, which this distribution already
+    Requires; importing it in-process makes the CLI's computed hash and the
+    catalog ``ScenarioPayload`` validator (which delegates to the same
+    function) agree by construction, and removes the PATH dependency that
+    a ``subprocess.run(["scenarios", "hash"])`` shell-out carried (ADR-019,
+    defect lead-pw41(b)).
     """
-    result = subprocess.run(
-        ["scenarios", "hash"],
-        input=gherkin_body,
-        capture_output=True,
-        text=True,
-        check=True,
+    return _canonical_scenario_hash(gherkin_body)
+
+
+def _render_message_yaml(message) -> str:
+    """Render a validated message model to YAML for the `read` commands.
+
+    Uses an effectively-unbounded line width so multi-line string fields —
+    notably a scenario's ``gherkin`` block — are not folded mid-line. Folding
+    used to be harmless when the gherkin began with a short ``Feature:``
+    header, but after lead-pw41 the gherkin block leads with its
+    ``@scenario_hash: @bc:`` tag line (scenario-block-only canonical form),
+    and default 80-column folding would split a ``Scenario:`` line across
+    YAML continuation lines, breaking the readability the `read inbox`
+    contract depends on. This affects display only; stored content, the wire
+    format, and computed hashes are untouched.
+    """
+    return yaml.safe_dump(
+        message.model_dump(exclude_none=True),
+        sort_keys=False,
+        width=float("inf"),
     )
-    return result.stdout.strip()
 
 
 def _cmd_respond_clarify(args: argparse.Namespace) -> int:
@@ -859,48 +878,49 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
 def _build_scenario_payload(
     path_str: str, feature_title: str, bc_tag: str
 ) -> ScenarioPayload:
-    """Read a scenario body file, wrap it with the standard Feature header
-    and tags, and hash the wrapped result. Shared between assign_scenarios
-    and request_bugfix because both messages embed the same
-    ScenarioPayload shape.
+    """Read a scenario body file and build a ScenarioPayload whose hash is
+    the canonical scenario-block-only hash of that block. Shared between
+    assign_scenarios and request_bugfix because both messages embed the
+    same ScenarioPayload shape.
 
-    lead-018 tightened the ScenarioPayload schema so that
-    `hash == canonical_hash(gherkin)`. The `gherkin` field stores the
-    wrapped text (Feature header + tag line + body), so we must hash the
-    wrapped text — hashing the inner body alone would put the CLI on the
-    wrong side of the schema invariant.
+    Canonical hash text is scenario-block-only (ADR-019, scenario 117):
+    the scenario block alone — its tags, the Scenario/Scenario Outline
+    keyword line, steps, and any Examples — with NO `Feature:` header
+    line. The earlier shape wrapped the body in `Feature: {title}\\n...`
+    before hashing; because the canonicalization rule
+    (`scenarios.hash.compute_scenario_hash`) drops blank lines and
+    `@scenario_hash:` lines but does NOT drop the `Feature:` line, that
+    line survived into the canonical hash text and made the dispatched
+    `scenarios[].hash` diverge from the scenario-block-only
+    `@scenario_hash:` tag written on disk for the same block (defect
+    lead-pw41(a)). We therefore hash — and store in `gherkin` — the
+    scenario block alone, with no Feature header.
 
-    Because the canonicalization rule strips `@scenario_hash:` lines
-    before hashing, the chicken-and-egg of "the tag line includes the
-    hash we're about to compute" resolves naturally: we can construct
-    the wrapped text using the eventual hash as a placeholder, hash it,
-    then replace the placeholder — but the simpler form below works
-    because the canonicalization strips `@scenario_hash:<anything>`
-    lines unconditionally. So we build the wrapped text with a sentinel
-    hash, compute the canonical hash of that string (the sentinel line
-    is dropped by canonicalization), and emit the same wrapped string
-    with the now-known hash substituted in. The substitution does not
-    perturb the canonical hash because both forms differ only in the
-    stripped `@scenario_hash:` line.
+    `feature_title` is retained in the signature (callers still supply
+    it via `--feature-title`) but is intentionally NOT part of the hash
+    text or the stored `gherkin`: only the scenario block participates in
+    the canonical hash, per scenario 117.
+
+    The chicken-and-egg of "the tag line includes the hash we're about
+    to compute" resolves because the canonicalization rule strips
+    `@scenario_hash:<anything>` lines unconditionally: we build the block
+    with a sentinel `@scenario_hash:` tag, hash it (the sentinel line is
+    dropped), then emit the same block with the now-known hash
+    substituted in. The substitution does not perturb the canonical hash
+    because both forms differ only in the stripped `@scenario_hash:` line.
+
+    The hash this returns equals `scenarios hash` of the scenario-block-only
+    body byte-for-byte, and equals the `@scenario_hash:` tag the BC writes
+    on disk for that block — restoring scenario 117 wire/disk equality.
     """
     body = Path(path_str).read_text()
     sentinel = "0" * 16
     sentinel_tags = [f"@scenario_hash:{sentinel}", f"@bc:{bc_tag}"]
-    sentinel_tagged = (
-        f"Feature: {feature_title}\n"
-        f"\n"
-        f"  {' '.join(sentinel_tags)}\n"
-        f"  {body}\n"
-    )
-    scen_hash = _compute_scenario_hash(sentinel_tagged)
+    sentinel_block = f"{' '.join(sentinel_tags)}\n{body}\n"
+    scen_hash = _compute_scenario_hash(sentinel_block)
     tags = [f"@scenario_hash:{scen_hash}", f"@bc:{bc_tag}"]
-    tagged = (
-        f"Feature: {feature_title}\n"
-        f"\n"
-        f"  {' '.join(tags)}\n"
-        f"  {body}\n"
-    )
-    return ScenarioPayload(hash=scen_hash, tags=tags, gherkin=tagged)
+    block = f"{' '.join(tags)}\n{body}\n"
+    return ScenarioPayload(hash=scen_hash, tags=tags, gherkin=block)
 
 
 def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
@@ -1208,7 +1228,7 @@ def _cmd_read_outbox(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"valid {message.message_type} from {args.work_id}:")
-    print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
+    print(_render_message_yaml(message))
     return 0
 
 
@@ -1240,7 +1260,7 @@ def _cmd_read_inbox(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"valid {message.message_type} from {args.work_id}.yaml:")
-    print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
+    print(_render_message_yaml(message))
     return 0
 
 
@@ -1358,7 +1378,7 @@ def _cmd_read_lead_inbox(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"valid {message.message_type} from {args.work_id}:")
-    print(yaml.safe_dump(message.model_dump(exclude_none=True), sort_keys=False))
+    print(_render_message_yaml(message))
     return 0
 
 

@@ -11530,3 +11530,155 @@ def then_mxxm_registry_list_includes(bc_name: str, shop_root: str, context: dict
         f"expected a registry list entry for {bc_name!r} with shop_root "
         f"{shop_root!r}; stdout:\n{stdout}"
     )
+
+
+# -----------------------------------------------------------------------
+# lead-pw41: scenario-block-only canonical hash (ADR-019, scenario 117)
+# -----------------------------------------------------------------------
+
+
+def _pw41_dispatched_scenario(bc_root: Path, context: dict) -> dict:
+    """Return the single dispatched ScenarioPayload dict from the inbox."""
+    rc = context.get("cli_returncode")
+    assert rc == 0, (
+        f"shop-msg exited {rc}; stderr:\n{context.get('cli_stderr', '')}"
+    )
+    rows = _fetch_inbox_rows(bc_root)
+    assert rows, "expected at least one inbox row after send; got none"
+    scenarios_field = rows[-1]["payload"].get("scenarios") or []
+    assert len(scenarios_field) == 1, (
+        f"expected exactly one dispatched scenario; got {len(scenarios_field)}"
+    )
+    return scenarios_field[0]
+
+
+@then(
+    parsers.parse(
+        "the dispatched scenario's hash equals the scenarios-hash of the "
+        'scenario-block-only body for bc-tag "{bc_tag}"'
+    )
+)
+def then_pw41_hash_is_block_only(
+    bc_root: Path, bc_tag: str, context: dict
+) -> None:
+    sp = _pw41_dispatched_scenario(bc_root, context)
+    body = context["scenario_body_files"][0]["body"]
+    # Reconstruct the scenario-block-only canonical text: the @bc tag line
+    # (a sentinel @scenario_hash: line is stripped by canonicalization, so
+    # its presence or absence does not change the hash) followed by the
+    # body. Crucially, NO "Feature:" header line participates.
+    block_only = (
+        f"@scenario_hash:{'0' * 16} @bc:{bc_tag}\n{body}\n"
+    )
+    expected = _scenario_hash_via_cli(block_only)
+    assert sp["hash"] == expected, (
+        f"dispatched hash {sp['hash']!r} does not equal the scenario-block-only "
+        f"hash {expected!r} of the body for bc-tag {bc_tag!r}"
+    )
+    # The dispatched hash must also equal the canonical hash of the gherkin
+    # field exactly (wire/disk equality: the @scenario_hash tag the BC
+    # writes on disk is the canonical hash of that very block).
+    gherkin_hash = _scenario_hash_via_cli(sp["gherkin"])
+    assert sp["hash"] == gherkin_hash, (
+        f"dispatched hash {sp['hash']!r} does not equal the canonical hash "
+        f"{gherkin_hash!r} of its own gherkin block"
+    )
+
+
+@then("the dispatched scenario's hash is independent of the feature title")
+def then_pw41_hash_independent_of_title(bc_root: Path, context: dict) -> None:
+    sp = _pw41_dispatched_scenario(bc_root, context)
+    body = context["scenario_body_files"][0]["body"]
+    # Sending the same body under a different feature title must produce the
+    # same hash, because the Feature: header is not part of the canonical
+    # hash text.
+    from pathlib import Path as _P
+
+    alt_path = _P(str(context["scenario_body_files"][0]["path"]))
+    cmd = [
+        "shop-msg", "send", "assign_scenarios",
+        "--bc", _get_or_register_bc_name(bc_root),
+        "--work-id", "lead-blk-title-variant",
+        "--feature-title", "A COMPLETELY DIFFERENT TITLE",
+        "--bc-tag", "shop-msg",
+        "--scenario-file", str(alt_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"variant send failed: {result.stderr}"
+    )
+    rows = _fetch_inbox_rows(bc_root)
+    variant = [r for r in rows if r["work_id"] == "lead-blk-title-variant"]
+    assert variant, "expected the title-variant inbox row"
+    variant_sp = variant[-1]["payload"]["scenarios"][0]
+    assert variant_sp["hash"] == sp["hash"], (
+        f"hash changed with feature title: {sp['hash']!r} vs "
+        f"{variant_sp['hash']!r} — the Feature line must not be part of the "
+        f"canonical hash text"
+    )
+
+
+@then(
+    parsers.parse(
+        "the dispatched scenario's gherkin contains no line starting with "
+        '"{prefix}"'
+    )
+)
+def then_pw41_gherkin_no_feature_line(
+    bc_root: Path, prefix: str, context: dict
+) -> None:
+    sp = _pw41_dispatched_scenario(bc_root, context)
+    offending = [
+        ln for ln in sp["gherkin"].splitlines() if ln.strip().startswith(prefix)
+    ]
+    assert not offending, (
+        f"expected no line starting with {prefix!r} in the dispatched "
+        f"gherkin; found: {offending!r}\nfull gherkin:\n{sp['gherkin']}"
+    )
+
+
+@then(
+    "the shop_msg cli module contains no subprocess call to the scenarios "
+    "hash binary"
+)
+def then_pw41_no_scenarios_subprocess() -> None:
+    import ast
+    import inspect
+
+    from shop_msg import cli as _cli
+
+    tree = ast.parse(inspect.getsource(_cli))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # Match subprocess.run(...) calls (or a bare run(...)).
+        is_run = (
+            isinstance(func, ast.Attribute) and func.attr == "run"
+        ) or (isinstance(func, ast.Name) and func.id == "run")
+        if not is_run or not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+            head = first.elts[0]
+            if isinstance(head, ast.Constant) and head.value == "scenarios":
+                raise AssertionError(
+                    "shop_msg.cli still makes a subprocess call to the "
+                    "`scenarios` binary to compute scenario hashes"
+                )
+
+
+@then(
+    "the shop_msg cli module imports compute_scenario_hash from scenarios.hash"
+)
+def then_pw41_imports_in_process() -> None:
+    from shop_msg import cli as _cli
+
+    # The in-process delegate must be the one used by _compute_scenario_hash.
+    from scenarios.hash import compute_scenario_hash as canonical
+
+    body = "@bc:shop-msg\nScenario: probe\n    Given a\n    When b\n    Then c\n"
+    assert _cli._compute_scenario_hash(body) == canonical(body), (
+        "shop_msg.cli._compute_scenario_hash does not delegate to "
+        "scenarios.hash.compute_scenario_hash in-process"
+    )
