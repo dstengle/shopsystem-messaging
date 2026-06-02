@@ -11812,24 +11812,103 @@ def then_4ibl_dispatch_targets_bc_launcher(
     )
 
 
+_4IBL_SECRET_EXPR = re.compile(r"\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
+
+
+def _4ibl_find_dispatch_step(spec: dict) -> dict:
+    """Return the workflow step whose run-body issues the bc-launcher
+    repository_dispatch (targets shopsystem-bc-launcher/dispatches)."""
+    jobs = spec.get("jobs")
+    if not isinstance(jobs, dict):
+        return None
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            run = step.get("run")
+            uses = step.get("uses")
+            haystack = " ".join(
+                s for s in (run, uses) if isinstance(s, str)
+            )
+            if "shopsystem-bc-launcher/dispatches" in haystack:
+                return step
+    return None
+
+
 @then(
     "that dispatch call carries a credential authorized to dispatch to the "
     "bc-launcher repository"
 )
 def then_4ibl_dispatch_carries_credential(context: dict) -> None:
     path = context["release_workflow_path"]
-    text = path.read_text()
+    spec = context["release_workflow_spec"]
 
-    # A cross-repo repository_dispatch cannot use the default GITHUB_TOKEN
-    # (repo-scoped); it must present an explicitly provisioned secret. Verify
-    # the dispatch step references a secret-backed credential and uses it as
-    # the Authorization bearer for the dispatch call.
-    assert "secrets." in text, (
-        f"release workflow {path.name} references no secrets.* credential; a "
-        f"cross-repo repository_dispatch needs a dispatch-authorized token, "
-        f"not the repo-scoped GITHUB_TOKEN"
+    # Tie the credential ON THE DISPATCH CALL to a secret reference, rather
+    # than checking for the mere co-presence of "secrets." and "Authorization"
+    # anywhere in the file. We (1) locate the step that performs the
+    # bc-launcher repository_dispatch, (2) extract the Authorization Bearer
+    # value bound to that call's curl invocation, (3) resolve that value
+    # through the step's env bindings, and (4) require it to be a
+    # ${{ secrets.* }} expression. A hardcoded Bearer (literal token) must
+    # fail here.
+    step = _4ibl_find_dispatch_step(spec)
+    assert step is not None, (
+        f"release workflow {path.name} has no step whose run-body issues a "
+        f"repository_dispatch to shopsystem-bc-launcher/dispatches; cannot "
+        f"verify the credential on the dispatch call"
     )
-    assert "Authorization" in text, (
-        f"release workflow {path.name} sends no Authorization header on its "
-        f"dispatch call; the repository_dispatch is unauthenticated"
+
+    run_body = step.get("run")
+    assert isinstance(run_body, str), (
+        f"release workflow {path.name} dispatch step has no run: body to carry "
+        f"an Authorization credential"
+    )
+
+    # Find the Authorization header value passed to the dispatch call. Match
+    # the curl header form -H "Authorization: <scheme> <value>".
+    auth_match = re.search(
+        r"""Authorization:\s*(?:Bearer|token)\s+(?P<value>[^"'\\\n]+)""",
+        run_body,
+    )
+    assert auth_match is not None, (
+        f"release workflow {path.name} dispatch step sends no Authorization "
+        f"Bearer/token header on its repository_dispatch call; the dispatch is "
+        f"unauthenticated"
+    )
+    auth_value = auth_match.group("value").strip()
+
+    # The Bearer value is acceptable iff it resolves to a ${{ secrets.* }}
+    # reference: either inline in the header, or via an env-var binding on the
+    # step (e.g. KEY: ${{ secrets.* }} referenced as ${KEY} / $KEY).
+    if _4IBL_SECRET_EXPR.search(auth_value):
+        return  # inline secret expression on the header
+
+    var_match = re.fullmatch(r"\$\{(\w+)\}|\$(\w+)", auth_value)
+    assert var_match is not None, (
+        f"release workflow {path.name} dispatch call uses a hardcoded "
+        f"Authorization credential ({auth_value!r}); a cross-repo "
+        f"repository_dispatch must present a ${{{{ secrets.* }}}}-backed token, "
+        f"not a literal value"
+    )
+    env_var = var_match.group(1) or var_match.group(2)
+
+    env = step.get("env")
+    assert isinstance(env, dict) and env_var in env, (
+        f"release workflow {path.name} dispatch call's Authorization Bearer "
+        f"references env var {env_var!r}, but the step defines no such env "
+        f"binding; cannot confirm the credential resolves to a secret"
+    )
+    env_binding = env[env_var]
+    assert isinstance(env_binding, str) and _4IBL_SECRET_EXPR.search(
+        env_binding
+    ), (
+        f"release workflow {path.name} dispatch call's Authorization credential "
+        f"resolves to env {env_var}={env_binding!r}, which is not a "
+        f"${{{{ secrets.* }}}} reference; the dispatch token is hardcoded, not "
+        f"secret-backed"
     )
