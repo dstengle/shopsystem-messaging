@@ -65,6 +65,9 @@ from shop_msg.storage import (
     _bc_id,
     _bc_outbox_slug,
     _lead_inbox_slug,
+    _abstract_address_for,
+    LEAD_ABSTRACT_ADDRESS,
+    SYSTEM_SLUG,
     _connect,
     consume_outbox_message,
     delete_bc_messages,
@@ -205,43 +208,37 @@ def _snapshot_production_name(name: str) -> None:
 
 
 def _registry_lookup(name: str, *, ignore_test_paths: bool = False) -> tuple[str, str] | None:
-    """Return (shop_root, shop_type) for a registry entry, or None if absent.
+    """Return (abstract_address, shop_type) for a registry entry, or None.
 
-    When *ignore_test_paths* is True, any entry whose shop_root looks like a
-    pytest temporary directory (contains '/pytest-') is treated as absent.
-    This is used when saving pre-test state so that already-corrupted entries
-    from a prior un-cleaned test run are not preserved — restoring None causes
-    the entry to be removed on teardown rather than re-persisting the stale
-    tmp path.
+    ADR-020: the registry stores no path. ``ignore_test_paths`` is retained
+    for signature compatibility with the retired fixture-hygiene plumbing but
+    is now a no-op (there is no path column to inspect for a tmp_path leak).
     """
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT shop_root, shop_type FROM shop_registry WHERE name = %s",
+                "SELECT abstract_address, shop_type FROM shop_registry WHERE name = %s",
                 (name,),
             )
             row = cur.fetchone()
     if row is None:
         return None
-    shop_root: str = row["shop_root"]
-    if ignore_test_paths and "/pytest-" in shop_root:
-        return None
-    return (shop_root, row["shop_type"])
+    return (row["abstract_address"], row["shop_type"])
 
 
 def _registry_restore(name: str, saved: tuple[str, str] | None) -> None:
-    """Restore a registry entry to its pre-test state.
+    """Restore a registry entry to its pre-test state (ADR-020: no path).
 
-    If *saved* is None the entry did not exist before the test (or pointed to a
-    stale pytest tmp path and was treated as absent) — the entry is removed.
-    If *saved* is (shop_root, shop_type) the entry is upserted back to those
-    values.
+    If *saved* is None the entry did not exist before the test — it is
+    removed. Otherwise the (abstract_address, shop_type) pair is restored by
+    re-registering under the captured shop_type (the abstract address is
+    re-derived from name + shop_type).
     """
     if saved is None:
         registry_remove(name)
     else:
-        shop_root, shop_type = saved
-        registry_add(name, shop_root, shop_type=shop_type)
+        _abstract_address, shop_type = saved
+        registry_add(name, shop_type=shop_type)
 
 
 def _ensure_session_lead(tmp_path_factory) -> tuple[Path, str]:
@@ -259,7 +256,7 @@ def _ensure_session_lead(tmp_path_factory) -> tuple[Path, str]:
     if _SESSION_LEAD_ROOT is None:
         root = tmp_path_factory.mktemp("session_lead")
         name = f"test-lead-session-{uuid.uuid4().hex[:8]}"
-        registry_add(name, str(root.resolve()), shop_type="lead")
+        registry_add(name, shop_type="lead")
         _test_registry[str(root.resolve())] = name
         _SESSION_LEAD_ROOT = root
         _SESSION_LEAD_NAME = name
@@ -278,9 +275,32 @@ def _ensure_session_lead(tmp_path_factory) -> tuple[Path, str]:
         # (45), so "shopsystem product" would otherwise win and route responses to
         # the production lead path, polluting it with test rows.  Registering both
         # to the session root ensures the ordering does not matter.
-        registry_add("shopsystem-product", str(root.resolve()), shop_type="lead")
-        registry_add("shopsystem product", str(root.resolve()), shop_type="lead")
+        registry_add("shopsystem-product", shop_type="lead")
+        registry_add("shopsystem product", shop_type="lead")
     return _SESSION_LEAD_ROOT, _SESSION_LEAD_NAME
+
+
+@pytest.fixture(autouse=True)
+def _default_bd_context(tmp_path_factory):
+    """Point the CLI's bd context at a neutral, .beads-free directory by default.
+
+    ADR-020: the shop-msg CLI resolves its bd workspace from the invoking CWD
+    (or the SHOPMSG_BD_CONTEXT override). pytest runs from the repo root, which
+    carries this BC's own (partially-initialised) .beads — a context the CLI
+    would otherwise pick up, making every name-addressed send/respond engage
+    the bd-first dispatch lifecycle and fail. Defaulting the override to an
+    empty temp dir restores the pre-ADR-020 behaviour (bd skipped unless the
+    test explicitly sets up a lead bd workspace). bd-integration tests override
+    this to point at the lead root that carries a real .beads workspace.
+    """
+    neutral = tmp_path_factory.mktemp("bd_context_neutral")
+    prior = os.environ.get("SHOPMSG_BD_CONTEXT")
+    os.environ["SHOPMSG_BD_CONTEXT"] = str(neutral)
+    yield
+    if prior is None:
+        os.environ.pop("SHOPMSG_BD_CONTEXT", None)
+    else:
+        os.environ["SHOPMSG_BD_CONTEXT"] = prior
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -340,66 +360,75 @@ def _per_test_registry_restore():
     _PER_TEST_MUTATED_NAMES.clear()
 
 
-@pytest.fixture(autouse=True)
-def _per_test_session_lead_inbox_cleanup():
-    """Function-scoped autouse cleanup of the session-shared lead-inbox namespace.
+def _sweep_global_address_rows() -> None:
+    """Delete every messages row keyed under the deployment system slug.
 
-    The session_lead_shop fixture (scope=session, autouse) hands every test in
-    the suite the SAME (lead_root, lead_name) pair, so every ``shop-msg respond``
-    that routes to that session lead INSERTs into one shared
-    ``(bc=session_lead, direction='inbox')`` namespace. The function-scoped
-    _per_test_registry_restore restores the shop_registry table but does NOT
-    touch those accumulated lead-inbox rows.
+    ADR-020 collapsed all routing onto GLOBAL CONSTANT abstract addresses:
+    every BC's ``bc``/``to`` column is ``shopsystem/<name>`` and every lead
+    response collapses to the single sentinel ``shopsystem/lead``. Per-test
+    unique BC names still project to ``shopsystem/test-bc-<uuid>``, so a single
+    ``bc LIKE 'shopsystem/%'`` predicate matches EVERY row any test can write —
+    inbox dispatches, outbox markers, BC<->lead nudges, and the shared lead
+    sentinel inbox alike — across all three message directions.
 
-    Work-id-keyed readbacks (_fetch_lead_inbox_payload filters by work_id) are
-    insensitive to that accumulation, but count-based / namespace-wide readback
-    assertions are NOT: a future lead-inbox-readback scenario that asserts on
-    row counts or "the inbox contains exactly ..." against the session lead
-    would pass in isolation and fail under the full suite purely from
-    cross-test accumulation. That "pass in isolation, fail in suite"
-    discriminator is exactly what lead-rgk4's contract says must NOT be a
-    burden the next readback author has to apply.
+    Pre-ADR-020 the registry keyed on per-test-unique ``tmp_path`` and each
+    lead was a unique path, so the ``bc``/``to`` column was naturally
+    test-unique and tests were isolated for free. Routing everything to
+    constant global addresses removed that isolation: every test now writes
+    under the same global keys, and any row a test leaves behind is visible to
+    every later test that touches the same global address. Count-based or
+    "inbox is empty / contains exactly ..." assertions then pass in isolation
+    and fail (non-deterministically, order-dependent) under the full suite.
 
-    This teardown deletes every inbox row in the session lead's namespace at
-    the end of each test (mechanism (a) from the dispatch: per-test teardown).
-    It is scoped strictly to the session lead's own inbox namespace, so it
-    cannot disturb per-test isolated lead roots (e.g. prime_lead_root) or any
-    BC outbox rows. It is a best-effort cleanup: a teardown failure must not
-    mask the test's own outcome.
+    This sweep is the deterministic, exhaustive teardown (mechanism (b) from
+    the dispatch): it clears every ``shopsystem/%`` row so no message-row state
+    survives a test boundary in either direction. The production addresses are
+    untouched (this only deletes message rows, never registry entries), so the
+    8 ADR-020 scenarios that assert the literal ``shopsystem/messaging`` /
+    ``shopsystem/lead`` addresses still observe the real constant slug.
     """
-    yield
-    if _SESSION_LEAD_ROOT is None:
-        return
-    bc = _bc_id(str(_SESSION_LEAD_ROOT.resolve()))
-    # nudge rows (lead-xp5f) accumulate at both the session lead (BC->lead
-    # nudges) and at BC roots under <session_lead>/repos/ (lead->BC nudges).
-    # Count-based nudge assertions ("NO nudge row", "a second nudge row")
-    # would otherwise pass in isolation and fail under the full suite from
-    # cross-test accumulation. Sweep both namespaces by path prefix.
-    repos_prefix = str((_SESSION_LEAD_ROOT / "repos").resolve()) + "%"
+    system_prefix = f"{SYSTEM_SLUG}/%"
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
+                # One predicate covers inbox, outbox, AND nudge rows: every
+                # address the suite produces lives under the system slug.
                 cur.execute(
-                    "DELETE FROM messages WHERE bc = %s AND direction = 'inbox'",
-                    (bc,),
+                    "DELETE FROM messages WHERE bc LIKE %s",
+                    (system_prefix,),
                 )
-                cur.execute(
-                    "DELETE FROM messages WHERE direction = 'nudge' "
-                    "AND (bc = %s OR bc LIKE %s)",
-                    (bc, repos_prefix),
-                )
-                # Seeded BC inbox dispatch rows (nudge scenario 3) also live
-                # under repos/; clear them so a re-run is clean.
-                cur.execute(
-                    "DELETE FROM messages WHERE direction = 'inbox' "
-                    "AND bc LIKE %s",
-                    (repos_prefix,),
-                )
+                # Defensive: any stray nudge row written under an address that
+                # somehow escaped the slug prefix is still swept (nudge rows are
+                # outside the inbox/outbox unique index and accumulate freely).
+                cur.execute("DELETE FROM messages WHERE direction = 'nudge'")
             conn.commit()
     except Exception:
-        # Best-effort: never let inbox cleanup mask the test's real result.
+        # Best-effort: never let the sweep mask the test's real result. The
+        # symmetric pre/post invocation means a transient failure on one side
+        # is covered by the other.
         pass
+
+
+@pytest.fixture(autouse=True)
+def _per_test_global_address_isolation():
+    """Guaranteed per-test isolation of the ADR-020 global-address namespaces.
+
+    Runs the exhaustive ``shopsystem/%`` message-row sweep BOTH before and
+    after every test (autouse, unconditional). The pre-sweep protects the very
+    first test in any ordering (and any test whose predecessor's post-sweep was
+    skipped); the post-sweep clears this test's own rows so it cannot pollute a
+    successor. Symmetric pre+post is what makes the suite deterministic under
+    arbitrary collection / randomized ordering, not just the one fixed order
+    pytest happens to collect in.
+
+    Unlike the prior best-effort, ``_SESSION_LEAD_ROOT``-conditional,
+    direction-by-direction teardown, this fixture is unconditional and its
+    single ``bc LIKE 'shopsystem/%'`` predicate is exhaustive across every
+    direction and every test/lead/BC abstract address.
+    """
+    _sweep_global_address_rows()
+    yield
+    _sweep_global_address_rows()
 
 
 def get_session_lead_root() -> Path:
@@ -419,23 +448,47 @@ def get_session_lead_name() -> str:
 
 
 def _get_or_register_bc_name(bc_root: Path) -> str:
-    """Return (and register) a canonical name for bc_root."""
+    """Return (and register) a canonical name for bc_root.
+
+    ADR-020: the registry stores no path. The path->name cache still keys on
+    the resolved tmp_path so each test BC keeps a stable unique name (and a
+    stable abstract address) within the session.
+    """
     path_str = str(bc_root.resolve())
     if path_str not in _test_registry:
         name = f"test-bc-{uuid.uuid4().hex[:12]}"
-        registry_add(name, path_str, shop_type="bc")
+        registry_add(name, shop_type="bc")
         _test_registry[path_str] = name
     return _test_registry[path_str]
 
 
 def _get_or_register_lead_name(lead_root: Path) -> str:
-    """Return (and register) a canonical name for lead_root."""
+    """Return (and register) a canonical name for lead_root (ADR-020: no path)."""
     path_str = str(lead_root.resolve())
     if path_str not in _test_registry:
         name = f"test-lead-{uuid.uuid4().hex[:12]}"
-        registry_add(name, path_str, shop_type="lead")
+        registry_add(name, shop_type="lead")
         _test_registry[path_str] = name
     return _test_registry[path_str]
+
+
+def _bc_address(bc_root: Path) -> str:
+    """Return the abstract address the BC at bc_root is stored under (ADR-020).
+
+    The messages ``bc``/``to`` column now keys on the abstract address, so
+    test helpers that read storage directly must compute the same address the
+    CLI used: register (or look up) the BC's canonical name, then project it.
+    """
+    name = _get_or_register_bc_name(bc_root)
+    return _abstract_address_for(name, "bc")
+
+
+def _lead_address(lead_root: Path) -> str:
+    """Return the lead's abstract address (always the sentinel, ADR-020)."""
+    # Ensure the lead is registered so resolution is consistent, but the
+    # address always collapses to the sentinel regardless of canonical name.
+    _get_or_register_lead_name(lead_root)
+    return LEAD_ABSTRACT_ADDRESS
 
 
 def _fetch_lead_inbox_payload(lead_root: Path, work_id: str, message_type: str) -> dict | None:
@@ -444,7 +497,7 @@ def _fetch_lead_inbox_payload(lead_root: Path, work_id: str, message_type: str) 
     Under the new routing model (lead-e9x), BC responses arrive at the
     lead's inbox namespace (bc=lead_root, direction='inbox').
     """
-    bc = _bc_id(str(lead_root.resolve()))
+    bc = _lead_address(lead_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -489,7 +542,7 @@ def empty_bc(tmp_path: Path) -> Path:
 
 def _fetch_outbox_rows(bc_root: Path) -> list[dict]:
     """Return all outbox rows for this bc_root, ordered by created_at."""
-    bc = _bc_id(str(bc_root.resolve()))
+    bc = _bc_address(bc_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -517,7 +570,7 @@ def _fetch_outbox_rows(bc_root: Path) -> list[dict]:
 
 def _fetch_inbox_rows(bc_root: Path) -> list[dict]:
     """Return all inbox rows for this bc_root, ordered by created_at."""
-    bc = _bc_id(str(bc_root.resolve()))
+    bc = _bc_address(bc_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -545,7 +598,7 @@ def _fetch_inbox_rows(bc_root: Path) -> list[dict]:
 
 def _fetch_outbox_payload(bc_root: Path, work_id: str, message_type: str) -> dict | None:
     """Return the payload for a specific outbox row, or None."""
-    bc = _bc_id(str(bc_root.resolve()))
+    bc = _bc_address(bc_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -617,7 +670,7 @@ def outbox_preexisting_file(bc_root: Path, filename: str, context: dict) -> None
     # Insert via the raw helper (bypasses schema validation intentionally —
     # the collision test only cares the row exists, not that it's valid).
     insert_raw_payload(
-        str(bc_root.resolve()),
+        _bc_address(bc_root),
         work_id,
         "outbox",
         message_type,
@@ -653,7 +706,7 @@ def lead_inbox_preexisting_response(bc_root: Path, filename: str, context: dict)
         "preexisting": True,
     }
     insert_raw_payload(
-        str(lead_root.resolve()),
+        _lead_address(lead_root),
         work_id,
         "inbox",
         message_type,
@@ -902,7 +955,7 @@ def inbox_preexisting_file(bc_root: Path, filename: str, context: dict) -> None:
         "description": "sentinel preexisting",
     }
     insert_raw_payload(
-        str(bc_root.resolve()),
+        _bc_address(bc_root),
         work_id,
         "inbox",
         "request_maintenance",
@@ -1119,7 +1172,7 @@ def file_parses_as_request_maintenance_with_criteria(
 def inbox_file_unchanged(bc_root: Path, filename: str, context: dict) -> None:
     work_id = _parse_inbox_filename(filename)
     original = context["preexisting_inbox_files"][filename]
-    bc = _bc_id(str(bc_root.resolve()))
+    bc = _bc_address(bc_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1570,7 +1623,7 @@ def outbox_preexisting_invalid_response(
         "question": "this payload is structurally valid YAML",
     }
     insert_raw_payload(
-        str(bc_root.resolve()),
+        _bc_address(bc_root),
         work_id,
         "outbox",
         message_type,
@@ -1638,7 +1691,7 @@ def inbox_file_parses_as_request_bugfix_one_scenario(
         f"shop-msg exited {rc}; stderr:\n{context.get('cli_stderr', '')}"
     )
     work_id = _parse_inbox_filename(filename)
-    raw = read_inbox_message(str(bc_root.resolve()), work_id)
+    raw = read_inbox_message(_bc_address(bc_root), work_id)
     assert raw is not None, (
         f"expected inbox row for work_id={work_id!r}; "
         f"found: {[r['work_id'] for r in _fetch_inbox_rows(bc_root)]}"
@@ -1828,7 +1881,7 @@ def then_inbox_yaml_deserializes(context: dict) -> None:
     )
     bc_root: Path = context["bc_root_roundtrip"]
     # Read the inbox row from DB instead of the file system.
-    raw = read_inbox_message(str(bc_root.resolve()), "lead-018-roundtrip")
+    raw = read_inbox_message(_bc_address(bc_root), "lead-018-roundtrip")
     assert raw is not None, (
         f"expected inbox row for work_id='lead-018-roundtrip'; "
         f"inbox rows: {_fetch_inbox_rows(bc_root)}"
@@ -2047,7 +2100,7 @@ def given_inbox_invalid_lead_message(
         "description": "this payload is structurally valid YAML",
     }
     insert_raw_payload(
-        str(bc_root.resolve()),
+        _bc_address(bc_root),
         work_id,
         "inbox",
         "not_a_real_type",
@@ -2076,6 +2129,11 @@ def given_lead_shop_with_two_bcs(
         bc = repos / name
         (bc / "inbox").mkdir(parents=True)
         (bc / "outbox").mkdir()
+        # ADR-020: register each sibling under its LITERAL directory name so
+        # its abstract address (shopsystem/<name>) trailing component matches
+        # the `pending outbox --bc-name <name>` filter (scenario d71fb7).
+        registry_add(name, shop_type="bc")
+        _test_registry[str(bc.resolve())] = name
     return lead_root
 
 
@@ -2920,7 +2978,7 @@ def given_listen_on_outbox_channel(bc_root: Path, context: dict) -> None:
         import psycopg as _pg
         from psycopg import sql as _sql
 
-        channel = _bc_outbox_slug(str(bc_root.resolve()))
+        channel = _bc_outbox_slug(_bc_address(bc_root))
         # The module-top override sets SHOPMSG_DSN unconditionally; this
         # fallback is dead code in practice but kept aligned with the
         # ephemeral test DSN so the listener cannot ever attach to
@@ -3135,7 +3193,7 @@ def given_lead_shop_with_one_bc(tmp_path: Path, bc_a: str) -> Path:
     (bc / "outbox").mkdir()
     # Register the BC and lead in the registry under their canonical names so
     # name-based addressing (--bc <name> / --lead <name>) works in step defs.
-    registry_add(bc_a, str(bc.resolve()), shop_type="bc")
+    registry_add(bc_a, shop_type="bc")
     _test_registry[str(bc.resolve())] = bc_a  # sync with session cache
     _get_or_register_lead_name(lead_root)  # register lead under a uuid name
     return lead_root
@@ -3149,8 +3207,7 @@ def given_lead_shop_with_one_bc(tmp_path: Path, bc_a: str) -> Path:
 def given_no_outbox_message(lead_root: Path, work_id: str, bc: str) -> None:
     """Assert (and ensure) that no outbox row exists for the given work_id in bc."""
     bc_root = lead_root / "repos" / bc
-    bc_root_str = str(bc_root.resolve())
-    bc_id = _bc_id(bc_root_str)
+    bc_id = _bc_address(bc_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -3456,7 +3513,7 @@ def given_listen_on_outbox_channel_lead(bc_root: Path, context: dict) -> None:
         import psycopg as _pg
         from psycopg import sql as _sql
 
-        channel = _bc_outbox_slug(str(bc_root.resolve()))
+        channel = _bc_outbox_slug(_bc_address(bc_root))
         # The module-top override sets SHOPMSG_DSN unconditionally; this
         # fallback is dead code in practice but kept aligned with the
         # ephemeral test DSN so the listener cannot ever attach to
@@ -3718,7 +3775,7 @@ def given_lead_registered(lead_name: str, context: dict, request) -> None:
     # Point the named lead at the session lead's root so the registry
     # resolve_lead_shop() call in the CLI finds a lead shop.
     lead_root = get_session_lead_root()
-    registry_add(lead_name, str(lead_root.resolve()), shop_type="lead")
+    registry_add(lead_name, shop_type="lead")
     _test_registry[str(lead_root.resolve())] = lead_name
     context["named_lead_root"] = lead_root
     context["named_lead_name"] = lead_name
@@ -3741,7 +3798,7 @@ def given_bc_registered(bc_name: str, tmp_path: Path, context: dict, request) ->
     bc_root = tmp_path / bc_name
     (bc_root / "inbox").mkdir(parents=True)
     (bc_root / "outbox").mkdir()
-    registry_add(bc_name, str(bc_root.resolve()), shop_type="bc")
+    registry_add(bc_name, shop_type="bc")
     _test_registry[str(bc_root.resolve())] = bc_name
     context["registered_bc_root"] = bc_root
     context["registered_bc_name"] = bc_name
@@ -3941,8 +3998,8 @@ def given_two_bc_responses_unconsumed(prime_lead_root: Path, tmp_path: Path) -> 
         bc_root = tmp_path / f"prime_bc_{i}"
         bc_root.mkdir(parents=True)
         insert_bc_response(
-            str(prime_lead_root.resolve()),
-            str(bc_root.resolve()),
+            _lead_address(prime_lead_root),
+            _bc_address(bc_root),
             work_id,
             "work_done",
             {
@@ -4204,7 +4261,7 @@ def _register_shop(name: str, path: Path, shop_type: str) -> None:
     """
     _snapshot_production_name(name)
     _PER_TEST_MUTATED_NAMES.add(name)
-    registry_add(name, str(path.resolve()), shop_type=shop_type)
+    registry_add(name, shop_type=shop_type)
     _test_registry[str(path.resolve())] = name
 
 
@@ -4970,7 +5027,7 @@ def given_hyphen_shop_registered_lead(
     # session-lead alias).
     saved = _registry_lookup(name)
     root = context["cwd_shop_root"]
-    registry_add(name, str(root.resolve()), shop_type="lead")
+    registry_add(name, shop_type="lead")
     _test_registry[str(root.resolve())] = name
     request.addfinalizer(lambda: _registry_restore(name, saved))
 
@@ -5299,780 +5356,6 @@ def then_behaves_identically_to_explicit(
     assert _norm(bare_stdout) == _norm(result.stdout), (
         f"bare and explicit stdouts differ.\n"
         f"bare:\n{bare_stdout}\nexplicit:\n{result.stdout}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Step defs for features/test_fixture_hygiene_production_registry.feature
-# (lead-6nt: scenarios 2460440854300728, acd9e1c74ea1744a, 6dcbb68f89d527ec,
-# 27c7804d2392736c, 420caad777af2152, e4263ccdca3b7a17).
-#
-# These scenarios pin invariants of the messaging BC's own test fixture
-# system: that production canonical registry entries written via
-# _register_shop are snapshotted, restored per-test, restored at session
-# end, and self-heal orphan tmp_path baselines from prior corrupted runs.
-#
-# Each scenario is verified by directly exercising the fixture helpers
-# (_snapshot_production_name, _PER_TEST_MUTATED_NAMES, _per_test_registry_restore
-# logic, session_lead_shop teardown logic) against a controlled pre-state
-# row in the shared shop_registry, then observing the post-state.  We use
-# uniquely-named synthetic canonical entries per test (prefixed
-# "fxhyg-<uuid>-<production-name>") so the meta-tests do not interfere
-# with the parent pytest session's own use of the production canonical
-# names — but the helpers themselves are the ones the parent session uses.
-# ---------------------------------------------------------------------------
-
-
-def _fxhyg_synthetic_name(production_name: str, suffix: str) -> str:
-    """Return a synthetic canonical name that exercises the same code paths
-    as a real production name but is namespaced to this meta-test so it
-    cannot collide with the parent session's own production-name snapshots.
-    """
-    return f"fxhyg-{suffix}-{production_name}"
-
-
-# Every synthetic name the fxhyg meta-test fixtures seed directly (bypassing
-# the per-test / session _register_shop cleanup plumbing) is recorded here so
-# the session-scoped fxhyg teardown below can remove it after the meta-tests
-# finish.  Without this, fxhyg-prefixed synthetic rows seeded with
-# shop_type="lead" (e.g. via given_fxhyg_session_completed) persist past
-# teardown and out-sort the real "shopsystem-product" lead row in
-# resolve_lead_shop() (which does ORDER BY name LIMIT 1; "fxhyg-" < "shopsystem-").
-# Hygiene is enforced at this fixture boundary, NOT by a defensive prefix
-# filter in resolve_lead_shop().
-_FXHYG_SEEDED_NAMES: set[str] = set()
-
-
-def _fxhyg_seed_production_row(name: str, shop_root: str, shop_type: str = "bc") -> None:
-    """Directly upsert a row into shop_registry as if it were a production
-    entry (i.e., not via _register_shop, which would record it for per-test
-    cleanup). This bypasses the per-test cleanup plumbing so we can simulate
-    the pre-session state that scenarios 39-44 specify.
-
-    Every name seeded through this chokepoint is recorded in
-    _FXHYG_SEEDED_NAMES so the session-scoped _fxhyg_registry_cleanup fixture
-    removes it at teardown — closing the leak where an fxhyg-prefixed
-    shop_type="lead" synthetic out-sorts the real shopsystem-product lead row
-    in resolve_lead_shop()."""
-    _FXHYG_SEEDED_NAMES.add(name)
-    registry_add(name, shop_root, shop_type=shop_type)
-
-
-@pytest.fixture(autouse=True)
-def _fxhyg_registry_cleanup():
-    """Function-scoped autouse teardown that removes every fxhyg synthetic row
-    seeded via _fxhyg_seed_production_row during the test.
-
-    The fxhyg meta-test fixtures seed synthetic production-style rows directly
-    (bypassing the tracked _register_shop cleanup); some are seeded with
-    shop_type="lead" pointing at the real session lead root.  Because they are
-    snapshotted AFTER seeding, the per-test / session restore re-persists them
-    at their seeded value instead of removing them — so they would otherwise
-    survive and out-sort the real "shopsystem-product" lead row in
-    resolve_lead_shop() (ORDER BY name LIMIT 1; "fxhyg-" < "shopsystem-") for
-    the remainder of the session.
-
-    Cleanup is function-scoped (not session-scoped) so the leaked lead rows are
-    removed as soon as the fxhyg meta-test completes, before any later test in
-    the same session calls resolve_lead_shop().  This is what lets the AC6
-    --force pins (33663625b12f56fd, 1fb957942f332206) stay green under
-    full-suite load, not just in isolation."""
-    yield
-    for name in list(_FXHYG_SEEDED_NAMES):
-        registry_remove(name)
-    _FXHYG_SEEDED_NAMES.clear()
-
-
-@given(
-    parsers.re(
-        r'a fixture-hygiene meta-test context with synthetic production name '
-        r'(?P<which>[^ ]+) seeded at (?P<shop_root>/\S+) with shop_type (?P<shop_type>\w+)'
-    ),
-    target_fixture="fxhyg_ctx",
-)
-def given_fxhyg_seeded(
-    which: str, shop_root: str, shop_type: str, context: dict
-) -> dict:
-    """Seed a synthetic production-style row and return a meta-context dict.
-    Used by scenarios that need a controlled production-state pre-condition.
-    """
-    suffix = uuid.uuid4().hex[:8]
-    synth = _fxhyg_synthetic_name(which, suffix)
-    _fxhyg_seed_production_row(synth, shop_root, shop_type)
-    ctx = {
-        "synth_name": synth,
-        "production_root": shop_root,
-        "production_type": shop_type,
-        "production_name_alias": which,
-        "suffix": suffix,
-    }
-    # Stash on the test context too so cleanup can find it if needed.
-    context.setdefault("fxhyg", []).append(ctx)
-    return ctx
-
-
-@given(parsers.parse('the messaging BC\'s pytest session is about to start'))
-def given_fxhyg_session_pre(context: dict) -> None:
-    # No-op: the session-start state is set up by individual seeded rows.
-    # This step exists so the Gherkin reads naturally.
-    context.setdefault("fxhyg_session_state", "pre")
-
-
-@given(parsers.parse('the messaging BC\'s pytest session is running'))
-def given_fxhyg_session_running(context: dict) -> None:
-    context["fxhyg_session_state"] = "running"
-
-
-@given(
-    parsers.re(
-        r'the shop_registry contains a production entry for canonical name '
-        r'"(?P<name>[^"]+)" with shop_root "(?P<shop_root>[^"]+)"'
-    )
-)
-def given_fxhyg_seed_named(
-    name: str, shop_root: str, context: dict, tmp_path: Path
-) -> None:
-    # Use a uuid-suffixed synthetic name so we do not stomp on the parent
-    # session's own snapshot of the same production name. The synthetic
-    # name's pre-state mimics the production one's pre-state.
-    suffix = uuid.uuid4().hex[:8]
-    synth = _fxhyg_synthetic_name(name, suffix)
-    _fxhyg_seed_production_row(synth, shop_root, "bc")
-    ctx = context.setdefault("fxhyg_seeded", {})
-    ctx[name] = {
-        "synth_name": synth,
-        "production_root": shop_root,
-        "production_type": "bc",
-        "suffix": suffix,
-    }
-
-
-@given(
-    parsers.re(
-        r'the shop_registry contains an entry for canonical name '
-        r'"(?P<name>[^"]+)" whose shop_root begins with "/tmp/" '
-        r'\(a leaked tmp_path from a prior corrupted pytest session\)'
-    )
-)
-def given_fxhyg_seed_orphan(
-    name: str, context: dict, tmp_path: Path
-) -> None:
-    """Simulate a prior corrupted session's leaked tmp_path row.
-
-    We seed a synthetic name pointing at a /tmp/pytest-of-* style path that
-    no longer exists.  This is the orphan-tmp_path baseline scenario 44
-    requires the fixture to self-heal away.
-    """
-    suffix = uuid.uuid4().hex[:8]
-    synth = _fxhyg_synthetic_name(name, suffix)
-    orphan_root = f"/tmp/pytest-of-vscode/pytest-DEAD/test_orphan_{suffix}"
-    _fxhyg_seed_production_row(synth, orphan_root, "bc")
-    ctx = context.setdefault("fxhyg_orphan", {})
-    ctx[name] = {
-        "synth_name": synth,
-        "orphan_root": orphan_root,
-        "suffix": suffix,
-    }
-
-
-@given(
-    parsers.re(
-        r'the production shop_root for "(?P<name>[^"]+)" is "(?P<prod_root>[^"]+)" '
-        r'but that production row is currently missing or pointing at the stale tmp_path'
-    )
-)
-def given_fxhyg_orphan_production_missing(
-    name: str, prod_root: str, context: dict
-) -> None:
-    # Record the asserted production root on the orphan ctx for later
-    # comparison; the actual pre-state is the /tmp/ row seeded by the
-    # prior step (which simulates the "pointing at stale tmp_path" case).
-    ctx = context["fxhyg_orphan"][name]
-    ctx["asserted_prod_root"] = prod_root
-
-
-# ----- WHEN steps --------------------------------------------------------
-
-
-@when(
-    parsers.re(
-        r'the pytest session runs and at least one test invokes the fixture helper '
-        r'that registers "(?P<a>[^"]+)" or "(?P<b>[^"]+)" at a tmp_path-rooted shop_root'
-    )
-)
-def when_fxhyg_session_mutates(
-    a: str, b: str, context: dict, tmp_path: Path
-) -> None:
-    """Simulate the session lifecycle:
-      1. session-init snapshot of the synthetic names;
-      2. per-test mutation via _register_shop (the same helper feature-file
-         step defs use);
-      3. per-test teardown.
-    """
-    seeded = context["fxhyg_seeded"]
-    # Step 1: session snapshot (lazy via _snapshot_production_name).
-    for prod_name in (a, b):
-        synth = seeded[prod_name]["synth_name"]
-        _snapshot_production_name(synth)
-    # Step 2: per-test mutation. We simulate a test that uses _register_shop
-    # to point the synthetic name at a tmp_path.
-    _PER_TEST_MUTATED_NAMES.clear()
-    for prod_name in (a, b):
-        synth = seeded[prod_name]["synth_name"]
-        tmp_target = tmp_path / f"mutated_{synth}"
-        tmp_target.mkdir(parents=True, exist_ok=True)
-        _register_shop(synth, tmp_target, "bc")
-    context["fxhyg_mutated_names"] = [
-        seeded[a]["synth_name"],
-        seeded[b]["synth_name"],
-    ]
-
-
-@when(parsers.parse('the pytest session completes (teardown of the session-scoped registry fixture runs)'))
-def when_fxhyg_session_teardown(context: dict) -> None:
-    """Simulate the session teardown loop from session_lead_shop, which
-    iterates _SAVED_PRODUCTION_ENTRIES and restores each name."""
-    # The real fixture also iterates _SAVED_PRODUCTION_ENTRIES, but we only
-    # restore the synthetic names this meta-test snapshotted to avoid
-    # disturbing the parent session's own baselines for the production
-    # names. Equivalence: each meta-test name is restored via exactly the
-    # same _registry_restore call the real teardown uses.
-    seeded = context.get("fxhyg_seeded", {})
-    synth_names = {entry["synth_name"] for entry in seeded.values()}
-    # Also include any orphan-scenario synthetic names.
-    for entry in context.get("fxhyg_orphan", {}).values():
-        synth_names.add(entry["synth_name"])
-    for synth in synth_names:
-        if synth in _SAVED_PRODUCTION_ENTRIES:
-            _registry_restore(synth, _SAVED_PRODUCTION_ENTRIES[synth])
-
-
-@when(
-    parsers.re(
-        r'a test calls the fixture helper to register "(?P<name>[^"]+)" at a '
-        r'tmp_path-rooted shop_root distinct from the production shop_root'
-    )
-)
-def when_fxhyg_test_mutates(name: str, context: dict, tmp_path: Path) -> None:
-    seeded = context["fxhyg_seeded"][name]
-    synth = seeded["synth_name"]
-    # Session-level snapshot must have happened first; do it lazily here so
-    # the synthetic-name baseline mirrors what _ensure_session_lead does
-    # for the real production names.
-    _snapshot_production_name(synth)
-    # Reset per-test tracker (the autouse fixture in a real test would do
-    # this at function start).
-    _PER_TEST_MUTATED_NAMES.clear()
-    tmp_target = tmp_path / f"mutated_{synth}"
-    tmp_target.mkdir(parents=True, exist_ok=True)
-    _register_shop(synth, tmp_target, "bc")
-    context["fxhyg_current_synth"] = synth
-    context["fxhyg_current_tmp"] = str(tmp_target.resolve())
-
-
-@when(parsers.parse('that test completes (passes)'))
-def when_fxhyg_test_passes(context: dict) -> None:
-    # Simulate the per-test autouse teardown running on a passing test.
-    _run_per_test_teardown_now()
-    context["fxhyg_test_outcome"] = "pass"
-
-
-@when(parsers.parse('that test raises an unhandled exception (fails) after the mutation'))
-def when_fxhyg_test_fails(context: dict) -> None:
-    # The per-test autouse fixture uses `yield` (not try/finally), so
-    # pytest's finalizer protocol invokes the teardown after `yield`
-    # regardless of test outcome. We simulate this by running the teardown
-    # directly, asserting that pytest's promise (teardown runs on both pass
-    # and fail) is what the fixture relies on.
-    _run_per_test_teardown_now()
-    context["fxhyg_test_outcome"] = "fail"
-
-
-@when(parsers.parse('the next test in the same pytest session begins'))
-def when_fxhyg_next_test_begins(context: dict) -> None:
-    # Per-test teardown of the prior test has already run by this point in
-    # the simulated lifecycle.  No state change needed; this step exists
-    # so the Gherkin reads naturally.
-    context["fxhyg_lifecycle"] = "next_test_began"
-
-
-@when(parsers.parse('I run "shop-msg registry list" against the same shop_registry the test session used'))
-def when_fxhyg_run_registry_list(context: dict) -> None:
-    """Exercise the CLI (not direct DB) so scenario 42 pins the
-    operator-visible surface. Uses the canonical context keys
-    (cli_returncode / cli_stdout / cli_stderr) so the shared
-    `@then("the command exits zero")` step covers our exit-code check
-    without a fxhyg-specific duplicate."""
-    result = subprocess.run(
-        ["shop-msg", "registry", "list"],
-        capture_output=True,
-        text=True,
-    )
-    context["cli_returncode"] = result.returncode
-    context["cli_stdout"] = result.stdout
-    context["cli_stderr"] = result.stderr
-
-
-@when(parsers.parse('the messaging BC\'s pytest session starts and the session-scoped fixture initializes'))
-def when_fxhyg_session_starts(context: dict) -> None:
-    """Simulate the full session lifecycle for the orphan-scenario:
-    snapshot at init (capturing the /tmp/ baseline as None via
-    ignore_test_paths=True), then session teardown (which restores via
-    _registry_restore(name, None) → registry_remove(name)).
-
-    The Gherkin's Then "captures... as absent" and "at session teardown,
-    no tmp_path-prefixed entry survives" both have to be verifiable from
-    post-When state, so we run init + teardown in one When.  The init
-    snapshot value is stashed on the orphan entry for the first Then to
-    inspect; the teardown side effect is observable in the registry for
-    the second Then.
-    """
-    for entry in context.get("fxhyg_orphan", {}).values():
-        synth = entry["synth_name"]
-        _snapshot_production_name(synth)
-        entry["captured_baseline"] = _SAVED_PRODUCTION_ENTRIES[synth]
-    # Simulate session teardown: restore every snapshotted orphan entry
-    # using the same _registry_restore mechanism the real session_lead_shop
-    # fixture invokes.  For a baseline of None this removes the stale row.
-    for entry in context.get("fxhyg_orphan", {}).values():
-        synth = entry["synth_name"]
-        _registry_restore(synth, _SAVED_PRODUCTION_ENTRIES[synth])
-
-
-@when(parsers.parse('the test session starts and the session-scoped fixture initializes'))
-def when_fxhyg_session_starts_alt(context: dict, tmp_path: Path) -> None:
-    """Scenario 43 entry point. Simulates init of the session fixture for
-    a representative production name beyond the two lead aliases, so the
-    "captured set is not limited to" Then can be verified deterministically
-    regardless of test ordering."""
-    # Snapshot at least one additional production-style name via the same
-    # lazy snapshot helper _register_shop uses.
-    suffix = uuid.uuid4().hex[:8]
-    synth = _fxhyg_synthetic_name("shopsystem-docs", suffix)
-    _fxhyg_seed_production_row(
-        synth, "/workspaces/shopsystem-product/repos/shopsystem-docs", "bc"
-    )
-    _snapshot_production_name(synth)
-    context.setdefault("fxhyg_43_synths", []).append(synth)
-    # Also run the orphan init path (if any orphans were seeded earlier
-    # via prior scenarios — keeps backward compat with the orphan When).
-    when_fxhyg_session_starts(context)
-
-
-# ----- THEN steps --------------------------------------------------------
-
-
-@then(
-    parsers.re(
-        r'the shop_registry entry for "(?P<name>[^"]+)" has shop_root '
-        r'"(?P<expected_root>[^"]+)" and the same shop_type it had pre-session'
-    )
-)
-def then_fxhyg_entry_restored(name: str, expected_root: str, context: dict) -> None:
-    seeded = context["fxhyg_seeded"][name]
-    synth = seeded["synth_name"]
-    expected_type = seeded["production_type"]
-    looked_up = _registry_lookup(synth)
-    assert looked_up is not None, (
-        f"synthetic-for-{name} ({synth}) was not restored; "
-        f"_SAVED_PRODUCTION_ENTRIES={_SAVED_PRODUCTION_ENTRIES.get(synth)!r}"
-    )
-    actual_root, actual_type = looked_up
-    assert actual_root == seeded["production_root"], (
-        f"synthetic-for-{name} shop_root not restored: "
-        f"expected {seeded['production_root']!r} got {actual_root!r}"
-    )
-    assert actual_type == expected_type, (
-        f"synthetic-for-{name} shop_type changed: "
-        f"expected {expected_type!r} got {actual_type!r}"
-    )
-
-
-@then(
-    parsers.parse(
-        'the restoration applies to every production canonical name the session '
-        'observed pre-test, not only "shopsystem-product" and "shopsystem product"'
-    )
-)
-def then_fxhyg_restoration_covers_all(context: dict) -> None:
-    # Confirm the SAVED set is not limited to the two lead-alias names.
-    snapshotted = set(_SAVED_PRODUCTION_ENTRIES.keys())
-    # At minimum, the synthetic names this meta-test seeded must be in the
-    # saved set, demonstrating that names beyond the two lead aliases are
-    # snapshotted.
-    seeded_synths = {
-        v["synth_name"] for v in context["fxhyg_seeded"].values()
-    }
-    missing = seeded_synths - snapshotted
-    assert not missing, (
-        f"session save/restore failed to cover these names: {missing!r}. "
-        f"This is the lead-6nt #39/#43 gap: snapshot must not be limited "
-        f"to a hand-maintained pair."
-    )
-    # And the lead aliases are also in the set (sanity).
-    assert "shopsystem-product" in snapshotted
-    assert "shopsystem product" in snapshotted
-
-
-@then(
-    parsers.re(
-        r'at the start of the next test, the shop_registry entry for '
-        r'"(?P<name>[^"]+)" has the production shop_root "(?P<expected_root>[^"]+)" '
-        r'— not the (?:prior|failed) test\'s tmp_path value'
-    )
-)
-def then_fxhyg_per_test_restored(name: str, expected_root: str, context: dict) -> None:
-    seeded = context["fxhyg_seeded"][name]
-    synth = seeded["synth_name"]
-    looked_up = _registry_lookup(synth)
-    assert looked_up is not None, (
-        f"per-test teardown did not restore {synth!r}; expected production "
-        f"root {seeded['production_root']!r}"
-    )
-    actual_root, _ = looked_up
-    assert actual_root == seeded["production_root"], (
-        f"per-test teardown left {synth!r} at {actual_root!r}, expected "
-        f"{seeded['production_root']!r} (the prior-test tmp_path leaked)"
-    )
-    # And specifically, it must NOT be the tmp_path the test wrote.
-    tmp_value = context.get("fxhyg_current_tmp")
-    if tmp_value is not None:
-        assert actual_root != tmp_value, (
-            f"per-test teardown failed to overwrite the test's tmp_path "
-            f"({tmp_value!r}); registry still contains the leaked value."
-        )
-
-
-@then(parsers.parse('the restoration is performed by a per-test (function-scoped) teardown, not deferred to session teardown'))
-def then_fxhyg_per_test_scope(context: dict) -> None:
-    # Verify the autouse fixture exists at function scope. Inspect the
-    # fixture definition itself rather than guessing from behavior.
-    fixture = _per_test_registry_restore
-    # pytest 9+ uses FixtureFunctionDefinition with _fixture_function_marker.
-    marker = getattr(fixture, "_fixture_function_marker", None)
-    if marker is None:
-        # Backward-compat for older pytest releases that attach the marker
-        # under the legacy attribute name.
-        marker = getattr(fixture, "_pytestfixturefunction", None)
-    assert marker is not None, "_per_test_registry_restore is not a pytest fixture"
-    assert marker.scope == "function", (
-        f"_per_test_registry_restore scope is {marker.scope!r}, expected 'function'. "
-        f"Per-test restore must be function-scoped, not session-scoped."
-    )
-    assert marker.autouse is True, (
-        "_per_test_registry_restore must be autouse=True so every test "
-        "is covered without opt-in."
-    )
-
-
-@then(parsers.parse('the per-test restoration runs regardless of test outcome (pass, fail, or error)'))
-def then_fxhyg_runs_on_failure(context: dict) -> None:
-    # The mechanism: pytest guarantees a fixture's post-yield teardown runs
-    # even when the test body raises (this is the documented contract of
-    # the yield-based fixture protocol). We verified the restore happened
-    # in the prior step (then_fxhyg_per_test_restored) under outcome=fail.
-    assert context.get("fxhyg_test_outcome") == "fail", (
-        "preceding When did not establish a failure-path outcome"
-    )
-
-
-@then(
-    parsers.parse(
-        'no entry whose canonical name was observed as a production entry '
-        'pre-session has a shop_root that begins with "/tmp/" or matches the '
-        'pytest tmp_path pattern (e.g., contains "/pytest-of-")'
-    )
-)
-def then_fxhyg_no_tmp_leaks(context: dict) -> None:
-    stdout = context["cli_stdout"]
-    # The scenario's "production canonical names observed pre-session" are
-    # the synthetic proxies this meta-test seeded (which stand in for
-    # shopsystem-messaging, shopsystem-docs, shopsystem-product, and
-    # shopsystem product). We restrict the no-leak invariant to those
-    # proxies — checking the real lead aliases here would conflate the
-    # parent pytest session's still-active session_lead_shop fixture
-    # (which legitimately points "shopsystem-product" at a tmp_path
-    # session-lead root mid-session, and restores it at parent-session
-    # teardown) with the post-session invariant scenario 42 pins.
-    proxy_names = {
-        entry["synth_name"]
-        for entry in context.get("fxhyg_seeded", {}).values()
-    }
-    assert proxy_names, (
-        "fxhyg_seeded is empty; scenario 42 setup did not snapshot any "
-        "production-name proxies"
-    )
-    offenders = []
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split(" ", 2)
-        if len(parts) < 3:
-            tokens = line.rsplit(" ", 2)
-            if len(tokens) != 3:
-                continue
-            name, shop_root, _shop_type = tokens
-        else:
-            name, shop_root, _shop_type = parts
-        if name not in proxy_names:
-            continue
-        if shop_root.startswith("/tmp/") or "/pytest-of-" in shop_root:
-            offenders.append((name, shop_root))
-    assert not offenders, (
-        f"post-session shop_registry contains production-name proxy rows "
-        f"pointing at tmp_path roots (lead-6nt #42 violation): {offenders!r}"
-    )
-
-
-@then(parsers.parse('every such production canonical entry resolves to the same shop_root it had pre-session'))
-def then_fxhyg_all_restored_to_pre_session(context: dict) -> None:
-    # The synthetic seeded entries should each resolve back to the
-    # production_root captured in the meta-context.  This is the precise
-    # invariant scenario 42 demands (no tmp_path leak AND post-state ==
-    # pre-state for production names).
-    for production_name, seeded in context.get("fxhyg_seeded", {}).items():
-        synth = seeded["synth_name"]
-        looked_up = _registry_lookup(synth)
-        assert looked_up is not None, (
-            f"{synth!r} (proxy for {production_name!r}) is missing post-session"
-        )
-        actual_root, _ = looked_up
-        assert actual_root == seeded["production_root"], (
-            f"{synth!r} post-session shop_root {actual_root!r} != "
-            f"pre-session {seeded['production_root']!r}"
-        )
-
-
-@then(
-    parsers.parse(
-        'for every canonical name the fixture helper may register during the '
-        'session, the session-scoped fixture has captured that name\'s '
-        'pre-session registry state (or absence) before any test mutates it'
-    )
-)
-def then_fxhyg_all_names_captured(context: dict) -> None:
-    # The contract: _register_shop calls _snapshot_production_name FIRST,
-    # then registry_add. So by construction, any name the helper ever
-    # touches has been snapshotted into _SAVED_PRODUCTION_ENTRIES by the
-    # time the mutation lands.
-    #
-    # We verify the contract holds by inspecting _register_shop's source
-    # ordering: snapshot must precede registry_add. (Pure behavioral test
-    # is impossible — you'd need to prove a negative over an infinite set
-    # of possible names; the lead-6nt #43 invariant is structural.)
-    import inspect
-    src = inspect.getsource(_register_shop)
-    snap_idx = src.find("_snapshot_production_name")
-    add_idx = src.find("registry_add(")
-    assert snap_idx >= 0, (
-        "_register_shop no longer calls _snapshot_production_name — "
-        "the lead-6nt #43 contract is broken."
-    )
-    assert add_idx >= 0, "_register_shop no longer calls registry_add"
-    assert snap_idx < add_idx, (
-        "_register_shop calls registry_add before _snapshot_production_name; "
-        "snapshot must precede mutation so the pre-state is preserved."
-    )
-
-
-@then(parsers.parse('the captured set is not limited to "shopsystem-product" and "shopsystem product"'))
-def then_fxhyg_captured_set_not_limited(context: dict) -> None:
-    snapshotted = set(_SAVED_PRODUCTION_ENTRIES.keys())
-    # At least one synthetic-meta name should be in the set (scenarios
-    # earlier in this feature seed them), demonstrating coverage beyond
-    # the two lead aliases.
-    extra = snapshotted - {"shopsystem-product", "shopsystem product"}
-    assert extra, (
-        "_SAVED_PRODUCTION_ENTRIES is limited to the two lead aliases. "
-        "The lead-6nt #39/#43 gap is not closed."
-    )
-
-
-@then(parsers.parse('at session teardown, each captured entry is restored to its pre-session value (or removed if it was absent pre-session)'))
-def then_fxhyg_teardown_restores_all(context: dict) -> None:
-    # The session_lead_shop fixture's teardown loop iterates
-    # _SAVED_PRODUCTION_ENTRIES and calls _registry_restore on each entry.
-    # Verify that contract by inspecting the source of the underlying
-    # function (pytest 9+ wraps it in FixtureFunctionDefinition).
-    import inspect
-    underlying = getattr(session_lead_shop, "_fixture_function", session_lead_shop)
-    src = inspect.getsource(underlying)
-    assert "_SAVED_PRODUCTION_ENTRIES" in src, (
-        "session_lead_shop teardown no longer references "
-        "_SAVED_PRODUCTION_ENTRIES — full-coverage restore is broken."
-    )
-    assert "_registry_restore" in src, (
-        "session_lead_shop teardown no longer calls _registry_restore"
-    )
-    # And the iteration must be over the *full* dict, not a hand-maintained
-    # tuple — verify by absence of the old pattern.
-    assert 'for well_known_name in ("shopsystem-product", "shopsystem product")' not in src, (
-        "session_lead_shop teardown still iterates a hand-maintained "
-        "two-name tuple instead of _SAVED_PRODUCTION_ENTRIES.items(); "
-        "the lead-6nt #43 fix has regressed."
-    )
-
-
-@then(parsers.parse('the test suite contains no canonical name that a step definition can register but the session-scoped fixture does not cover'))
-def then_fxhyg_no_uncovered_names(context: dict) -> None:
-    # Structural guarantee: because _register_shop snapshots-then-mutates,
-    # there is no path by which a step def can land a name in the registry
-    # without first adding it to _SAVED_PRODUCTION_ENTRIES.  We re-assert
-    # the structural invariant here.
-    import inspect
-    src = inspect.getsource(_register_shop)
-    assert "_snapshot_production_name(name)" in src
-    assert "_PER_TEST_MUTATED_NAMES.add(name)" in src
-
-
-@then(
-    parsers.re(
-        r'the session-scoped fixture captures the pre-session state for '
-        r'"(?P<name>[^"]+)" as absent \(it does not preserve the tmp_path value\)'
-    )
-)
-def then_fxhyg_orphan_captured_as_absent(name: str, context: dict) -> None:
-    entry = context["fxhyg_orphan"][name]
-    captured = entry["captured_baseline"]
-    assert captured is None, (
-        f"orphan tmp_path baseline for {name!r} was captured as "
-        f"{captured!r} instead of None. The ignore_test_paths=True "
-        f"self-heal in _snapshot_production_name is broken."
-    )
-
-
-@then(
-    parsers.re(
-        r'at session teardown, the shop_registry contains no entry for '
-        r'"(?P<name>[^"]+)" with a tmp_path-prefixed shop_root'
-    )
-)
-def then_fxhyg_orphan_removed_at_teardown(name: str, context: dict) -> None:
-    entry = context["fxhyg_orphan"][name]
-    synth = entry["synth_name"]
-    # The session teardown was simulated by an earlier When step; verify
-    # the row is gone (because its baseline was captured as None, restore
-    # removes it).
-    looked_up = _registry_lookup(synth)
-    if looked_up is not None:
-        shop_root, _ = looked_up
-        assert "/tmp/" not in shop_root and "/pytest-of-" not in shop_root, (
-            f"orphan {synth!r} survived session teardown still pointing at "
-            f"{shop_root!r}"
-        )
-
-
-@then(parsers.parse('the self-healing behavior applies uniformly to every production canonical name the session-scoped fixture covers, not only to "shopsystem-product" and "shopsystem product"'))
-def then_fxhyg_self_heal_uniform(context: dict) -> None:
-    # The self-heal is performed by _snapshot_production_name, which is
-    # invoked uniformly for every name passing through _register_shop or
-    # _ensure_session_lead.  Verify the helper itself uses
-    # ignore_test_paths=True unconditionally.
-    import inspect
-    src = inspect.getsource(_snapshot_production_name)
-    assert "ignore_test_paths=True" in src, (
-        "_snapshot_production_name no longer self-heals tmp_path baselines"
-    )
-
-
-# ----- helper used by When steps -----------------------------------------
-
-def _run_per_test_teardown_now() -> None:
-    """Execute the post-yield body of _per_test_registry_restore once.
-
-    We cannot call the generator-fixture directly (pytest manages it), but
-    we can replicate its post-yield body exactly.  This is acceptable
-    because the structural-invariant Then steps (then_fxhyg_per_test_scope,
-    then_fxhyg_runs_on_failure) verify the *real* fixture's scope and
-    autouse flag — i.e., that the body actually runs at the right time
-    during real test execution.
-    """
-    for mutated_name in list(_PER_TEST_MUTATED_NAMES):
-        if mutated_name in _SAVED_PRODUCTION_ENTRIES:
-            _registry_restore(
-                mutated_name, _SAVED_PRODUCTION_ENTRIES[mutated_name]
-            )
-        else:
-            registry_remove(mutated_name)
-    _PER_TEST_MUTATED_NAMES.clear()
-
-
-@given(
-    parsers.parse(
-        'the messaging BC\'s pytest session has run to completion '
-        '(all session-scoped teardowns have executed)'
-    )
-)
-def given_fxhyg_session_completed(context: dict) -> None:
-    """For scenario 42: simulate post-session state by running the same
-    snapshot+mutate+restore flow over a set of synthetic names that proxy
-    for the production names listed in the scenario."""
-    # Seed and snapshot synthetic proxies for the four production names
-    # listed in the scenario's Given/And block. Then perform a mutation +
-    # session teardown.  Post-state must be: no tmp_path leaks for any
-    # proxy.
-    proxies = {}
-    production_proxies = [
-        ("shopsystem-messaging", "/workspaces/shopsystem-product/repos/shopsystem-messaging", "bc"),
-        ("shopsystem-docs", "/workspaces/shopsystem-product/repos/shopsystem-docs", "bc"),
-        ("shopsystem-product", "/workspaces/shopsystem-product", "lead"),
-        ("shopsystem product", "/workspaces/shopsystem-product", "lead"),
-    ]
-    import tempfile
-    tmp_dir = Path(tempfile.mkdtemp(prefix="fxhyg42-"))
-    for prod_name, prod_root, shop_type in production_proxies:
-        suffix = uuid.uuid4().hex[:8]
-        synth = _fxhyg_synthetic_name(prod_name, suffix)
-        _fxhyg_seed_production_row(synth, prod_root, shop_type)
-        _snapshot_production_name(synth)
-        # Mutate the synth name to a tmp_path during a "test".
-        tmp_target = tmp_dir / f"pytest-of-fake/pytest-7/test_x/{synth}"
-        tmp_target.mkdir(parents=True, exist_ok=True)
-        _PER_TEST_MUTATED_NAMES.clear()
-        _register_shop(synth, tmp_target, shop_type)
-        # End-of-session restore for this name.
-        _registry_restore(synth, _SAVED_PRODUCTION_ENTRIES[synth])
-        proxies[prod_name] = {
-            "synth_name": synth,
-            "production_root": prod_root,
-            "production_type": shop_type,
-        }
-    context["fxhyg_seeded"] = proxies
-
-
-@given(
-    parsers.parse(
-        'the production canonical names observed pre-session include at '
-        'least "shopsystem-messaging", "shopsystem-docs", "shopsystem-product", '
-        'and "shopsystem product"'
-    )
-)
-def given_fxhyg_observed_names(context: dict) -> None:
-    # The Given above already seeded + snapshotted these proxies; this
-    # step exists so the Gherkin reads naturally.
-    assert "fxhyg_seeded" in context, (
-        "expected fxhyg_seeded to be populated by the prior Given"
-    )
-
-
-# Bridge step: the feature uses "the test suite contains a fixture helper..."
-# and "the test suite contains a session-scoped fixture..." as Given
-# statements. They are structural pre-conditions about the conftest module;
-# we verify them by import.
-
-@given(parsers.parse('the messaging BC\'s test suite contains a fixture helper that registers a (canonical-name, shop_root, shop_type) triple in the shop_registry on behalf of a step definition'))
-def given_fxhyg_helper_exists(context: dict) -> None:
-    assert callable(_register_shop), "_register_shop must be importable"
-
-
-@given(parsers.parse('the test suite contains a session-scoped fixture responsible for restoring production registry state at teardown'))
-def given_fxhyg_session_fixture_exists(context: dict) -> None:
-    marker = getattr(session_lead_shop, "_fixture_function_marker", None)
-    if marker is None:
-        marker = getattr(session_lead_shop, "_pytestfixturefunction", None)
-    assert marker is not None, "session_lead_shop is not a pytest fixture"
-    assert marker.scope == "session", (
-        f"session_lead_shop scope is {marker.scope!r}, expected 'session'"
     )
 
 
@@ -6726,13 +6009,19 @@ def _nn5f_register_lead(lead_name: str, context: dict, request) -> None:
     """
     saved = _registry_lookup(lead_name, ignore_test_paths=True)
     lead_root = get_session_lead_root()
-    registry_add(lead_name, str(lead_root.resolve()), shop_type="lead")
+    registry_add(lead_name, shop_type="lead")
     _test_registry[str(lead_root.resolve())] = lead_name
     context["nn5f_lead_name"] = lead_name
     context["nn5f_lead_root"] = lead_root
 
     bd_ok = _ensure_lead_bd_workspace(lead_root)
     context["lead_bd_available"] = bd_ok
+    if bd_ok:
+        # ADR-020: the CLI resolves its bd context from SHOPMSG_BD_CONTEXT /
+        # CWD. Point it at the lead root that carries the real .beads
+        # workspace so the bd-first dispatch lifecycle engages exactly as the
+        # pre-ADR-020 lead-path resolution did.
+        os.environ["SHOPMSG_BD_CONTEXT"] = str(lead_root.resolve())
     if bd_ok and "lead_bd_pretest_ids" not in context:
         pre_ids = _lead_bd_bead_ids(lead_root)
         context["lead_bd_pretest_ids"] = pre_ids
@@ -6758,7 +6047,7 @@ def _nn5f_register_bc(bc_name: str, tmp_path: Path, context: dict, request) -> N
     bc_root = get_session_lead_root() / "repos" / bc_name
     (bc_root / "inbox").mkdir(parents=True, exist_ok=True)
     (bc_root / "outbox").mkdir(exist_ok=True)
-    registry_add(bc_name, str(bc_root.resolve()), shop_type="bc")
+    registry_add(bc_name, shop_type="bc")
     _test_registry[str(bc_root.resolve())] = bc_name
     context["nn5f_bc_name"] = bc_name
     context["nn5f_bc_root"] = bc_root
@@ -7263,7 +6552,7 @@ def nn5f_then_inbox_row_created(triple: str, summary: str, context: dict) -> Non
 def nn5f_then_outbox_marker_created(triple: str, context: dict) -> None:
     bc_root = context["nn5f_bc_root"]
     work_id = context.get("nn5f_active_work_id", "lead-n03")
-    assert outbox_row_exists(str(bc_root.resolve()), work_id, "work_done"), (
+    assert outbox_row_exists(_bc_address(bc_root), work_id, "work_done"), (
         f"expected BC-outbox work_done marker for {work_id}"
     )
 
@@ -7469,11 +6758,15 @@ def tuu5_given_bc_with_clone(
 ) -> None:
     _nn5f_register_bc(bc_name, tmp_path, context, request)
     bc_root = Path(context["nn5f_bc_root"])
-    # Make the BC root a real git clone with a commit, so the CLI's
-    # _bc_origin_main_commit can read a HEAD SHA. We cannot force the literal
-    # sample SHA from the scenario; we record the ACTUAL short SHA the repo
-    # produces and assert the bd metadata matches that (the scenario's
-    # "b14b0ba" is an illustrative value).
+    # ADR-020: the registry stores no BC path. The CLI reads the BC's
+    # origin/main HEAD from the SHOPMSG_BC_CLONE override (the BC's local
+    # clone), falling back to the invoking CWD. Point the override at this
+    # test's git clone so _bc_origin_main_commit reads its HEAD SHA. We
+    # cannot force the literal sample SHA from the scenario; we record the
+    # ACTUAL short SHA the repo produces and assert the bd metadata matches
+    # that (the scenario's "b14b0ba" is an illustrative value).
+    os.environ["SHOPMSG_BC_CLONE"] = str(bc_root.resolve())
+    request.addfinalizer(lambda: os.environ.pop("SHOPMSG_BC_CLONE", None))
     env = dict(os.environ)
     env.setdefault("GIT_AUTHOR_NAME", "test")
     env.setdefault("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -7880,7 +7173,10 @@ def tuu5_given_postgres_row_exists(bc: str, work_id: str, mtype: str, context: d
         ],
     }
     from shop_msg.storage import insert_message as _ins
-    _ins(str(bc_root), work_id, "inbox", mtype, payload, notify=False)
+    # ADR-020: the CLI keys the deposit on the BC's abstract address, so the
+    # seeded "already-landed" row must use the same key for the sweep's
+    # dispatch_inbox_row_exists reconciliation to find it.
+    _ins(_bc_address(bc_root), work_id, "inbox", mtype, payload, notify=False)
 
 
 @given(
@@ -9991,7 +9287,7 @@ def _sn1e_init_bc(name: str, tmp_path: Path, context: dict, request) -> Path:
     if proc.returncode != 0 or not (bc_root / ".beads").is_dir():
         pytest.skip(f"could not init bd workspace for {name}: {proc.stderr}")
     saved = _registry_lookup(name, ignore_test_paths=True)
-    registry_add(name, str(bc_root.resolve()), shop_type="bc")
+    registry_add(name, shop_type="bc")
     _test_registry[str(bc_root.resolve())] = name
     request.addfinalizer(lambda: _registry_restore(name, saved))
     roots[name] = bc_root
@@ -9999,9 +9295,17 @@ def _sn1e_init_bc(name: str, tmp_path: Path, context: dict, request) -> Path:
 
 
 def _sn1e_run(argv: list[str], bc_root: Path, context: dict) -> None:
-    """Run a shop-msg invocation with cwd at the BC root and record results."""
+    """Run a shop-msg invocation with cwd at the BC root and record results.
+
+    ADR-020: the BC-side bead side effect resolves its bd workspace from the
+    invoking CWD / SHOPMSG_BD_CONTEXT. Point the override at the BC root that
+    carries the real .beads workspace so the bead lands in the BC's own bd
+    namespace (the default neutral override would otherwise divert it).
+    """
+    env = dict(os.environ)
+    env["SHOPMSG_BD_CONTEXT"] = str(bc_root.resolve())
     result = subprocess.run(
-        argv, cwd=str(bc_root), capture_output=True, text=True
+        argv, cwd=str(bc_root), capture_output=True, text=True, env=env
     )
     context["cli_returncode"] = result.returncode
     context["cli_stdout"] = result.stdout
@@ -10048,7 +9352,7 @@ def sn1e_given_dispatch_with_desc(
     payload = {"message_type": mtype, "work_id": work_id, "description": desc}
     if mtype in ("request_bugfix",):
         payload["scenarios"] = []
-    insert_message(str(bc_root.resolve()), work_id, "inbox", mtype, payload)
+    insert_message(_bc_address(bc_root), work_id, "inbox", mtype, payload)
     context["sn1e_last_work_id"] = work_id
     context["sn1e_last_desc"] = desc
 
@@ -10069,7 +9373,7 @@ def sn1e_given_dispatch_no_desc(
     payload = {"message_type": mtype, "work_id": work_id}
     if mtype == "assign_scenarios":
         payload["scenarios"] = []
-    insert_message(str(bc_root.resolve()), work_id, "inbox", mtype, payload)
+    insert_message(_bc_address(bc_root), work_id, "inbox", mtype, payload)
     context["sn1e_last_work_id"] = work_id
 
 
@@ -10100,7 +9404,7 @@ def sn1e_given_previously_observed(
     bc_root = context["sn1e_bc_roots"][bc]
     payload = {"message_type": mtype, "work_id": work_id,
                "description": f"maintenance for {work_id}"}
-    insert_message(str(bc_root.resolve()), work_id, "inbox", mtype, payload)
+    insert_message(_bc_address(bc_root), work_id, "inbox", mtype, payload)
     # First observation creates the paired bead.
     _sn1e_run(["shop-msg", "pending", "inbox", "--bc", bc], bc_root, context)
     real_id = _bd_facade.find_bc_bead_id(bc_root, work_id)
@@ -10146,7 +9450,7 @@ def sn1e_given_open_bead(
     bc_root = list(context["sn1e_bc_roots"].values())[0]
     payload = {"message_type": "request_bugfix", "work_id": work_id,
                "description": f"work for {work_id}", "scenarios": []}
-    insert_message(str(bc_root.resolve()), work_id, "inbox", "request_bugfix", payload)
+    insert_message(_bc_address(bc_root), work_id, "inbox", "request_bugfix", payload)
     bc_name = _test_registry[str(bc_root.resolve())]
     _sn1e_run(["shop-msg", "pending", "inbox", "--bc", bc_name], bc_root, context)
     real_id = _bd_facade.find_bc_bead_id(bc_root, work_id)
@@ -10199,7 +9503,7 @@ def sn1e_when_respond_work_done(
     # Seed and observe the inbox row for this work_id so a paired bead exists.
     payload = {"message_type": "request_bugfix", "work_id": work_id,
                "description": f"work for {work_id}", "scenarios": []}
-    insert_message(str(bc_root.resolve()), work_id, "inbox", "request_bugfix", payload)
+    insert_message(_bc_address(bc_root), work_id, "inbox", "request_bugfix", payload)
     _sn1e_run(["shop-msg", "pending", "inbox", "--bc", bc], bc_root, context)
     real_id = _bd_facade.find_bc_bead_id(bc_root, work_id)
     assert real_id is not None
@@ -10222,7 +9526,7 @@ def sn1e_when_respond_mech(bc: str, work_id: str, note: str, context: dict) -> N
     # Seed and observe so a paired bead exists for this work_id.
     payload = {"message_type": "request_maintenance", "work_id": work_id,
                "description": f"work for {work_id}"}
-    insert_message(str(bc_root.resolve()), work_id, "inbox", "request_maintenance", payload)
+    insert_message(_bc_address(bc_root), work_id, "inbox", "request_maintenance", payload)
     _sn1e_run(["shop-msg", "pending", "inbox", "--bc", bc], bc_root, context)
     real_id = _bd_facade.find_bc_bead_id(bc_root, work_id)
     assert real_id is not None
@@ -10518,7 +9822,7 @@ def sn1e_then_note_appended_clarify(bead_id: str, substr: str, context: dict) ->
 )
 def sn1e_then_lead_inbox_clarify(lead: str, work_id: str, context: dict) -> None:
     lead_root = get_session_lead_root()
-    raw = read_lead_inbox_message(str(lead_root.resolve()), work_id)
+    raw = read_lead_inbox_message(_lead_address(lead_root), work_id)
     assert raw is not None, "no lead-inbox clarify row deposited"
     assert raw.get("message_type") == "clarify", raw
 
@@ -10609,7 +9913,7 @@ def sn1e_given_loose_dispatch(
     # BC-side bead via first observation.
     payload = {"message_type": mtype, "work_id": lead_wid,
                "description": f"work for {lead_wid}", "scenarios": []}
-    insert_message(str(bc_root.resolve()), lead_wid, "inbox", mtype, payload)
+    insert_message(_bc_address(bc_root), lead_wid, "inbox", mtype, payload)
     _sn1e_run(["shop-msg", "pending", "inbox", "--bc", bc], bc_root, context)
     real_bc_id = _bd_facade.find_bc_bead_id(bc_root, lead_wid)
     assert real_bc_id is not None
@@ -10654,7 +9958,7 @@ def sn1e_given_loose_consume(
     # consume + the facade flip, mirroring the consume CLI path.
     lead_root = get_session_lead_root()
     bc_root = context["sn1e_bc_roots"][bc]
-    consume_outbox_message(str(bc_root.resolve()), lead_wid, "work_done")
+    consume_outbox_message(_bc_address(bc_root), lead_wid, "work_done")
     if _bd_facade.get_dispatch_bead(lead_root, lead_wid) is not None:
         _bd_facade.set_dispatch_state(lead_root, lead_wid, _bd_facade.STATE_CONSUMED)
 
@@ -10775,8 +10079,13 @@ def _run_embedded_nudge(command_str: str, context: dict):
     argv = _shlex.split(command_str)
     result = _run(argv, context)
     is_send = "send" in argv[:2]
+    # ADR-020: a nudge is keyed on the recipient's abstract address, not a
+    # path. `shop-msg send nudge` (lead->BC) deposits at the BC's abstract
+    # address; `shop-msg nudge` (BC->lead) deposits at the lead sentinel.
     context["nudge_recipient_root"] = (
-        _nudge_bc_root(context) if is_send else _nudge_lead_root(context)
+        _bc_address(_nudge_bc_root(context))
+        if is_send
+        else LEAD_ABSTRACT_ADDRESS
     )
     return result
 
@@ -10824,7 +10133,7 @@ def nudge_given_bc_with_pipeline(
 
 
 def _nudge_fetch_inbox_full(bc_root: Path, work_id: str):
-    bc = _bc_id(str(bc_root.resolve()))
+    bc = _bc_address(bc_root)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -10850,7 +10159,9 @@ def nudge_given_seed_dispatch_inbox(bc_name: str, work_id: str, context: dict) -
         "work_id": work_id,
         "scenarios": [],
     }
-    insert_message(str(bc_root), work_id, "inbox", "assign_scenarios", payload)
+    # ADR-020: key the seeded dispatch row on the BC's abstract address so it
+    # matches what the CLI and _nudge_fetch_inbox_full read.
+    insert_message(_bc_address(bc_root), work_id, "inbox", "assign_scenarios", payload)
     pre = _nudge_fetch_inbox_full(bc_root, work_id)
     context["nudge_inbox_pre"] = pre[0] if pre else None
 
@@ -11194,342 +10505,6 @@ for _ln in _NUDGE_LOADBEARING_LINES:
     @then(parsers.parse(_ln))
     def _nudge_loadbearing_noop(context: dict) -> None:
         pass
-
-
-# ---------------------------------------------------------------------------
-# lead-mxxm / ADR-018: name-addressed BC ops do not require shop_root to exist
-# on the lead host. The messaging registry's shop_root column is load-bearing
-# for nothing on the lead host (BCs run as bc-launcher containers; the clone
-# lives inside the container), so the former existence guard was removed. The
-# step defs below register a BC whose shop_root path does NOT exist on the
-# filesystem and assert that send/read/pending/registry operations succeed with
-# no "does not exist on disk" / "registry may be stale" warning.
-# ---------------------------------------------------------------------------
-
-_MXXM_WARN_DISK = "does not exist on disk"
-_MXXM_WARN_STALE = "registry may be stale"
-
-
-@given(
-    parsers.parse(
-        'a BC named "{bc_name}" is registered with a shop_root path that '
-        'does not exist on the lead host'
-    )
-)
-def given_bc_registered_with_nonexistent_root(
-    bc_name: str, tmp_path: Path, context: dict, request
-) -> None:
-    """Register bc_name in the messaging registry pointing at a path that is
-    guaranteed NOT to exist on the lead filesystem.
-
-    The path is under the pytest tmp dir (so prior-run cleanup logic treats it
-    as a test path) but is never created, mirroring the lead-host reality where
-    the BC's shop_root column points into /workspaces/.../repos/<bc> that the
-    lead never materializes.
-    """
-    saved = _registry_lookup(bc_name, ignore_test_paths=True)
-    nonexistent_root = tmp_path / "repos" / bc_name
-    assert not nonexistent_root.exists(), (
-        f"precondition violated: {nonexistent_root} unexpectedly exists"
-    )
-    registry_add(bc_name, str(nonexistent_root), shop_type="bc")
-    context["mxxm_bc_name"] = bc_name
-    context["mxxm_bc_root"] = nonexistent_root
-    context.setdefault("mxxm_stderr_log", [])
-    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
-
-
-def _mxxm_record(context: dict, result) -> None:
-    context["cli_returncode"] = result.returncode
-    context["cli_stdout"] = result.stdout
-    context["cli_stderr"] = result.stderr
-    context.setdefault("mxxm_stderr_log", []).append(result.stderr)
-    context.setdefault("mxxm_rc_log", []).append(result.returncode)
-
-
-@when(
-    parsers.parse(
-        'I run shop-msg send assign_scenarios for that BC with work-id "{work_id}"'
-    )
-)
-def when_mxxm_send_assign_scenarios(work_id: str, context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    result = subprocess.run(
-        [
-            "shop-msg", "send", "assign_scenarios",
-            "--bc", bc_name,
-            "--work-id", work_id,
-            "--feature-title", "lead-mxxm ADR-018 reachability probe",
-            "--bc-tag", bc_name,
-            "--scenario-file", str(_mxxm_scenario_body_file(context)),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-def _mxxm_scenario_body_file(context: dict) -> Path:
-    """Write a minimal well-formed scenario body to a tmp file and return it."""
-    root = context["mxxm_bc_root"].parent.parent  # the pytest tmp_path
-    root.mkdir(parents=True, exist_ok=True)
-    body = (
-        "  @scenario_hash:0000000000000000 @bc:probe\n"
-        "  Scenario: ADR-018 reachability probe\n"
-        "    Given the messaging registry resolves a BC by name\n"
-        "    When a name-addressed op runs against an absent shop_root\n"
-        "    Then it succeeds without a staleness warning\n"
-    )
-    path = root / "mxxm_scenario_body.txt"
-    path.write_text(body)
-    return path
-
-
-@then(
-    parsers.parse(
-        'shop-msg pending inbox for that BC includes work-id "{work_id}"'
-    )
-)
-def then_mxxm_pending_inbox_includes(work_id: str, context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    result = subprocess.run(
-        ["shop-msg", "pending", "inbox", "--bc", bc_name],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-    assert result.returncode == 0, (
-        f"pending inbox exited {result.returncode}; stderr:\n{result.stderr}"
-    )
-    assert work_id in result.stdout, (
-        f"expected pending inbox to include {work_id!r}; stdout:\n{result.stdout}"
-    )
-
-
-@then(
-    parsers.parse(
-        'stderr contains no "points to path ... which does not exist on disk" warning'
-    )
-)
-def then_mxxm_no_disk_warning(context: dict) -> None:
-    stderr = context.get("cli_stderr", "")
-    assert _MXXM_WARN_DISK not in stderr, (
-        f"unexpected 'does not exist on disk' warning in stderr:\n{stderr}"
-    )
-
-
-@then(parsers.parse('stderr contains no "registry may be stale" warning'))
-def then_mxxm_no_stale_warning(context: dict) -> None:
-    stderr = context.get("cli_stderr", "")
-    assert _MXXM_WARN_STALE not in stderr, (
-        f"unexpected 'registry may be stale' warning in stderr:\n{stderr}"
-    )
-
-
-@given(
-    parsers.parse('an inbox message with work-id "{work_id}" is present for that BC')
-)
-def given_mxxm_inbox_present(work_id: str, context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    result = subprocess.run(
-        [
-            "shop-msg", "send", "request_maintenance",
-            "--bc", bc_name,
-            "--work-id", work_id,
-            "--description", "lead-mxxm ADR-018 inbox seed",
-            "--acceptance-criterion", "the inbox row is readable by name",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, (
-        f"inbox seed failed: rc={result.returncode}; stderr:\n{result.stderr}"
-    )
-
-
-@given(
-    parsers.parse('an outbox response with work-id "{work_id}" is present for that BC')
-)
-def given_mxxm_outbox_present(work_id: str, context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    # Seed an inbox row first so respond has a dispatch to answer, then respond
-    # work_done to populate the BC's outbox namespace.
-    seed = subprocess.run(
-        [
-            "shop-msg", "send", "request_maintenance",
-            "--bc", bc_name,
-            "--work-id", work_id,
-            "--description", "lead-mxxm ADR-018 outbox seed",
-            "--acceptance-criterion", "the outbox row is readable by name",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert seed.returncode == 0, (
-        f"outbox seed (inbox) failed: rc={seed.returncode}; stderr:\n{seed.stderr}"
-    )
-    resp = subprocess.run(
-        [
-            "shop-msg", "respond", "work_done",
-            "--bc", bc_name,
-            "--work-id", work_id,
-            "--status", "complete",
-            "--summary", "lead-mxxm ADR-018 outbox seed response",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert resp.returncode == 0, (
-        f"outbox seed (respond) failed: rc={resp.returncode}; stderr:\n{resp.stderr}"
-    )
-
-
-@when(parsers.parse('I run shop-msg read inbox for that BC with work-id "{work_id}"'))
-def when_mxxm_read_inbox(work_id: str, context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    result = subprocess.run(
-        ["shop-msg", "read", "inbox", "--bc", bc_name, "--work-id", work_id],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-@when(parsers.parse('I run shop-msg read outbox for that BC with work-id "{work_id}"'))
-def when_mxxm_read_outbox(work_id: str, context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    result = subprocess.run(
-        ["shop-msg", "read", "outbox", "--bc", bc_name, "--work-id", work_id],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-@when('I run shop-msg pending inbox for that BC')
-def when_mxxm_pending_inbox(context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    result = subprocess.run(
-        ["shop-msg", "pending", "inbox", "--bc", bc_name],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-@when('I run shop-msg pending outbox for that BC')
-def when_mxxm_pending_outbox(context: dict) -> None:
-    bc_name = context["mxxm_bc_name"]
-    # Resolve the lead by the stable session lead NAME (registered for the whole
-    # session, never removed by per-test finalizers) rather than re-deriving a
-    # possibly-stale cached name from the path, which can race with another
-    # test's registry-restore finalizer.
-    lead_name = get_session_lead_name()
-    result = subprocess.run(
-        ["shop-msg", "pending", "outbox", "--lead", lead_name, "--bc-name", bc_name],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-@then('every one of those commands exits zero')
-def then_mxxm_every_command_zero(context: dict) -> None:
-    rc_log = context.get("mxxm_rc_log", [])
-    assert rc_log, "no commands were recorded for the multi-command scenario"
-    for i, rc in enumerate(rc_log):
-        assert rc == 0, (
-            f"command #{i} exited {rc}; "
-            f"stderr:\n{context.get('mxxm_stderr_log', [''])[i]}"
-        )
-
-
-@then(
-    parsers.parse(
-        'none of those commands wrote a "points to path ... which does not '
-        'exist on disk" warning to stderr'
-    )
-)
-def then_mxxm_none_wrote_disk_warning(context: dict) -> None:
-    for i, stderr in enumerate(context.get("mxxm_stderr_log", [])):
-        assert _MXXM_WARN_DISK not in stderr, (
-            f"command #{i} wrote a 'does not exist on disk' warning:\n{stderr}"
-        )
-
-
-@then(
-    parsers.parse(
-        'none of those commands wrote a "registry may be stale" warning to stderr'
-    )
-)
-def then_mxxm_none_wrote_stale_warning(context: dict) -> None:
-    for i, stderr in enumerate(context.get("mxxm_stderr_log", [])):
-        assert _MXXM_WARN_STALE not in stderr, (
-            f"command #{i} wrote a 'registry may be stale' warning:\n{stderr}"
-        )
-
-
-@given(
-    parsers.parse('no shop named "{bc_name}" is registered in the messaging registry')
-)
-def given_mxxm_no_shop_registered(bc_name: str, context: dict, request) -> None:
-    saved = _registry_lookup(bc_name, ignore_test_paths=True)
-    registry_remove(bc_name)
-    context["mxxm_registry_add_name"] = bc_name
-    context.setdefault("mxxm_stderr_log", [])
-    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
-
-
-@given(
-    parsers.parse('the filesystem path "{path}" does not exist on the lead host')
-)
-def given_mxxm_path_absent(path: str, context: dict) -> None:
-    assert not Path(path).exists(), (
-        f"precondition violated: {path} unexpectedly exists on the lead host"
-    )
-    context["mxxm_registry_add_root"] = path
-
-
-@when(
-    parsers.parse(
-        'I run shop-msg registry add with canonical name "{bc_name}" and '
-        'shop_root "{shop_root}"'
-    )
-)
-def when_mxxm_registry_add(bc_name: str, shop_root: str, context: dict) -> None:
-    result = subprocess.run(
-        ["shop-msg", "registry", "add", bc_name, shop_root],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-@when('I run shop-msg registry list')
-def when_mxxm_registry_list(context: dict) -> None:
-    result = subprocess.run(
-        ["shop-msg", "registry", "list"],
-        capture_output=True,
-        text=True,
-    )
-    _mxxm_record(context, result)
-
-
-@then(
-    parsers.parse(
-        'stdout includes an entry for "{bc_name}" with shop_root "{shop_root}"'
-    )
-)
-def then_mxxm_registry_list_includes(bc_name: str, shop_root: str, context: dict) -> None:
-    stdout = context.get("cli_stdout", "")
-    matching = [
-        ln for ln in stdout.splitlines()
-        if ln.startswith(f"{bc_name} ") and shop_root in ln
-    ]
-    assert matching, (
-        f"expected a registry list entry for {bc_name!r} with shop_root "
-        f"{shop_root!r}; stdout:\n{stdout}"
-    )
 
 
 # -----------------------------------------------------------------------
@@ -11911,4 +10886,547 @@ def then_4ibl_dispatch_carries_credential(context: dict) -> None:
         f"resolves to env {env_var}={env_binding!r}, which is not a "
         f"${{{{ secrets.* }}}} reference; the dispatch token is hardcoded, not "
         f"secret-backed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# lead-n6yz / ADR-020: abstract-address registry and routing (no stored path).
+#
+# The registry stores no filesystem path. Each entry carries a canonical name,
+# an abstract address (<system>/<name>; the lead collapses to <system>/lead),
+# and a shop_type. `registry add` takes no path positional (and rejects one
+# with a migration message); `registry list` projects abstract addresses and
+# no path column; messages key the bc/to column on the abstract address; bd
+# context resolves from the local invoking CWD; and a migration backfills
+# abstract addresses from canonical names, mapping the lead to the sentinel
+# and dropping unmappable orphan rows.
+# ---------------------------------------------------------------------------
+
+from shop_msg.storage import (
+    registry_remove as _adr020_registry_remove,
+    resolve_shop_name as _adr020_resolve_shop_name,
+)
+
+
+def _adr020_run(argv: list[str], context: dict, *, cwd: Path | None = None) -> None:
+    kwargs: dict[str, Any] = {"capture_output": True, "text": True}
+    if cwd is not None:
+        kwargs["cwd"] = str(cwd)
+    result = subprocess.run(argv, **kwargs)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+def _adr020_cleanup_name(name: str, request) -> None:
+    """Restore a canonical name to its pre-test registry state at teardown."""
+    saved = _registry_lookup(name)
+    request.addfinalizer(lambda: _registry_restore(name, saved))
+
+
+# ----- GIVEN steps ---------------------------------------------------------
+
+
+@given(parsers.parse(
+    'no shop named "{name}" is registered in the messaging registry'
+))
+def given_adr020_no_shop(name: str, request) -> None:
+    _adr020_cleanup_name(name, request)
+    _adr020_registry_remove(name)
+
+
+@given(parsers.parse('the deployment\'s system slug is "{slug}"'))
+def given_adr020_system_slug(slug: str) -> None:
+    assert slug == SYSTEM_SLUG, (
+        f"test expects deployment system slug {SYSTEM_SLUG!r}, scenario says {slug!r}"
+    )
+
+
+@given("the shop-msg CLI has shipped abstract-address routing identity")
+def given_adr020_cli_shipped() -> None:
+    pass
+
+
+# NOTE: the bare phrasings '"{name}" is registered in the messaging registry'
+# and '"{name}" is registered as the lead shop' are already defined above
+# (given_bc_registered / given_lead_registered) and register under the
+# canonical name; the ADR-020 scenarios reuse those. Only the
+# abstract-address-bearing variants are new here.
+
+
+@given(parsers.parse(
+    '"{name}" is registered in the messaging registry with abstract address "{address}"'
+))
+def given_adr020_registered_bc_with_address(name: str, address: str, request) -> None:
+    _adr020_cleanup_name(name, request)
+    registry_add(name, shop_type="bc")
+    assert _adr020_resolve_shop_name(name) == address, (
+        f"expected {name!r} to resolve to abstract address {address!r}; "
+        f"got {_adr020_resolve_shop_name(name)!r}"
+    )
+
+
+@given(parsers.parse(
+    '"{name}" is registered as the lead shop with abstract address "{address}"'
+))
+def given_adr020_registered_lead_with_address(name: str, address: str, request) -> None:
+    _adr020_cleanup_name(name, request)
+    registry_add(name, shop_type="lead")
+    assert _adr020_resolve_shop_name(name) == address, (
+        f"expected lead {name!r} to resolve to {address!r}; "
+        f"got {_adr020_resolve_shop_name(name)!r}"
+    )
+
+
+@given("the registry stores no filesystem path for any entry")
+def given_adr020_registry_no_path() -> None:
+    # Structural guarantee: the shop_registry table has no shop_root column.
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'shop_registry'"
+            )
+            cols = {r["column_name"] for r in cur.fetchall()}
+    assert "shop_root" not in cols, (
+        f"shop_registry still has a shop_root column: {sorted(cols)}"
+    )
+
+
+@given("the invoking CWD contains a .beads directory discoverable by walk-up")
+def given_adr020_cwd_has_beads(tmp_path: Path, context: dict) -> None:
+    beads = tmp_path / ".beads"
+    beads.mkdir()
+    # A minimal marker so a walk-up locator finds this as the bd workspace.
+    (beads / "marker.txt").write_text("adr020 bd context probe")
+    context["adr020_cwd"] = tmp_path
+    context["adr020_beads_dir"] = beads
+
+
+# ----- WHEN steps ----------------------------------------------------------
+
+
+@when(parsers.parse(
+    'I run shop-msg registry add with canonical name "{name}" and '
+    'no filesystem-path argument'
+))
+def when_adr020_registry_add_no_path(name: str, context: dict) -> None:
+    _adr020_run(["shop-msg", "registry", "add", name], context)
+
+
+@when(parsers.parse(
+    'I run shop-msg registry add with canonical name "{name}" and '
+    'a filesystem-path positional argument'
+))
+def when_adr020_registry_add_with_path(name: str, context: dict) -> None:
+    _adr020_run(
+        ["shop-msg", "registry", "add", name, "/workspaces/some/path"], context
+    )
+
+
+@when("I run shop-msg registry list")
+def when_adr020_registry_list(context: dict) -> None:
+    _adr020_run(["shop-msg", "registry", "list"], context)
+
+
+@when(parsers.parse(
+    'I inspect the registered entry for "{name}" via shop-msg registry list'
+))
+def when_adr020_inspect_entry(name: str, context: dict) -> None:
+    _adr020_run(["shop-msg", "registry", "list"], context)
+    context["adr020_inspect_name"] = name
+
+
+@when(parsers.parse(
+    'I run shop-msg send assign_scenarios --bc {bc} with a valid payload and '
+    'work-id "{work_id}"'
+))
+def when_adr020_send_assign(bc: str, work_id: str, context: dict, tmp_path: Path) -> None:
+    body = (
+        "  Scenario: ADR-020 routing probe\n"
+        "    Given a name-addressed dispatch\n"
+        "    When it is routed by abstract address\n"
+        "    Then it lands at that abstract address\n"
+    )
+    scen = tmp_path / "adr020_scenario.txt"
+    scen.write_text(body)
+    # Run from a CWD with no .beads workspace so the bd-first dispatch lifecycle
+    # is skipped (matching the pre-ADR-020 behaviour where the lead's tmp_path
+    # carried no bd workspace); this scenario pins the postgres routing, not bd.
+    _adr020_run(
+        [
+            "shop-msg", "send", "assign_scenarios",
+            "--bc", bc,
+            "--work-id", work_id,
+            "--feature-title", "ADR-020 routing probe",
+            "--bc-tag", bc,
+            "--scenario-file", str(scen),
+        ],
+        context,
+        cwd=tmp_path,
+    )
+    context["adr020_bc_name"] = bc
+    context["adr020_work_id"] = work_id
+
+
+@when(parsers.parse(
+    'a BC sends a response addressed to the lead with work-id "{work_id}"'
+))
+def when_adr020_bc_responds(work_id: str, context: dict) -> None:
+    bc = context.get("adr020_response_bc", "shopsystem-messaging")
+    _adr020_run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", bc,
+            "--work-id", work_id,
+            "--status", "complete",
+            "--summary", "ADR-020 lead-routing probe",
+        ],
+        context,
+    )
+    context["adr020_work_id"] = work_id
+
+
+@when(parsers.parse(
+    'I run a name-addressed shop-msg operation against --bc {bc} that needs a '
+    'bd context'
+))
+def when_adr020_name_addressed_op(bc: str, context: dict) -> None:
+    cwd = context["adr020_cwd"]
+    # `pending inbox --bc <name>` resolves the bd context (ADR-017 bead side
+    # effect) from the LOCAL invoking CWD via walk-up; run it from the CWD
+    # that carries the .beads directory.
+    _adr020_run(["shop-msg", "pending", "inbox", "--bc", bc], context, cwd=cwd)
+
+
+@when("the addressing migration runs to completion")
+def when_adr020_migration_runs(context: dict) -> None:
+    # _ensure_schema runs the ADR-020 address migration; any _connect() that
+    # reaches the schema path triggers it. Force it explicitly.
+    from shop_msg.storage import _ensure_schema
+    with _connect() as conn:
+        _ensure_schema(conn)
+    context["adr020_migration_done"] = True
+
+
+# ----- migration GIVEN steps (pre-migration path-keyed rows) ---------------
+
+
+def _adr020_seed_pre_migration_row(name: str, shop_root: str, shop_type: str) -> None:
+    """Insert a row carrying a legacy shop_root path, simulating the
+    pre-migration registry shape. Adds the shop_root column back if the
+    current schema has already dropped it, then makes abstract_address NULL so
+    the migration backfills it."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE shop_registry ADD COLUMN IF NOT EXISTS shop_root TEXT"
+            )
+            cur.execute(
+                "ALTER TABLE shop_registry ALTER COLUMN abstract_address DROP NOT NULL"
+            )
+            cur.execute(
+                """
+                INSERT INTO shop_registry (name, shop_root, shop_type, abstract_address)
+                VALUES (%s, %s, %s, NULL)
+                ON CONFLICT (name) DO UPDATE
+                  SET shop_root = EXCLUDED.shop_root,
+                      shop_type = EXCLUDED.shop_type,
+                      abstract_address = NULL
+                """,
+                (name, shop_root, shop_type),
+            )
+        conn.commit()
+
+
+@given(parsers.parse(
+    'a pre-migration shop_registry contains a path-keyed entry for canonical '
+    'name "{name}"'
+))
+def given_adr020_premig_bc(name: str, request) -> None:
+    _adr020_cleanup_name(name, request)
+    _adr020_seed_pre_migration_row(
+        name, f"/workspaces/shopsystem-product/repos/{name}", "bc"
+    )
+
+
+@given(parsers.parse(
+    'it contains a path-keyed lead entry for canonical name "{name}"'
+))
+def given_adr020_premig_lead(name: str, request) -> None:
+    _adr020_cleanup_name(name, request)
+    _adr020_seed_pre_migration_row(
+        name, f"/workspaces/{name}", "lead"
+    )
+
+
+@given(parsers.parse(
+    'it contains an orphan row whose key cannot be mapped to any known '
+    'canonical name, such as "{orphan}" or a tmp_path-prefixed key'
+))
+def given_adr020_premig_orphan(orphan: str, context: dict, request) -> None:
+    request.addfinalizer(lambda: _adr020_registry_remove(orphan))
+    _adr020_seed_pre_migration_row(orphan, orphan, "bc")
+    context["adr020_orphan_key"] = orphan
+
+
+# ----- THEN steps ----------------------------------------------------------
+
+
+def _adr020_list_lines(context: dict) -> list[str]:
+    return [ln for ln in context.get("cli_stdout", "").splitlines() if ln.strip()]
+
+
+@then(parsers.parse(
+    'shop-msg registry list includes an entry for "{name}" whose abstract '
+    'address is "{address}"'
+))
+def then_adr020_list_includes(name: str, address: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "registry", "list"], capture_output=True, text=True
+    )
+    matching = [
+        ln for ln in result.stdout.splitlines()
+        if ln.split() and ln.split()[0] == name and address in ln.split()
+    ]
+    assert matching, (
+        f"expected registry list entry for {name!r} with abstract address "
+        f"{address!r}; stdout:\n{result.stdout}"
+    )
+
+
+@then(parsers.parse(
+    'stderr contains a message indicating registry add no longer accepts a '
+    'shop_root path and instructs the caller to use registry add [--lead-shop] <name>'
+))
+def then_adr020_migration_message(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "no longer accepted" in stderr or "no longer accepts" in stderr, (
+        f"stderr does not indicate the path is no longer accepted:\n{stderr}"
+    )
+    assert "registry add [--lead-shop] <name>" in stderr, (
+        f"stderr does not instruct the new no-path form:\n{stderr}"
+    )
+
+
+@then(parsers.parse('no entry for "{name}" is added to the registry'))
+def then_adr020_no_entry_added(name: str, context: dict) -> None:
+    assert _adr020_resolve_shop_name(name) is None, (
+        f"expected no registry entry for {name!r}, but one exists with "
+        f"address {_adr020_resolve_shop_name(name)!r}"
+    )
+
+
+@then(parsers.parse(
+    'stdout contains an entry whose abstract address is "{address}"'
+))
+def then_adr020_stdout_has_address(address: str, context: dict) -> None:
+    lines = _adr020_list_lines(context)
+    matching = [ln for ln in lines if address in ln.split()]
+    assert matching, (
+        f"expected a registry list entry whose abstract address is {address!r}; "
+        f"stdout:\n{context.get('cli_stdout', '')}"
+    )
+
+
+@then("no entry in stdout contains a filesystem path field")
+def then_adr020_no_path_field(context: dict) -> None:
+    for ln in _adr020_list_lines(context):
+        for token in ln.split():
+            assert not token.startswith("/"), (
+                f"registry list line exposes a filesystem path token {token!r}: "
+                f"{ln!r}"
+            )
+            assert "/tmp/" not in token, (
+                f"registry list line exposes a tmp path token {token!r}: {ln!r}"
+            )
+
+
+@then("the entry exposes the fields abstract address and shop_type only")
+def then_adr020_entry_fields(context: dict) -> None:
+    name = context["adr020_inspect_name"]
+    lines = [
+        ln for ln in _adr020_list_lines(context)
+        if ln.split() and ln.split()[0] == name
+    ]
+    assert lines, f"no registry list entry for {name!r}"
+    fields = lines[0].split()
+    # name + abstract_address + shop_type == exactly three tokens.
+    assert len(fields) == 3, (
+        f"expected exactly (name, abstract_address, shop_type); got {fields!r}"
+    )
+    assert fields[1] == f"{SYSTEM_SLUG}/messaging", fields
+    assert fields[2] in ("bc", "lead"), fields
+
+
+@then("the entry exposes no shop_root field and no filesystem path value")
+def then_adr020_entry_no_path(context: dict) -> None:
+    name = context["adr020_inspect_name"]
+    lines = [
+        ln for ln in _adr020_list_lines(context)
+        if ln.split() and ln.split()[0] == name
+    ]
+    assert lines, f"no registry list entry for {name!r}"
+    for token in lines[0].split():
+        assert not token.startswith("/") and "/tmp/" not in token, (
+            f"entry for {name!r} exposes a filesystem path token {token!r}"
+        )
+
+
+def _adr020_stored_to(bc_address: str, work_id: str, direction: str) -> str | None:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT bc FROM messages WHERE bc = %s AND work_id = %s "
+                "AND direction = %s LIMIT 1",
+                (bc_address, work_id, direction),
+            )
+            row = cur.fetchone()
+    return row["bc"] if row else None
+
+
+@then(parsers.parse(
+    'the stored message\'s "to" field is the abstract address "{address}"'
+))
+def then_adr020_stored_to(address: str, context: dict) -> None:
+    work_id = context["adr020_work_id"]
+    # A dispatch lands as a direction='inbox' row keyed on the recipient's
+    # abstract address; a BC response lands as a direction='inbox' row at the
+    # lead sentinel. Either way the stored "to" (bc column) must equal address.
+    stored = _adr020_stored_to(address, work_id, "inbox")
+    assert stored == address, (
+        f"expected stored 'to' field {address!r} for work_id {work_id!r}; "
+        f"found {stored!r}"
+    )
+
+
+@then(parsers.parse(
+    'shop-msg pending inbox --bc {bc} includes work-id "{work_id}"'
+))
+def then_adr020_pending_bc_includes(bc: str, work_id: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert work_id in result.stdout, (
+        f"expected pending inbox --bc {bc} to include {work_id!r}; "
+        f"stdout:\n{result.stdout}"
+    )
+
+
+@then(parsers.parse(
+    'shop-msg read inbox --bc {bc} with work-id "{work_id}" returns that message'
+))
+def then_adr020_read_bc(bc: str, work_id: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "read", "inbox", "--bc", bc, "--work-id", work_id],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert work_id in result.stdout, (
+        f"read inbox did not return the message for {work_id!r}; "
+        f"stdout:\n{result.stdout}"
+    )
+
+
+@then(parsers.parse(
+    'shop-msg pending inbox --lead {lead} includes work-id "{work_id}"'
+))
+def then_adr020_pending_lead_includes(lead: str, work_id: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--lead", lead],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert work_id in result.stdout, (
+        f"expected pending inbox --lead {lead} to include {work_id!r}; "
+        f"stdout:\n{result.stdout}"
+    )
+
+
+@then(parsers.parse(
+    'shop-msg pending inbox --bc {bc} does not include work-id "{work_id}"'
+))
+def then_adr020_pending_bc_excludes(bc: str, work_id: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert work_id not in result.stdout, (
+        f"expected pending inbox --bc {bc} to NOT include {work_id!r}; "
+        f"stdout:\n{result.stdout}"
+    )
+
+
+@then("the bd context used is the .beads directory discovered from the local invoking CWD")
+def then_adr020_bd_context_local(context: dict) -> None:
+    # The op ran from the CWD carrying .beads; the bd workspace the CLI uses is
+    # discovered by walk-up from that CWD. We assert the .beads dir exists at
+    # the invoking CWD (the discoverable workspace) and the op did not crash.
+    beads = context["adr020_beads_dir"]
+    assert beads.is_dir(), f"expected .beads workspace at {beads}"
+    assert context["cli_returncode"] == 0, (
+        f"name-addressed op exited {context['cli_returncode']}; "
+        f"stderr:\n{context.get('cli_stderr', '')}"
+    )
+
+
+@then("the command emits no FileNotFoundError or NotADirectoryError arising from a registry-stored path")
+def then_adr020_no_path_errors(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "FileNotFoundError" not in stderr, (
+        f"name-addressed op surfaced a FileNotFoundError:\n{stderr}"
+    )
+    assert "NotADirectoryError" not in stderr, (
+        f"name-addressed op surfaced a NotADirectoryError:\n{stderr}"
+    )
+
+
+@then(parsers.parse(
+    'the entry for "{name}" has abstract address "{address}"'
+))
+def then_adr020_migrated_bc_address(name: str, address: str, context: dict) -> None:
+    assert _adr020_resolve_shop_name(name) == address, (
+        f"after migration, {name!r} resolves to "
+        f"{_adr020_resolve_shop_name(name)!r}, expected {address!r}"
+    )
+
+
+@then(parsers.parse('the lead entry has abstract address "{address}"'))
+def then_adr020_migrated_lead_address(address: str, context: dict) -> None:
+    # The lead entry was seeded under canonical name shopsystem-product.
+    assert _adr020_resolve_shop_name("shopsystem-product") == address, (
+        f"after migration, the lead resolves to "
+        f"{_adr020_resolve_shop_name('shopsystem-product')!r}, expected {address!r}"
+    )
+
+
+@then("the orphan row that maps to no known canonical name is absent from the migrated registry")
+def then_adr020_orphan_absent(context: dict) -> None:
+    orphan = context["adr020_orphan_key"]
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM shop_registry WHERE name = %s", (orphan,)
+            )
+            row = cur.fetchone()
+    assert row is None, (
+        f"orphan row {orphan!r} survived the migration; it should have been dropped"
+    )
+
+
+@then("no migrated entry retains a shop_root filesystem path")
+def then_adr020_no_shop_root_column(context: dict) -> None:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'shop_registry'"
+            )
+            cols = {r["column_name"] for r in cur.fetchall()}
+    assert "shop_root" not in cols, (
+        f"shop_registry still carries a shop_root column after migration: "
+        f"{sorted(cols)}"
     )

@@ -82,6 +82,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -291,37 +292,78 @@ def _apply_cwd_resolution(args: argparse.Namespace) -> None:
 
 
 def _resolve_bc(args: argparse.Namespace) -> str:
-    """Resolve --bc <name> to the bc_root path via the registry.
+    """Resolve --bc <name> to the BC's abstract address via the registry.
 
-    Exits non-zero if the name is not registered.
+    ADR-020 / PDR-007 Option A: the registry stores no filesystem path, so
+    resolution yields the BC's abstract address (``<system>/<name>``), which
+    is the value threaded through the storage layer as the messages
+    ``bc``/``to`` column key. Exits non-zero if the name is not registered.
     """
     name = args.bc
-    path = resolve_shop_name(name)
-    if path is None:
+    address = resolve_shop_name(name)
+    if address is None:
         print(
             f"shop-msg: shop name {name!r} is not registered in the registry. "
             f"Run 'shop-msg registry add' to register it first.",
             file=sys.stderr,
         )
         sys.exit(1)
-    return str(Path(path).resolve())
+    return address
 
 
 def _resolve_lead(args: argparse.Namespace) -> str:
-    """Resolve --lead <name> to the lead_root path via the registry.
+    """Resolve --lead <name> to the lead's abstract address via the registry.
 
-    Exits non-zero if the name is not registered.
+    ADR-020: the lead collapses to the sentinel abstract address
+    ``<system>/lead``. Exits non-zero if the name is not registered.
     """
     name = args.lead
-    path = resolve_shop_name(name)
-    if path is None:
+    address = resolve_shop_name(name)
+    if address is None:
         print(
             f"shop-msg: lead name {name!r} is not registered in the registry. "
             f"Run 'shop-msg registry add' to register it first.",
             file=sys.stderr,
         )
         sys.exit(1)
-    return str(Path(path).resolve())
+    return address
+
+
+def _invoking_bd_context() -> Path:
+    """Return the local invoking CWD as the bd working directory (ADR-020).
+
+    The registry stores no filesystem path, so a name-addressed shop-msg
+    operation resolves its bd context from the LOCAL invoking CWD (the
+    ``.beads`` workspace is discovered by walk-up from here). Returning the
+    CWD — never a registry-stored path — is what keeps name-addressed ops
+    from raising FileNotFoundError / NotADirectoryError off a registry path
+    that no longer exists (scenario f9910cf40291768c).
+
+    Test/operator seam: ``SHOPMSG_BD_CONTEXT``, when set, overrides the CWD
+    as the bd-context root. In production an agent invokes shop-msg from
+    within its own shop directory, so the CWD is the bd workspace; the
+    override lets a harness that invokes the CLI from a neutral directory
+    still point bd at the correct shop workspace, exactly as the
+    pre-ADR-020 registry-path resolution did.
+    """
+    override = os.environ.get("SHOPMSG_BD_CONTEXT")
+    if override:
+        return Path(override)
+    return Path.cwd()
+
+
+def _bc_clone_context() -> Path:
+    """Return the directory to read the BC's origin/main HEAD from (ADR-020).
+
+    The registry stores no BC path, so the BC's ``bc_origin_main_commit`` is
+    read from the ``SHOPMSG_BC_CLONE`` override when set (the BC's local clone
+    on whatever host actually holds it), falling back to the invoking CWD.
+    Best-effort: when neither carries a git clone the commit is simply None.
+    """
+    override = os.environ.get("SHOPMSG_BC_CLONE")
+    if override:
+        return Path(override)
+    return _invoking_bd_context()
 
 
 def _bc_origin_main_commit(bc_root: str) -> str | None:
@@ -352,14 +394,13 @@ def _bc_origin_main_commit(bc_root: str) -> str | None:
 
 
 def _resolve_registered_lead() -> str | None:
-    """Return the shop_root for the registered lead shop, or None.
+    """Return the registered lead shop's abstract address, or None.
 
-    Used by ``respond`` commands to route responses to the lead's inbox.
+    ADR-020: yields the sentinel abstract address ``<system>/lead`` (no
+    filesystem path). Used by ``respond`` commands to route responses to the
+    lead's inbox namespace.
     """
-    path = resolve_lead_shop()
-    if path is None:
-        return None
-    return str(Path(path).resolve())
+    return resolve_lead_shop()
 
 
 def _compute_scenario_hash(gherkin_body: str) -> str:
@@ -478,8 +519,11 @@ def _apply_bc_bead_response(
     Runs AFTER the messaging emission has succeeded. Best-effort: a bd hiccup
     is reported on stderr but does not change the command's exit status, since
     the primary messaging action (the lead-inbox deposit) already landed.
+
+    ADR-020: ``bc_root`` is now the BC's abstract address, not a path; the bd
+    workspace is discovered by walk-up from the LOCAL invoking CWD instead.
     """
-    bc_root_path = Path(bc_root)
+    bc_root_path = _invoking_bd_context()
     if not bd_facade.bd_available(bc_root_path):
         return
     try:
@@ -672,9 +716,13 @@ def _bd_first_send(
     deposit runs, preserving the pre-lead-tuu5 behavior for callers that do
     not participate in the bd dispatch lifecycle.
     """
-    lead_root_str = _resolve_registered_lead()
-    use_bd = lead_root_str is not None and bd_facade.bd_available(Path(lead_root_str))
-    lead_root = Path(lead_root_str) if lead_root_str else None
+    # ADR-020: a registered lead resolves to the sentinel abstract address,
+    # not a path; the lead's bd workspace is discovered by walk-up from the
+    # LOCAL invoking CWD. The "is a lead registered?" gate is the non-None
+    # abstract address; the bd cwd is the invoking CWD.
+    lead_address = _resolve_registered_lead()
+    lead_root = _invoking_bd_context() if lead_address is not None else None
+    use_bd = lead_root is not None and bd_facade.bd_available(lead_root)
 
     # Dispatch-dependency consultation (PDR-010 / ADR-013). Before any write,
     # consult the bd depends-on edges of this work_id. The graph is invariantly
@@ -869,7 +917,7 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
         payload=payload,
         scenario_hashes_pinned=hashes,
         depends_on_dispatch=getattr(args, "depends_on", None),
-        bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+        bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
         payload_ref=getattr(args, "payload", None),
         queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
@@ -937,7 +985,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
             payload=payload,
             scenario_hashes_pinned=_scenario_hashes_from_dict(payload),
             depends_on_dispatch=getattr(args, "depends_on", None),
-            bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+            bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
             payload_ref=args.payload,
             queue_on_dependency=getattr(args, "queue_on_dependency", False),
         )
@@ -984,7 +1032,7 @@ def _cmd_send_request_bugfix(args: argparse.Namespace) -> int:
         payload=message.model_dump(exclude_none=True),
         scenario_hashes_pinned=_scenario_hashes_from_payload(scenarios_payload),
         depends_on_dispatch=getattr(args, "depends_on", None),
-        bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+        bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
         payload_ref=getattr(args, "payload", None),
         queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
@@ -1004,7 +1052,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
             payload=payload,
             scenario_hashes_pinned=_scenario_hashes_from_dict(payload),
             depends_on_dispatch=getattr(args, "depends_on", None),
-            bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+            bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
             payload_ref=args.payload,
             queue_on_dependency=getattr(args, "queue_on_dependency", False),
         )
@@ -1039,7 +1087,7 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         payload=message.model_dump(exclude_none=True),
         scenario_hashes_pinned=_scenario_hashes_from_payload(scenarios_payload),
         depends_on_dispatch=getattr(args, "depends_on", None),
-        bc_origin_main_commit=_bc_origin_main_commit(bc_root),
+        bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
         payload_ref=getattr(args, "payload", None),
         queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
@@ -1137,8 +1185,8 @@ def _do_nudge(
     # shop's bd workspace. Best-effort: a missing lead workspace or missing
     # bead is a no-op (bd_available / bd note guards), never blocking delivery.
     if work_id:
-        lead_root_str = _resolve_registered_lead()
-        if lead_root_str is not None:
+        lead_address = _resolve_registered_lead()
+        if lead_address is not None:
             at = (
                 __import__("datetime")
                 .datetime.now(__import__("datetime").timezone.utc)
@@ -1146,7 +1194,11 @@ def _do_nudge(
             )
             note_text = bd_facade.nudge_note_text(reason, work_id, at)
             try:
-                bd_facade.append_note(work_id, note_text, root=Path(lead_root_str))
+                # ADR-020: the lead's bd workspace resolves from the LOCAL
+                # invoking CWD (no registry-stored path).
+                bd_facade.append_note(
+                    work_id, note_text, root=_invoking_bd_context()
+                )
             except bd_facade.BdFacadeError as exc:
                 # Delivery already succeeded; the bd note is a secondary
                 # artefact. Surface a warning but do not fail the nudge.
@@ -1285,14 +1337,14 @@ def _cmd_pending_inbox(args: argparse.Namespace) -> int:
     """
     bc_root = _resolve_bc(args)
     rows = query_pending_inbox(bc_root)
-    bc_root_path = Path(bc_root)
-    # ADR-018 / lead-mxxm: the BC-side bead side effect (ADR-017) runs `bd`
-    # with cwd scoped to the registered shop_root. On the lead host that path
-    # is load-bearing for nothing and need not exist; bd_available() now
-    # returns False for an absent path (rather than letting `bd` raise on a
-    # non-existent cwd), so the pending rows are still enumerated and the bead
-    # side effect is correctly skipped — best-effort by design (a bd-less or
-    # path-less environment simply lists the rows, pre-lead-sn1e behavior).
+    # ADR-020: bc_root is the BC's abstract address (no path). The BC-side
+    # bead side effect (ADR-017) runs `bd` with cwd scoped to the LOCAL
+    # invoking CWD, whose `.beads` workspace is discovered by walk-up. A
+    # bd-less invoking CWD simply lists the rows (best-effort, pre-lead-sn1e
+    # behavior); resolving from the local CWD — never a registry-stored path
+    # — is what keeps name-addressed pending from crashing (scenario
+    # f9910cf40291768c).
+    bc_root_path = _invoking_bd_context()
     bd_ok = bd_facade.bd_available(bc_root_path)
     for work_id, message_type in rows:
         # ADR-017 / lead-sn1e: observing an unprocessed inbox row creates a
@@ -1420,9 +1472,11 @@ def _cmd_consume_outbox(args: argparse.Namespace) -> int:
     # `bd update` step is required. Best-effort and scoped to a registered
     # lead with a reachable bd workspace; a bd-less invocation just performs
     # the messaging release (pre-lead-tuu5 behavior).
-    lead_root_str = _resolve_registered_lead()
-    if lead_root_str is not None:
-        lead_root = Path(lead_root_str)
+    lead_address = _resolve_registered_lead()
+    if lead_address is not None:
+        # ADR-020: the lead's bd workspace resolves from the LOCAL invoking
+        # CWD, not a registry-stored path.
+        lead_root = _invoking_bd_context()
         if (
             bd_facade.bd_available(lead_root)
             and bd_facade.get_dispatch_bead(lead_root, args.work_id) is not None
@@ -1483,15 +1537,16 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
 
     Idempotent: a second sweep finds nothing at outbox_pending and is a no-op.
     """
-    shop_root_str = resolve_shop_name(args.shop)
-    if shop_root_str is None:
+    if resolve_shop_name(args.shop) is None:
         print(
             f"shop-msg sweep: shop name {args.shop!r} is not registered in the "
             f"registry.",
             file=sys.stderr,
         )
         return 1
-    shop_root = Path(shop_root_str).resolve()
+    # ADR-020: the swept shop's bd workspace resolves from the LOCAL invoking
+    # CWD (no registry-stored path).
+    shop_root = _invoking_bd_context()
     threshold = args.threshold_seconds
 
     if not bd_facade.bd_available(shop_root):
@@ -1538,7 +1593,9 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             continue
-        bc_root = str(Path(bc_root_str).resolve())
+        # ADR-020: bc_root_str is the BC's abstract address; thread it
+        # straight through as the storage key (no path resolution).
+        bc_root = bc_root_str
 
         if not dispatch_inbox_row_exists(bc_root, work_id, message_type):
             # Deposit never landed: re-deposit from the payload reference.
@@ -1652,7 +1709,8 @@ def _promote_one(
             file=sys.stderr,
         )
         return "noop"
-    bc_root = str(Path(bc_root_str).resolve())
+    # ADR-020: bc_root_str is the BC's abstract address (storage key).
+    bc_root = bc_root_str
     if not Path(payload_ref).exists():
         print(
             f"shop-msg promote: bead {work_id} payload reference "
@@ -1697,15 +1755,16 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     same command (the deterministic seam the close-triggers-promote contract
     relies on), so a test does not depend on a native bd-close hook.
     """
-    shop_root_str = resolve_shop_name(args.shop)
-    if shop_root_str is None:
+    if resolve_shop_name(args.shop) is None:
         print(
             f"shop-msg promote: shop name {args.shop!r} is not registered in "
             f"the registry.",
             file=sys.stderr,
         )
         return 1
-    shop_root = Path(shop_root_str).resolve()
+    # ADR-020: the promoted shop's bd workspace resolves from the LOCAL
+    # invoking CWD (no registry-stored path).
+    shop_root = _invoking_bd_context()
     if not bd_facade.bd_available(shop_root):
         print(
             f"shop-msg promote: no reachable bd workspace under {shop_root!r}; "
@@ -1939,7 +1998,7 @@ def _cmd_dump(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        bc_root = str(Path(bc_root).resolve())
+        # ADR-020: resolve_shop_name yields the abstract address (storage key).
     direction = args.direction
     limit = args.limit or 100
 
@@ -2024,9 +2083,22 @@ def _cmd_bc_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_registry_add(args: argparse.Namespace) -> int:
-    """Register a shop by canonical name."""
+    """Register a shop by canonical name (ADR-020: no filesystem path).
+
+    A filesystem-path positional is no longer accepted. When one is supplied
+    the command exits non-zero with a migration message naming the new
+    no-path form, and adds NO entry (scenario cf22ce33ba3edeea).
+    """
+    if getattr(args, "shop_root", None) is not None:
+        print(
+            "shop-msg registry add: a shop_root path is no longer accepted "
+            "(ADR-020: the registry stores no filesystem path). "
+            "Use: registry add [--lead-shop] <name>",
+            file=sys.stderr,
+        )
+        return 1
     shop_type = "lead" if getattr(args, "lead_shop", False) else "bc"
-    registry_add(args.name, args.shop_root, shop_type=shop_type)
+    registry_add(args.name, shop_type=shop_type)
     return 0
 
 
@@ -2042,10 +2114,15 @@ def _cmd_registry_remove(args: argparse.Namespace) -> int:
 
 
 def _cmd_registry_list(args: argparse.Namespace) -> int:
-    """List all registered shops."""
+    """List all registered shops.
+
+    ADR-020: each line is ``<name> <abstract_address> <shop_type>``; there
+    is no filesystem-path column (scenarios 3d9da19b3174fcf6 /
+    b324c650784c2378).
+    """
     entries = registry_list()
-    for name, shop_root, shop_type in entries:
-        print(f"{name} {shop_root} {shop_type}")
+    for name, abstract_address, shop_type in entries:
+        print(f"{name} {abstract_address} {shop_type}")
     return 0
 
 
@@ -2770,12 +2847,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     registry_add_cmd = registry_sub.add_parser(
         "add",
-        help="register a shop by canonical name",
+        help="register a shop by canonical name (no filesystem path; ADR-020)",
     )
     registry_add_cmd.add_argument("name", help="canonical shop name")
+    # ADR-020: the registry stores no path. A filesystem-path positional is
+    # accepted at parse time only so the command can emit a clear migration
+    # message and exit non-zero (cf22ce33ba3edeea), rather than argparse
+    # reporting an opaque "unrecognized arguments".
     registry_add_cmd.add_argument(
         "shop_root",
-        help="filesystem path to the shop root directory",
+        nargs="?",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     registry_add_cmd.add_argument(
         "--lead-shop",

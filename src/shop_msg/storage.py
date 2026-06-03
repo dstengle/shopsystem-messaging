@@ -200,13 +200,96 @@ ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS consumed BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
+# ADR-020 / PDR-007 Option A: the registry stores NO filesystem path. Each
+# entry is keyed by canonical name and carries an abstract address
+# (``<system>/<name>``; the lead collapses to the sentinel
+# ``<system>/lead``) plus the shop_type. The fresh-table DDL omits
+# shop_root entirely; the migration below drops a legacy shop_root column
+# and backfills abstract_address from canonical names.
 _DDL_REGISTRY = """
 CREATE TABLE IF NOT EXISTS shop_registry (
-  name         TEXT PRIMARY KEY,
-  shop_root    TEXT NOT NULL,
-  shop_type    TEXT NOT NULL DEFAULT 'bc',
-  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  name             TEXT PRIMARY KEY,
+  abstract_address TEXT NOT NULL,
+  shop_type        TEXT NOT NULL DEFAULT 'bc',
+  registered_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+"""
+
+# Deployment system slug used to project canonical names onto abstract
+# addresses (ADR-020). A canonical BC name "shopsystem-messaging" projects
+# to the abstract address "shopsystem/messaging"; the lead collapses to the
+# sentinel "shopsystem/lead" regardless of its canonical name.
+SYSTEM_SLUG = "shopsystem"
+LEAD_ABSTRACT_ADDRESS = f"{SYSTEM_SLUG}/lead"
+
+
+def _abstract_address_for(name: str, shop_type: str) -> str:
+    """Project a (canonical-name, shop_type) pair onto its abstract address.
+
+    A lead shop collapses to the sentinel ``<system>/lead`` regardless of its
+    canonical name. A BC name of the form ``<system>-<rest>`` projects to
+    ``<system>/<rest>``; a name carrying no recognizable system prefix is
+    placed under the deployment system slug as ``<system>/<name>``.
+    """
+    if shop_type == "lead":
+        return LEAD_ABSTRACT_ADDRESS
+    prefix = f"{SYSTEM_SLUG}-"
+    if name.startswith(prefix):
+        rest = name[len(prefix):]
+        return f"{SYSTEM_SLUG}/{rest}"
+    return f"{SYSTEM_SLUG}/{name}"
+
+
+# ADR-020 addressing migration. A pre-migration shop_registry keyed on a
+# path-bearing shape (a shop_root column) is migrated in place:
+#   1. Add the abstract_address column if absent.
+#   2. Backfill abstract_address from each row's canonical name + shop_type
+#      (lead -> sentinel), dropping any row whose key cannot be mapped to a
+#      known canonical name (an orphan path key such as "/workspace" or a
+#      tmp_path-prefixed key has no canonical name and is removed).
+#   3. Drop the legacy shop_root column so no entry retains a path.
+# Idempotent: re-running finds abstract_address already present and shop_root
+# already gone, and performs no row deletion the second time.
+_DDL_REGISTRY_ADDRESS_MIGRATION = """
+DO $$
+BEGIN
+  -- Step 1: ensure the abstract_address column exists.
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'shop_registry' AND column_name = 'abstract_address'
+  ) THEN
+    ALTER TABLE shop_registry ADD COLUMN abstract_address TEXT;
+  END IF;
+
+  -- Step 2: drop orphan rows whose key (name) cannot be mapped to a known
+  -- canonical name. A canonical BC/lead name does not start with '/' and is
+  -- not a pytest tmp_path key; any row whose name looks like a filesystem
+  -- path is an orphan from the path-keyed era and is removed.
+  DELETE FROM shop_registry
+  WHERE name LIKE '/%' OR name LIKE '%/pytest-%' OR name LIKE '/tmp/%';
+
+  -- Step 3: backfill abstract_address from the canonical name + shop_type for
+  -- any row that does not yet carry one.
+  UPDATE shop_registry
+  SET abstract_address = CASE
+    WHEN shop_type = 'lead' THEN '""" + LEAD_ABSTRACT_ADDRESS + """'
+    WHEN name LIKE '""" + SYSTEM_SLUG + """-%'
+      THEN '""" + SYSTEM_SLUG + """/' || substring(name from """ + str(len(SYSTEM_SLUG) + 2) + """)
+    ELSE '""" + SYSTEM_SLUG + """/' || name
+  END
+  WHERE abstract_address IS NULL;
+
+  -- Step 4: enforce NOT NULL now that every surviving row carries an address.
+  ALTER TABLE shop_registry ALTER COLUMN abstract_address SET NOT NULL;
+
+  -- Step 5: drop the legacy shop_root column so no entry retains a path.
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'shop_registry' AND column_name = 'shop_root'
+  ) THEN
+    ALTER TABLE shop_registry DROP COLUMN shop_root;
+  END IF;
+END $$;
 """
 
 # Presence heartbeat (PDR-010 / ADR-014). The watch process that holds the
@@ -238,6 +321,7 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
         cur.execute(_DDL_PARTIAL_UNIQUE_MIGRATION)
         cur.execute(_DDL_PARTIAL_UNIQUE_INDEX)
         cur.execute(_DDL_REGISTRY)
+        cur.execute(_DDL_REGISTRY_ADDRESS_MIGRATION)
         cur.execute(_DDL_PRESENCE)
     conn.commit()
 
@@ -268,11 +352,14 @@ class OutboxDepositError(Exception):
 
 
 def _bc_id(bc_root: str) -> str:
-    """Return the bc identifier for a bc_root path.
+    """Return the bc identifier for an addressed shop.
 
-    The bc column in the messages table is the bc_root path string
-    (str(Path(...))). Using the full path keeps each test's tmp_path
-    isolated from other tests without any coordination.
+    ADR-020 / PDR-007 Option A: the ``bc``/``to`` column in the messages
+    table is the shop's ABSTRACT ADDRESS (``<system>/<name>``; the lead
+    collapses to ``<system>/lead``), not a filesystem path. Callers thread
+    the abstract address through the ``bc_root`` parameter (the name is
+    retained for continuity with the pre-ADR-020 plumbing); this function is
+    the identity projection of that address onto the column value.
     """
     return bc_root
 
@@ -570,21 +657,23 @@ def query_pending_outbox(
     """Return (work_id, message_type, bc_name) triples for pending outbox rows.
 
     Lead-side counterpart to query_pending_inbox. 'Pending' here means an
-    outbox row exists (the lead has not yet consumed/acted on it). We
-    derive the bc_name from the bc column's trailing path component so it
-    matches the directory name under repos/.
+    outbox row exists (the lead has not yet consumed/acted on it).
 
-    When bc_filter is given, restrict to rows whose bc column ends with
-    that name.
+    ADR-020: the ``bc`` column is the BC's abstract address
+    (``<system>/<name>``), not a filesystem path. The ``bc_name`` projected
+    back is the abstract address's trailing component (the BC's name part).
+    The pre-ADR-020 ``<lead_root>/repos/`` path-prefix restriction is gone
+    (it has no meaning once the registry stores no path); the lead-side
+    enumeration spans every BC abstract address with an outbox row.
+
+    When ``bc_filter`` is given it is the BC's name part; restrict to rows
+    whose abstract address trailing component equals it.
     """
     import os as _os
 
-    # We key off `bc` values that start with the lead_root + "/repos/" prefix
-    # (or any prefix for test bc paths).
     with _connect() as conn:
         with conn.cursor() as cur:
             if bc_filter is not None:
-                # bc column is a full path; bc_name is the final component.
                 cur.execute(
                     """
                     SELECT work_id, message_type, bc
@@ -609,15 +698,13 @@ def query_pending_outbox(
             rows = cur.fetchall()
 
     result = []
-    seen_bcs: set[str] = set()
     for row in rows:
         bc = row["bc"]
         bc_name = _os.path.basename(bc)
-        # For the lead-side `pending outbox` command the intent is to only
-        # see BCs that are siblings under repos/. We filter by checking
-        # that the bc path sits under <lead_root>/repos/.
-        repos_prefix = lead_root.rstrip("/") + "/repos/"
-        if not bc.startswith(repos_prefix):
+        # A defensive guard: when a filter is supplied, the trailing component
+        # must match it exactly (the LIKE above also matches longer suffixes
+        # sharing the same tail, which we exclude here).
+        if bc_filter is not None and bc_name != bc_filter:
             continue
         result.append((row["work_id"], row["message_type"], bc_name))
     return result
@@ -935,24 +1022,27 @@ def watch_outbox_for_lead(lead_root: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def registry_add(name: str, shop_root: str, shop_type: str = "bc") -> None:
-    """Register a shop by canonical name.
+def registry_add(name: str, shop_type: str = "bc") -> None:
+    """Register a shop by canonical name (ADR-020: no filesystem path).
 
-    If the name already exists with the same shop_root and shop_type, this
-    is a no-op (idempotent). If the name exists with different values, the
-    existing entry is updated (upsert semantics).
+    The registry stores NO path. Each entry carries the canonical name, the
+    abstract address projected from that name + shop_type (lead -> sentinel),
+    and the shop_type. Re-registering the same name with the same shop_type
+    is a no-op; a shop_type change updates the entry (and its derived
+    abstract address) via upsert semantics.
     """
+    abstract = _abstract_address_for(name, shop_type)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO shop_registry (name, shop_root, shop_type)
+                INSERT INTO shop_registry (name, abstract_address, shop_type)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (name) DO UPDATE
-                  SET shop_root = EXCLUDED.shop_root,
+                  SET abstract_address = EXCLUDED.abstract_address,
                       shop_type = EXCLUDED.shop_type
                 """,
-                (name, shop_root, shop_type),
+                (name, abstract, shop_type),
             )
         conn.commit()
 
@@ -974,17 +1064,24 @@ def registry_remove(name: str) -> bool:
 
 
 def registry_list() -> list[tuple[str, str, str]]:
-    """Return all registry entries as (name, shop_root, shop_type) triples."""
+    """Return all registry entries as (name, abstract_address, shop_type) triples.
+
+    ADR-020: there is no shop_root projection — the registry exposes the
+    abstract address only, never a filesystem path.
+    """
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT name, shop_root, shop_type
+                SELECT name, abstract_address, shop_type
                 FROM shop_registry
                 ORDER BY name
                 """
             )
-            return [(row["name"], row["shop_root"], row["shop_type"]) for row in cur.fetchall()]
+            return [
+                (row["name"], row["abstract_address"], row["shop_type"])
+                for row in cur.fetchall()
+            ]
 
 
 def registry_sync(manifest_path: str) -> None:
@@ -1014,17 +1111,19 @@ def registry_sync(manifest_path: str) -> None:
 
     with _connect() as conn:
         with conn.cursor() as cur:
-            # Upsert all BCs from manifest.
-            for name, shop_root in manifest_bcs.items():
+            # Upsert all BCs from manifest. ADR-020: the manifest's path
+            # values are ignored — the registry stores only the canonical
+            # name, its abstract address, and the shop_type.
+            for name in manifest_bcs:
                 cur.execute(
                     """
-                    INSERT INTO shop_registry (name, shop_root, shop_type)
+                    INSERT INTO shop_registry (name, abstract_address, shop_type)
                     VALUES (%s, %s, 'bc')
                     ON CONFLICT (name) DO UPDATE
-                      SET shop_root = EXCLUDED.shop_root,
+                      SET abstract_address = EXCLUDED.abstract_address,
                           shop_type = 'bc'
                     """,
-                    (name, shop_root),
+                    (name, _abstract_address_for(name, "bc")),
                 )
             # Remove BC entries not in manifest (do not remove lead entries).
             if manifest_bcs:
@@ -1045,18 +1144,20 @@ def registry_sync(manifest_path: str) -> None:
         conn.commit()
 
 
-def resolve_root_to_name(shop_root: str) -> str | None:
-    """Reverse-resolve a shop_root path to its canonical registered name.
+def resolve_root_to_name(abstract_address: str) -> str | None:
+    """Reverse-resolve an abstract address to its canonical registered name.
 
-    Returns the name if a registry entry maps to this shop_root, else None.
-    Used by the presence heartbeat so bc_presence is keyed by canonical BC
-    name (e.g. 'shopsystem-messaging') rather than by filesystem path.
+    ADR-020: the messages column keys on the abstract address, so the
+    presence heartbeat reverse-lookup maps an abstract address (e.g.
+    ``shopsystem/messaging``) back to the canonical name
+    (``shopsystem-messaging``). Returns None if no entry carries that
+    address.
     """
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT name FROM shop_registry WHERE shop_root = %s LIMIT 1",
-                (shop_root,),
+                "SELECT name FROM shop_registry WHERE abstract_address = %s LIMIT 1",
+                (abstract_address,),
             )
             row = cur.fetchone()
     if row is None:
@@ -1065,21 +1166,23 @@ def resolve_root_to_name(shop_root: str) -> str | None:
 
 
 def resolve_shop_name(name: str) -> str | None:
-    """Resolve a canonical shop name to its shop_root path.
+    """Resolve a canonical shop name to its abstract address.
 
-    Returns the shop_root string if found, or None if the name is not
-    registered.
+    ADR-020: the registry stores no filesystem path; resolution yields the
+    shop's abstract address (``<system>/<name>``; the lead collapses to
+    ``<system>/lead``), which is the value threaded as the messages
+    ``bc``/``to`` column key. Returns None if the name is not registered.
     """
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT shop_root FROM shop_registry WHERE name = %s",
+                "SELECT abstract_address FROM shop_registry WHERE name = %s",
                 (name,),
             )
             row = cur.fetchone()
     if row is None:
         return None
-    return row["shop_root"]
+    return row["abstract_address"]
 
 
 def listen_on_outbox_channel(bc_root: str, timeout: float = 5.0) -> list[str]:
@@ -1109,16 +1212,18 @@ def listen_on_outbox_channel(bc_root: str, timeout: float = 5.0) -> list[str]:
 
 
 def resolve_lead_shop() -> str | None:
-    """Return the shop_root for the first registered lead shop, or None.
+    """Return the lead shop's abstract address, or None if no lead registered.
 
-    Used by ``shop-msg respond`` to determine where to route the response:
-    the lead shop's inbox receives all BC responses (Brief-006 scope C).
+    ADR-020: all lead shops collapse to the sentinel abstract address
+    ``<system>/lead``; ``shop-msg respond`` routes BC responses to that
+    address (Brief-006 scope C). Returns None when no lead is registered so
+    callers preserve their "no lead" diagnostics.
     """
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT shop_root FROM shop_registry
+                SELECT abstract_address FROM shop_registry
                 WHERE shop_type = 'lead'
                 ORDER BY name
                 LIMIT 1
@@ -1127,7 +1232,7 @@ def resolve_lead_shop() -> str | None:
             row = cur.fetchone()
     if row is None:
         return None
-    return row["shop_root"]
+    return row["abstract_address"]
 
 
 def _lead_inbox_slug(lead_root: str) -> str:
