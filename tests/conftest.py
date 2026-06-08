@@ -59,6 +59,7 @@ from catalog.schemas import (
     ScenarioPayload,
     WorkDone,
 )
+from catalog.journal import LeadSnapshot, ScenarioJournal
 import uuid
 
 from shop_msg.storage import (
@@ -11429,4 +11430,168 @@ def then_adr020_no_shop_root_column(context: dict) -> None:
     assert "shop_root" not in cols, (
         f"shop_registry still carries a shop_root column after migration: "
         f"{sorted(cols)}"
+    )
+
+
+# -----------------------------------------------------------------------
+# lead-9b3w: BC scenario-completion journal + lead snapshot reconciliation
+#
+# A BC records scenario completion by appending the scenario's block-only
+# canonical hash to an authoritative, append-only journal
+# (catalog.journal.ScenarioJournal). The lead pulls that journal on demand
+# and reconciles its own per-BC snapshot (catalog.journal.LeadSnapshot)
+# against it.
+# -----------------------------------------------------------------------
+
+@given(
+    parsers.parse(
+        'a BC whose authoritative journal does not yet contain the '
+        'block-only canonical hash "{scenario_hash}"'
+    ),
+    target_fixture="bc_journal",
+)
+def given_journal_without_hash(scenario_hash: str, context: dict) -> ScenarioJournal:
+    journal = ScenarioJournal()
+    # Seed an unrelated prior entry so we can later assert the append does
+    # not remove or overwrite a previously-journaled hash.
+    prior = "prior_entry_hash"
+    assert prior != scenario_hash
+    journal.append(prior)
+    context["journal_prior_entries"] = journal.entries()
+    assert not journal.contains(scenario_hash), (
+        f"precondition failed: journal already contains {scenario_hash!r}"
+    )
+    return journal
+
+
+@given(
+    parsers.parse(
+        'a scenario for that BC becomes PINNED & DEMONSTRATED: a work_done '
+        'landed for it and its block-only canonical hash "{scenario_hash}" '
+        'equals its on-disk @scenario_hash tag'
+    ),
+    target_fixture="completed_scenario_hash",
+)
+def given_scenario_pinned_and_demonstrated(scenario_hash: str) -> str:
+    # The hash that the BC will record on completion is exactly the
+    # scenario's block-only canonical hash, which equals its on-disk
+    # @scenario_hash tag (the PINNED & DEMONSTRATED precondition).
+    return scenario_hash
+
+
+@when("the BC records the completion of that scenario")
+def when_bc_records_completion(
+    bc_journal: ScenarioJournal, completed_scenario_hash: str
+) -> None:
+    bc_journal.append(completed_scenario_hash)
+
+
+@then(
+    parsers.parse(
+        "the BC's authoritative journal contains the block-only canonical "
+        'hash "{scenario_hash}" as an appended entry'
+    )
+)
+def then_journal_contains_hash(
+    bc_journal: ScenarioJournal, scenario_hash: str
+) -> None:
+    assert bc_journal.contains(scenario_hash), (
+        f"expected journal to contain {scenario_hash!r} after completion; "
+        f"entries={bc_journal.entries()!r}"
+    )
+    # It is an appended entry: it is the most recently added one.
+    assert bc_journal.entries()[-1] == scenario_hash, (
+        f"expected {scenario_hash!r} to be the appended (last) entry; "
+        f"entries={bc_journal.entries()!r}"
+    )
+
+
+@then("no previously-journaled hash is removed or overwritten by the append")
+def then_no_prior_entry_lost(
+    bc_journal: ScenarioJournal, context: dict
+) -> None:
+    prior = context["journal_prior_entries"]
+    current = bc_journal.entries()
+    # Every previously-journaled hash is still present, at its original
+    # position and value (append is additive, never destructive).
+    assert current[: len(prior)] == prior, (
+        f"a previously-journaled entry was removed or overwritten: "
+        f"prior={prior!r}, current={current!r}"
+    )
+
+
+@given(
+    parsers.parse(
+        'a BC whose authoritative journal contains the block-only '
+        'canonical hash "{scenario_hash}"'
+    ),
+    target_fixture="bc_journal",
+)
+def given_journal_with_hash(scenario_hash: str, context: dict) -> ScenarioJournal:
+    journal = ScenarioJournal()
+    journal.append(scenario_hash)
+    context["bc_name"] = "shopsystem-messaging"
+    assert journal.contains(scenario_hash)
+    return journal
+
+
+@given(
+    parsers.parse(
+        'a lead snapshot that does not record "{scenario_hash}" as '
+        'completed for that BC'
+    ),
+    target_fixture="lead_snapshot",
+)
+def given_snapshot_without_hash(
+    scenario_hash: str, context: dict
+) -> LeadSnapshot:
+    snapshot = LeadSnapshot()
+    bc = context["bc_name"]
+    assert not snapshot.records_completed(bc, scenario_hash), (
+        f"precondition failed: snapshot already records {scenario_hash!r} "
+        f"as completed for {bc!r}"
+    )
+    return snapshot
+
+
+@when(
+    "the lead pulls that BC's journal on demand and reconciles its "
+    "snapshot against it"
+)
+def when_lead_reconciles(
+    lead_snapshot: LeadSnapshot, bc_journal: ScenarioJournal, context: dict
+) -> None:
+    bc = context["bc_name"]
+    lead_snapshot.reconcile_against(bc, bc_journal)
+
+
+@then(
+    parsers.parse(
+        'the lead snapshot records the block-only canonical hash '
+        '"{scenario_hash}" as completed for that BC'
+    )
+)
+def then_snapshot_records_hash(
+    lead_snapshot: LeadSnapshot, scenario_hash: str, context: dict
+) -> None:
+    bc = context["bc_name"]
+    assert lead_snapshot.records_completed(bc, scenario_hash), (
+        f"expected snapshot to record {scenario_hash!r} as completed for "
+        f"{bc!r} after reconciliation; "
+        f"completed={lead_snapshot.completed_for(bc)!r}"
+    )
+
+
+@then(
+    "the reconciled snapshot matches the BC's authoritative journal for "
+    "that BC entry by entry"
+)
+def then_snapshot_matches_journal(
+    lead_snapshot: LeadSnapshot, bc_journal: ScenarioJournal, context: dict
+) -> None:
+    bc = context["bc_name"]
+    assert lead_snapshot.completed_for(bc) == bc_journal.entries(), (
+        f"reconciled snapshot does not match the journal entry by entry: "
+        f"snapshot={lead_snapshot.completed_for(bc)!r}, "
+        f"journal={bc_journal.entries()!r}"
     )
