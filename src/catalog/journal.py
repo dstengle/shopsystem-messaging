@@ -27,7 +27,7 @@ against (the same identity the BC echoes in ``work_done.scenario_hashes``).
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, Iterable, List, Set
 
 
 class ScenarioJournal:
@@ -100,3 +100,96 @@ class LeadSnapshot:
         ``completed_for(bc)`` matches ``journal.entries()`` entry by entry.
         """
         self._completed[bc] = journal.entries()
+
+    def apply_work_done(self, bc: str, scenario_hash: str) -> None:
+        """Incrementally record ``scenario_hash`` as completed for ``bc``
+        from a single arriving ``work_done``.
+
+        This is the incremental counterpart to ``reconcile_against``: it
+        touches only the one hash the ``work_done`` carries and only the
+        one BC entry it names. It deliberately does NOT pull or sweep any
+        BC journal — not the named BC's and not any other BC's — so a
+        newly-completed scenario is reflected in the snapshot without the
+        cost (and staleness window) of a full reconciliation pass over
+        every BC journal. Recording an already-recorded hash is a no-op,
+        so repeated delivery of the same ``work_done`` is idempotent.
+        """
+        recorded = self._completed.setdefault(bc, [])
+        if scenario_hash not in recorded:
+            recorded.append(scenario_hash)
+
+
+class CompletionState:
+    """A lookup of which scenario block-only canonical hashes are recorded
+    as completed.
+
+    The lookup is keyed *purely* on the block-only canonical hash string —
+    the same identity that lives on ``scenarios[].hash``, the on-disk
+    ``@scenario_hash:`` tag, and ``work_done.scenario_hashes``. It is NOT
+    keyed on bead id, scenario title, or any dispatch record; two scenarios
+    that share a block-only canonical hash share a completion answer, and a
+    hash is the only thing that can be presented to ``is_completed``.
+    """
+
+    def __init__(self, completed: Iterable[str] = ()) -> None:
+        self._completed: Set[str] = set(completed)
+
+    def record_completed(self, scenario_hash: str) -> None:
+        """Record ``scenario_hash`` as a completed scenario."""
+        self._completed.add(scenario_hash)
+
+    def is_completed(self, scenario_hash: str) -> bool:
+        """Return a definite boolean answer for ``scenario_hash``.
+
+        ``True`` (a definite "yes") iff the hash was recorded as completed;
+        ``False`` (a definite "no") otherwise. The answer is a function of
+        the hash alone — no bead id, title, or dispatch record participates.
+        """
+        return scenario_hash in self._completed
+
+
+class SystemStateView:
+    """The lead's system-state view that incorporates BC-journaled
+    completions and classifies each against the lead's canonical features.
+
+    The lead's canonical features are the set of block-only canonical
+    hashes that appear as ``@scenario_hash`` tags under the lead's
+    ``features/``. A BC-journaled completion whose hash is one of those is a
+    *recognized* completion and counts toward coverage. A BC-journaled
+    completion whose hash is absent from the canonical features is an
+    *orphan anomaly*: it is surfaced for investigation and excluded from
+    both the coverage count (numerator) and the outstanding denominator,
+    because the lead has no canonical scenario it could be covering.
+    """
+
+    def __init__(self, canonical_hashes: Iterable[str]) -> None:
+        self._canonical: Set[str] = set(canonical_hashes)
+        self._completed: Set[str] = set()
+
+    def incorporate_completion(self, scenario_hash: str) -> None:
+        """Incorporate a BC-journaled completion for ``scenario_hash``."""
+        self._completed.add(scenario_hash)
+
+    def is_orphan(self, scenario_hash: str) -> bool:
+        """True if an incorporated completion is an unrecognized orphan
+        anomaly: completed per a BC journal but absent from the lead's
+        canonical features."""
+        return scenario_hash in self._completed and scenario_hash not in self._canonical
+
+    def orphan_anomalies(self) -> Set[str]:
+        """Return every incorporated completion that is an orphan anomaly,
+        surfaced for investigation."""
+        return {h for h in self._completed if h not in self._canonical}
+
+    def coverage_count(self) -> int:
+        """The coverage numerator: incorporated completions that map to a
+        canonical feature. Orphan completions are excluded."""
+        return len(self._completed & self._canonical)
+
+    def outstanding_denominator(self) -> int:
+        """The outstanding denominator: the lead's canonical features.
+
+        Orphan completions are excluded — they never join the denominator,
+        because they correspond to no canonical scenario the lead is
+        tracking coverage for."""
+        return len(self._canonical)

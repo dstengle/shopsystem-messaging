@@ -59,7 +59,12 @@ from catalog.schemas import (
     ScenarioPayload,
     WorkDone,
 )
-from catalog.journal import LeadSnapshot, ScenarioJournal
+from catalog.journal import (
+    CompletionState,
+    LeadSnapshot,
+    ScenarioJournal,
+    SystemStateView,
+)
 import uuid
 
 from shop_msg.storage import (
@@ -11594,4 +11599,292 @@ def then_snapshot_matches_journal(
         f"reconciled snapshot does not match the journal entry by entry: "
         f"snapshot={lead_snapshot.completed_for(bc)!r}, "
         f"journal={bc_journal.entries()!r}"
+    )
+
+
+# -----------------------------------------------------------------------
+# lead-if3j: completion lookup keyed on block-only canonical hash,
+# incremental snapshot application, and orphan-anomaly detection.
+#
+# - CompletionState.is_completed answers yes/no keyed purely on the
+#   block-only canonical hash (catalog.journal.CompletionState).
+# - LeadSnapshot.apply_work_done records a single newly-completed hash
+#   incrementally, without sweeping every BC journal.
+# - SystemStateView flags a BC-journaled completion absent from the
+#   lead's canonical features as an orphan anomaly and excludes it from
+#   both coverage numerator and outstanding denominator.
+# -----------------------------------------------------------------------
+
+# --- completion lookup: definite yes (1b21dbb923413455) ---------------
+
+@given(
+    parsers.parse(
+        'a scenario block whose block-only canonical hash is "{scenario_hash}"'
+    )
+)
+def given_scenario_block_with_hash(scenario_hash: str, context: dict) -> None:
+    # The lookup is keyed purely on this hash; we record nothing else
+    # (no bead id, title, or dispatch record) about the scenario.
+    context["lookup_hash"] = scenario_hash
+
+
+@given(
+    parsers.parse(
+        'the completion state records "{scenario_hash}" as a completed scenario'
+    ),
+    target_fixture="completion_state",
+)
+def given_completion_state_records(scenario_hash: str) -> CompletionState:
+    state = CompletionState()
+    state.record_completed(scenario_hash)
+    return state
+
+
+@given(
+    parsers.parse(
+        'the completion state records no completed scenario with hash '
+        '"{scenario_hash}"'
+    ),
+    target_fixture="completion_state",
+)
+def given_completion_state_empty(scenario_hash: str) -> CompletionState:
+    state = CompletionState()
+    assert not state.is_completed(scenario_hash), (
+        f"precondition failed: completion state already records "
+        f"{scenario_hash!r} as completed"
+    )
+    return state
+
+
+@when(
+    parsers.parse(
+        'the completion lookup is queried for the block-only canonical hash '
+        '"{scenario_hash}"'
+    )
+)
+def when_completion_lookup_queried(
+    completion_state: CompletionState, scenario_hash: str, context: dict
+) -> None:
+    context["lookup_answer"] = completion_state.is_completed(scenario_hash)
+    context["lookup_queried_hash"] = scenario_hash
+
+
+@then(parsers.parse('the lookup returns a definite "yes" answer for "{scenario_hash}"'))
+def then_lookup_yes(scenario_hash: str, context: dict) -> None:
+    answer = context["lookup_answer"]
+    assert answer is True, (
+        f"expected a definite yes (True) for {scenario_hash!r}; got {answer!r}"
+    )
+
+
+@then(parsers.parse('the lookup returns a definite "no" answer for "{scenario_hash}"'))
+def then_lookup_no(scenario_hash: str, context: dict) -> None:
+    answer = context["lookup_answer"]
+    assert answer is False, (
+        f"expected a definite no (False) for {scenario_hash!r}; got {answer!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the answer is keyed on the block-only canonical hash "{scenario_hash}", '
+        'not on any bead id, scenario title, or dispatch record'
+    )
+)
+def then_answer_keyed_on_hash(
+    completion_state: CompletionState, scenario_hash: str, context: dict
+) -> None:
+    # The answer was produced by querying the hash alone, and the only
+    # thing that could change it is the hash: a different hash with the
+    # same notional "title"/"bead"/"dispatch" yields the opposite answer.
+    assert context["lookup_queried_hash"] == scenario_hash, (
+        "the lookup was not queried on the block-only canonical hash"
+    )
+    expected = context["lookup_answer"]
+    assert completion_state.is_completed(scenario_hash) is expected, (
+        "the answer is not a pure function of the block-only canonical hash"
+    )
+    # A different hash string is a different question regardless of any
+    # bead id / title / dispatch record, so it must not borrow this answer.
+    other_hash = scenario_hash + "_other"
+    assert completion_state.is_completed(other_hash) is False, (
+        "the lookup answered yes for a different hash; the answer is not "
+        "keyed purely on the block-only canonical hash"
+    )
+
+
+# --- incremental snapshot application (307967ddfb53fc45) --------------
+
+@given(
+    parsers.parse(
+        'a lead snapshot in which the block-only canonical hash '
+        '"{scenario_hash}" is not recorded as completed'
+    ),
+    target_fixture="lead_snapshot",
+)
+def given_snapshot_missing_hash_incremental(
+    scenario_hash: str, context: dict
+) -> LeadSnapshot:
+    snapshot = LeadSnapshot()
+    bc = "shopsystem-messaging"
+    context["incremental_bc"] = bc
+    assert not snapshot.records_completed(bc, scenario_hash), (
+        f"precondition failed: snapshot already records {scenario_hash!r}"
+    )
+    return snapshot
+
+
+@given(
+    parsers.parse(
+        'a work_done arrives carrying a scenario whose block-only canonical '
+        'hash "{scenario_hash}" equals its on-disk @scenario_hash tag'
+    ),
+    target_fixture="arriving_work_done_hash",
+)
+def given_work_done_carrying_hash(scenario_hash: str) -> str:
+    # PINNED & DEMONSTRATED: the work_done's carried hash equals the
+    # on-disk @scenario_hash tag, so the lead can apply it as-is.
+    return scenario_hash
+
+
+@when("the lead applies that work_done to its snapshot incrementally")
+def when_lead_applies_incrementally(
+    lead_snapshot: LeadSnapshot, arriving_work_done_hash: str, context: dict
+) -> None:
+    bc = context["incremental_bc"]
+    # Record the journals untouched at apply time so we can later assert
+    # no full reconciliation sweep was performed.
+    context["pre_apply_completed"] = lead_snapshot.completed_for(bc)
+    lead_snapshot.apply_work_done(bc, arriving_work_done_hash)
+
+
+@then(
+    parsers.parse(
+        'the lead snapshot records the block-only canonical hash '
+        '"{scenario_hash}" as completed'
+    )
+)
+def then_snapshot_records_incremental(
+    lead_snapshot: LeadSnapshot, scenario_hash: str, context: dict
+) -> None:
+    bc = context["incremental_bc"]
+    assert lead_snapshot.records_completed(bc, scenario_hash), (
+        f"expected snapshot to record {scenario_hash!r} as completed for "
+        f"{bc!r} after incremental apply; "
+        f"completed={lead_snapshot.completed_for(bc)!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the lead recorded "{scenario_hash}" without performing a full '
+        'reconciliation sweep of every BC journal'
+    )
+)
+def then_recorded_without_full_sweep(
+    lead_snapshot: LeadSnapshot, scenario_hash: str, context: dict
+) -> None:
+    bc = context["incremental_bc"]
+    # The only change to the snapshot is the single hash the work_done
+    # carried, added to the single named BC's entry. No other BC entry
+    # was created and no other hash appeared — which is exactly what a
+    # full reconciliation sweep over every BC journal would have risked
+    # touching. apply_work_done pulls no journal at all.
+    pre = context["pre_apply_completed"]
+    post = lead_snapshot.completed_for(bc)
+    assert post == pre + [scenario_hash], (
+        f"incremental apply touched more than the carried hash: "
+        f"pre={pre!r}, post={post!r}"
+    )
+    # No journal exists in this scenario's world; the snapshot still
+    # recorded the hash, proving the application did not depend on
+    # pulling/sweeping any BC journal.
+    assert lead_snapshot.records_completed(bc, scenario_hash)
+
+
+# --- orphan-anomaly detection (03a396b8dc08041e) ----------------------
+
+@given(
+    parsers.parse(
+        'a BC journal reports a completed scenario whose block-only '
+        'canonical hash is "{scenario_hash}"'
+    ),
+    target_fixture="bc_journal",
+)
+def given_bc_journal_reports_completion(scenario_hash: str, context: dict) -> ScenarioJournal:
+    journal = ScenarioJournal()
+    journal.append(scenario_hash)
+    context["orphan_hash"] = scenario_hash
+    return journal
+
+
+@given(
+    parsers.parse(
+        'no scenario block under the lead\'s features carries '
+        '"{scenario_hash}" as its @scenario_hash tag'
+    ),
+    target_fixture="system_state_view",
+)
+def given_no_canonical_feature_for_hash(
+    scenario_hash: str, context: dict
+) -> SystemStateView:
+    # The lead's canonical features carry some recognized hashes, but NOT
+    # this one — so an incorporated completion for it has no canonical
+    # scenario it could be covering.
+    canonical = {"recognized_hash_a", "recognized_hash_b"}
+    assert scenario_hash not in canonical
+    return SystemStateView(canonical)
+
+
+@when("the lead's system-state view incorporates that BC-journaled completion")
+def when_view_incorporates_completion(
+    system_state_view: SystemStateView, bc_journal: ScenarioJournal, context: dict
+) -> None:
+    # Capture the pre-incorporation coverage/denominator so we can assert
+    # the orphan changes neither.
+    context["pre_coverage"] = system_state_view.coverage_count()
+    context["pre_denominator"] = system_state_view.outstanding_denominator()
+    for h in bc_journal.entries():
+        system_state_view.incorporate_completion(h)
+
+
+@then(
+    parsers.parse(
+        'the completion with block-only canonical hash "{scenario_hash}" is '
+        'flagged as an unrecognized orphan anomaly surfaced for investigation'
+    )
+)
+def then_flagged_orphan(
+    system_state_view: SystemStateView, scenario_hash: str
+) -> None:
+    assert system_state_view.is_orphan(scenario_hash), (
+        f"expected {scenario_hash!r} to be flagged as an orphan anomaly"
+    )
+    assert scenario_hash in system_state_view.orphan_anomalies(), (
+        f"expected {scenario_hash!r} to be surfaced in the orphan-anomaly "
+        f"set for investigation; got {system_state_view.orphan_anomalies()!r}"
+    )
+
+
+@then(parsers.parse('"{scenario_hash}" is excluded from the coverage count'))
+def then_excluded_from_coverage(
+    system_state_view: SystemStateView, scenario_hash: str, context: dict
+) -> None:
+    # The orphan did not increment the coverage numerator.
+    assert system_state_view.coverage_count() == context["pre_coverage"], (
+        f"orphan {scenario_hash!r} was counted in coverage; "
+        f"pre={context['pre_coverage']!r}, "
+        f"post={system_state_view.coverage_count()!r}"
+    )
+
+
+@then(parsers.parse('"{scenario_hash}" is excluded from the outstanding denominator'))
+def then_excluded_from_denominator(
+    system_state_view: SystemStateView, scenario_hash: str, context: dict
+) -> None:
+    # The orphan did not join the outstanding denominator.
+    assert system_state_view.outstanding_denominator() == context["pre_denominator"], (
+        f"orphan {scenario_hash!r} joined the outstanding denominator; "
+        f"pre={context['pre_denominator']!r}, "
+        f"post={system_state_view.outstanding_denominator()!r}"
     )

@@ -1,0 +1,16 @@
+Feature: BC-journaled completion absent from the lead's canonical features is an orphan anomaly (lead-if3j)
+
+  When a BC journal reports a completed scenario whose block-only canonical
+  hash matches no scenario block under the lead's canonical features, the
+  lead's system-state view flags it as an unrecognized orphan anomaly for
+  investigation and excludes it from both the coverage numerator and the
+  outstanding denominator.
+
+  @scenario_hash:03a396b8dc08041e @bc:shopsystem-messaging
+  Scenario: a BC-journaled completion whose block-only canonical hash is absent from the lead's canonical features is flagged as an unrecognized orphan anomaly
+    Given a BC journal reports a completed scenario whose block-only canonical hash is "h7"
+    And no scenario block under the lead's features carries "h7" as its @scenario_hash tag
+    When the lead's system-state view incorporates that BC-journaled completion
+    Then the completion with block-only canonical hash "h7" is flagged as an unrecognized orphan anomaly surfaced for investigation
+    And "h7" is excluded from the coverage count
+    And "h7" is excluded from the outstanding denominator
