@@ -27,7 +27,15 @@ against (the same identity the BC echoes in ``work_done.scenario_hashes``).
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Set
+import re
+from pathlib import Path
+from typing import Dict, Iterable, List, Set, Union
+
+# A committed @scenario_hash tag on a feature block: the tag value is the
+# block-only canonical hash for that scenario block (ADR-019). The rebuild
+# below treats the *committed tag value* as authoritative — it is the
+# "as-committed @scenario_hash tag" the journal bootstraps from.
+_SCENARIO_HASH_TAG = re.compile(r"@scenario_hash:([0-9a-fA-F]+)")
 
 
 class ScenarioJournal:
@@ -63,6 +71,39 @@ class ScenarioJournal:
     def entries(self) -> List[str]:
         """Return the journaled hashes in append order (a copy)."""
         return list(self._entries)
+
+    def rebuild_from_features(self, features_tree: Union[str, Path]) -> None:
+        """Rebuild this journal from a BC's as-committed features tree.
+
+        Scans ``features_tree`` (a directory) for ``@scenario_hash:<hash>``
+        tags on the feature blocks committed there, and BOOTSTRAPS each
+        committed tag value into the journal as an entry. The bootstrap
+        predicate is the as-committed tag ALONE: a hash present on a
+        committed feature block is journaled here even though no
+        ``work_done`` event drove an append for it. This is how a BC
+        reconstructs its authoritative journal from the gated,
+        commit-time-green features tree (the source of truth on disk) when
+        the journal does not yet carry those hashes.
+
+        The committed tag value is taken verbatim as the block-only
+        canonical hash — the tag the BC writes on disk for a scenario block
+        already IS that block's block-only canonical hash (ADR-019), so the
+        rebuild reuses it rather than re-deriving it.
+
+        Idempotent and non-destructive: each committed tag is appended via
+        :meth:`append`, so rebuilding a second time over the same
+        as-committed features tree yields a journal identical entry by
+        entry — a hash already journaled is not duplicated, and no
+        previously-journaled hash (whether bootstrapped or work_done-driven)
+        is removed or overwritten.
+        """
+        root = Path(features_tree)
+        # A stable, deterministic walk order so the bootstrapped entries are
+        # appended in a reproducible order across rebuilds.
+        for feature_file in sorted(root.rglob("*.feature")):
+            text = feature_file.read_text(encoding="utf-8")
+            for match in _SCENARIO_HASH_TAG.finditer(text):
+                self.append(match.group(1))
 
 
 class LeadSnapshot:

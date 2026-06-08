@@ -11603,6 +11603,167 @@ def then_snapshot_matches_journal(
 
 
 # -----------------------------------------------------------------------
+# lead-7hsl: a BC rebuilds its authoritative journal from its as-committed
+# @scenario_hash-tagged features tree.
+#
+# The committed feature block's @scenario_hash tag IS the block-only
+# canonical hash (ADR-019). The rebuild bootstraps each such committed tag
+# into the journal on the as-committed predicate ALONE (no work_done
+# required), reusing the committed tag value rather than re-deriving it.
+# The rebuild is idempotent and non-destructive over repeated rebuilds.
+#
+# The scenario's "h8" is a stand-in for "the block-only canonical hash";
+# the steps below bind it to a REAL canonical hash computed from a real
+# committed feature block, so the bootstrap exercises the same hash
+# identity the BC writes on disk.
+# -----------------------------------------------------------------------
+
+@given(
+    parsers.parse(
+        'a BC whose features tree carries a scenario block whose committed '
+        '@scenario_hash tag is the block-only canonical hash "{label}", '
+        "demonstrated green in the BC's gated commit-time state"
+    ),
+    target_fixture="committed_features_tree",
+)
+def given_committed_features_tree(label: str, tmp_path: Path, context: dict) -> Path:
+    from scenarios.hash import compute_scenario_hash
+
+    # A real scenario block whose committed @scenario_hash tag equals its
+    # block-only canonical hash (ADR-019), demonstrated green at commit time.
+    scenario_block = (
+        "Scenario: a representative pinned behavior\n"
+        "  Given a precondition\n"
+        "  When an action occurs\n"
+        "  Then an observable outcome holds\n"
+    )
+    canonical_hash = compute_scenario_hash(scenario_block)
+    features_tree = tmp_path / "features"
+    features_tree.mkdir()
+    # The committed tag carries the block-only canonical hash; the Feature:
+    # header is NOT part of the canonical hash text (ADR-019), so writing the
+    # block under a Feature header on disk does not change the tag value.
+    feature_text = (
+        "Feature: a committed BC feature\n\n"
+        f"  @scenario_hash:{canonical_hash} @bc:shopsystem-messaging\n"
+        + "\n".join("  " + line for line in scenario_block.splitlines())
+        + "\n"
+    )
+    (features_tree / "committed.feature").write_text(feature_text, encoding="utf-8")
+
+    # The committed tag value must equal the BLOCK-ONLY canonical hash
+    # recomputed from the on-disk scenario block (the as-committed
+    # predicate). Recompute from the scenario block extracted from disk —
+    # excluding the Feature: header and the tag line, which are not part of
+    # the block-only canonical hash text.
+    import re as _re
+
+    on_disk_tag = _re.search(
+        r"@scenario_hash:([0-9a-fA-F]+)", feature_text
+    ).group(1)
+    on_disk_lines = feature_text.splitlines()
+    sc_start = next(
+        i for i, l in enumerate(on_disk_lines) if l.strip().startswith("Scenario:")
+    )
+    on_disk_block = "\n".join(on_disk_lines[sc_start:])
+    assert on_disk_tag == compute_scenario_hash(on_disk_block), (
+        "precondition failed: committed @scenario_hash tag is not the "
+        "block-only canonical hash of the on-disk scenario block"
+    )
+    # Bind the scenario's stand-in label "h8" to the real canonical hash.
+    context.setdefault("hash_labels", {})[label] = canonical_hash
+    return features_tree
+
+
+@given(
+    parsers.parse(
+        'the BC\'s authoritative journal is empty of "{label}" because no '
+        "work_done event drove an append for it"
+    ),
+    target_fixture="bc_journal",
+)
+def given_journal_empty_of_hash(label: str, context: dict) -> ScenarioJournal:
+    journal = ScenarioJournal()
+    # Seed an unrelated, pre-existing work_done-driven entry so the rebuild's
+    # non-destructiveness over previously-journaled hashes can be asserted.
+    prior = "preexisting_journaled_hash"
+    journal.append(prior)
+    context["journal_prior_entries"] = journal.entries()
+    canonical_hash = context["hash_labels"][label]
+    assert prior != canonical_hash
+    assert not journal.contains(canonical_hash), (
+        f"precondition failed: journal already contains {canonical_hash!r}"
+    )
+    return journal
+
+
+@when(
+    "the BC rebuilds its authoritative journal from its as-committed "
+    "@scenario_hash-tagged features tree"
+)
+def when_bc_rebuilds_journal(
+    bc_journal: ScenarioJournal, committed_features_tree: Path, context: dict
+) -> None:
+    bc_journal.rebuild_from_features(committed_features_tree)
+    # Snapshot the journal after the first rebuild so idempotence of a
+    # second rebuild can be asserted entry-by-entry.
+    context["journal_after_first_rebuild"] = bc_journal.entries()
+
+
+@then(
+    parsers.parse(
+        "the BC's authoritative journal contains the block-only canonical "
+        'hash "{label}" as a bootstrapped entry on the as-committed '
+        "predicate alone, with no work_done required"
+    )
+)
+def then_journal_bootstrapped_hash(
+    bc_journal: ScenarioJournal, label: str, context: dict
+) -> None:
+    canonical_hash = context["hash_labels"][label]
+    assert bc_journal.contains(canonical_hash), (
+        f"expected journal to contain bootstrapped {canonical_hash!r} after "
+        f"rebuild; entries={bc_journal.entries()!r}"
+    )
+    # Bootstrapped on the as-committed predicate ALONE: no work_done append
+    # was driven for this hash, yet the rebuild journaled it.
+
+
+@then(
+    parsers.parse(
+        "rebuilding the journal a second time over the same as-committed "
+        "features tree yields a journal identical entry-by-entry, neither "
+        'duplicating "{label}" nor dropping any previously-journaled hash'
+    )
+)
+def then_rebuild_idempotent(
+    bc_journal: ScenarioJournal,
+    committed_features_tree: Path,
+    label: str,
+    context: dict,
+) -> None:
+    before_second = context["journal_after_first_rebuild"]
+    bc_journal.rebuild_from_features(committed_features_tree)
+    after_second = bc_journal.entries()
+    # Identical entry-by-entry: idempotent.
+    assert after_second == before_second, (
+        f"second rebuild was not identity-preserving: "
+        f"before={before_second!r}, after={after_second!r}"
+    )
+    # Not duplicated.
+    canonical_hash = context["hash_labels"][label]
+    assert after_second.count(canonical_hash) == 1, (
+        f"second rebuild duplicated {canonical_hash!r}: {after_second!r}"
+    )
+    # No previously-journaled (work_done-driven) hash dropped.
+    for prior in context["journal_prior_entries"]:
+        assert prior in after_second, (
+            f"second rebuild dropped previously-journaled {prior!r}: "
+            f"{after_second!r}"
+        )
+
+
+# -----------------------------------------------------------------------
 # lead-if3j: completion lookup keyed on block-only canonical hash,
 # incremental snapshot application, and orphan-anomaly detection.
 #
