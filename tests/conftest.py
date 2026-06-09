@@ -11430,3 +11430,121 @@ def then_adr020_no_shop_root_column(context: dict) -> None:
         f"shop_registry still carries a shop_root column after migration: "
         f"{sorted(cols)}"
     )
+
+
+# ===========================================================================
+# lead-fnj5: the depends-on dispatch gate reads bd-native issue status as
+# authoritative. A predecessor closed via `bd close` carries bd-native
+# status=closed even though its dispatch_state metadata was never advanced
+# past consumed (the facade has no `bd close` hook). The gate MUST treat such
+# a predecessor as SATISFIED: strict-mode send passes and --queue-on-dependency
+# dispatches normally rather than queuing forever.
+#
+# Deterministic seam: a REAL `bd close` is run against the predecessor, so the
+# native status genuinely flips to closed while dispatch_state stays consumed.
+# This is exactly the disagreement the fix resolves (no shop-msg hook fakery).
+# ===========================================================================
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists at dispatch_state="{state}" then '
+        'closed via "bd close" so its bd-native status is "closed" while its '
+        'dispatch_state metadata remains "{meta_state}"'
+    )
+)
+def fnj5_given_closed_bd_issue_unadvanced(
+    work_id: str, state: str, meta_state: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # Create the dispatch bead and move its dispatch_state metadata to the
+    # pre-close value (consumed). Then run a genuine `bd close`, which flips the
+    # bd-native status to closed but leaves dispatch_state metadata untouched.
+    _eow5_create_dispatch_bead_at_state(lead_root, work_id, state)
+    proc = subprocess.run(
+        ["bd", "close", work_id],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"bd close {work_id} failed: {proc.stderr}"
+    # Verify the demonstrated disagreement is set up correctly: bd-native status
+    # is closed, but the dispatch_state metadata still reads the pre-close value.
+    rec = _bd_facade.get_dispatch_bead(lead_root, work_id) or {}
+    assert rec.get("status") == "closed", (
+        f"expected bd-native status=closed after bd close; rec={rec}"
+    )
+    assert (rec.get("metadata") or {}).get("dispatch_state") == meta_state, (
+        f"expected dispatch_state metadata to remain {meta_state!r}; rec={rec}"
+    )
+
+
+@then(
+    parsers.parse(
+        "a postgres outbox row at (bc={bc}, direction='outbox', "
+        "work_id='{work_id}', message_type='{mtype}') is deposited"
+    )
+)
+def fnj5_then_postgres_row_deposited(
+    bc: str, work_id: str, mtype: str, context: dict
+) -> None:
+    assert context["cli_returncode"] == 0, (
+        f"expected zero exit before deposit check; "
+        f"stderr={context.get('cli_stderr')!r}"
+    )
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [
+        r for r in rows
+        if r["work_id"] == work_id and r["message_type"] == mtype
+    ]
+    assert matching, (
+        f"expected a deposited row for {work_id} ({mtype}); found rows="
+        f"{[(r['work_id'], r['message_type']) for r in rows]}"
+    )
+
+
+@then(
+    parsers.parse(
+        'NO queued lead bd entry "{work_id}" carrying pending_dependency is '
+        'created'
+    )
+)
+def fnj5_then_no_queued_pending_dependency(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    # The gate is satisfied, so the dispatch proceeds normally: no queued intent
+    # at outbox_pending with a pending_dependency pointer. (A normal send still
+    # creates a dispatch bead that advances through outbox_pending->dispatched;
+    # the load-bearing negative is the pending_dependency pointer, which only a
+    # queued/deferred dispatch carries.)
+    assert "pending_dependency" not in meta, (
+        f"{work_id} must NOT be queued behind a closed predecessor; meta={meta}"
+    )
+    assert meta.get("dispatch_state") != _bd_facade.STATE_OUTBOX_PENDING, (
+        f"{work_id} must not be left queued at outbox_pending; meta={meta}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that bd-native status=closed '
+        'is the authoritative satisfaction signal for the depends-on gate, '
+        'independent of the dispatch_state metadata projection'
+    )
+)
+def fnj5_then_pin_strict_authoritative(context: dict) -> None:
+    # The predecessor's dispatch_state metadata was never advanced past consumed
+    # (set up in the Given); the send nonetheless succeeded. That is only
+    # possible if the gate consulted bd-native status, not the metadata.
+    assert context["cli_returncode"] == 0
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that --queue-on-dependency '
+        'MUST NOT queue behind an already-closed predecessor: a closed bd issue '
+        'satisfies the gate so the dispatch proceeds normally rather than '
+        'deferring forever'
+    )
+)
+def fnj5_then_pin_queue_no_defer(context: dict) -> None:
+    assert context["cli_returncode"] == 0

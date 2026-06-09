@@ -1575,10 +1575,13 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
         # lead-tuu5.)
         pending_dependency = metadata.get(bd_facade.KEY_PENDING_DEPENDENCY)
         if pending_dependency:
-            predecessor_state = bd_facade.predecessor_dispatch_state(
-                shop_root, pending_dependency
-            )
-            if predecessor_state != bd_facade.STATE_CLOSED:
+            # Authoritative ground truth is bd-native issue status (lead-fnj5
+            # cure (a)): a predecessor closed via `bd close` reads
+            # status=closed even though its dispatch_state metadata was never
+            # advanced past consumed. predecessor_satisfied() ORs the
+            # bd-native status with the historical dispatch_state=closed
+            # projection, so this skip remains at least as strict as before.
+            if not bd_facade.predecessor_satisfied(shop_root, pending_dependency):
                 continue
         work_id = bead.get("id")
         bc_name = metadata.get(bd_facade.KEY_DISPATCHED_TO_BC)

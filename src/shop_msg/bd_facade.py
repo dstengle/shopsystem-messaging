@@ -551,25 +551,54 @@ def predecessor_dispatch_state(lead_root: Path, work_id: str) -> str | None:
     return metadata.get(KEY_DISPATCH_STATE)
 
 
-def first_unclosed_predecessor(lead_root: Path, work_id: str) -> tuple[str, str] | None:
-    """Return (predecessor_work_id, its_dispatch_state) for the first
-    depends-on predecessor of ``work_id`` that is NOT at dispatch_state=closed,
-    or None when every predecessor is closed (or there are none).
+def predecessor_satisfied(lead_root: Path, work_id: str) -> bool:
+    """Return True iff the predecessor bead ``work_id`` counts as CLOSED for the
+    purpose of the depends-on dispatch gate (PDR-010 / ADR-013).
 
-    The dispatch_state is reported as the bead's metadata value, defaulting to
-    the literal string of bd's native status when no dispatch_state metadata is
-    present, so the caller can name a concrete state in its refusal message.
+    bd-native issue status is the authoritative ground truth (lead-fnj5 cure
+    (a)): a predecessor is SATISFIED when its bd-native ``status`` is ``closed``,
+    regardless of its ``dispatch_state`` metadata value. The terminal close runs
+    via ``bd close`` (PDR-010 / ADR-017 reconciliation), which the facade has no
+    hook on, so a genuinely-closed predecessor is left at
+    ``dispatch_state=consumed`` while its native status reads ``closed``. Keying
+    the gate on the metadata projection alone therefore refuses against
+    actually-closed predecessors. We additionally honor the historical
+    ``dispatch_state == "closed"`` projection so any caller (or test) that
+    advances the metadata to ``closed`` without a bd-native close is still
+    treated as satisfied — the two sources are OR'd, never AND'd, so the gate is
+    strictly more permissive than the metadata-only check and no previously
+    satisfied predecessor becomes unsatisfied.
+    """
+    rec = get_dispatch_bead(lead_root, work_id)
+    if rec is None:
+        return False
+    if (rec.get("metadata") or {}).get(KEY_DISPATCH_STATE) == STATE_CLOSED:
+        return True
+    return rec.get("status") == STATE_CLOSED
+
+
+def first_unclosed_predecessor(lead_root: Path, work_id: str) -> tuple[str, str] | None:
+    """Return (predecessor_work_id, its_reported_state) for the first depends-on
+    predecessor of ``work_id`` that is NOT satisfied (neither bd-native
+    ``status=closed`` nor ``dispatch_state=closed``), or None when every
+    predecessor is satisfied (or there are none).
+
+    The reported state is the bead's ``dispatch_state`` metadata value, falling
+    back to the literal string of bd's native status when no dispatch_state
+    metadata is present, so the caller can name a concrete state in its refusal
+    message.
     """
     for predecessor in list_depends_on(lead_root, work_id):
+        if predecessor_satisfied(lead_root, predecessor):
+            continue
+        # Report a concrete state for the refusal message: prefer the
+        # dispatch_state metadata; fall back to bd native status.
         state = predecessor_dispatch_state(lead_root, work_id=predecessor)
-        if state != STATE_CLOSED:
-            # Report a concrete state for the refusal message: prefer the
-            # dispatch_state metadata; fall back to bd native status.
-            reported = state
-            if reported is None:
-                rec = get_dispatch_bead(lead_root, predecessor)
-                reported = (rec or {}).get("status") or "unknown"
-            return predecessor, reported
+        reported = state
+        if reported is None:
+            rec = get_dispatch_bead(lead_root, predecessor)
+            reported = (rec or {}).get("status") or "unknown"
+        return predecessor, reported
     return None
 
 
