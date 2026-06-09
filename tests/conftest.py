@@ -4053,41 +4053,191 @@ def when_run_prime_lead_by_name(lead_name: str, context: dict) -> None:
     context["cli_stderr"] = result.stderr
 
 
+# -----------------------------------------------------------------------
+# lead-mcps: prime --lead directs to send/nudge/consume and does NOT
+# advertise lead-side respond (carried scenario 0c1ecd9b9127edfa).
+# -----------------------------------------------------------------------
+
+
+@given(
+    parsers.parse('a lead shop named "{lead_name}"'),
+    target_fixture="mcps_lead_name",
+)
+def given_a_lead_shop_named(lead_name: str) -> str:
+    """Ensure a lead shop is registered under the given canonical name.
+
+    The session lead fixture already registers ``shopsystem-product`` as a
+    lead pointing at the session lead root; this step makes that
+    registration explicit (and idempotent) for the carried scenario.
+    """
+    registry_add(lead_name, shop_type="lead")
+    return lead_name
+
+
+@when(parsers.parse('the operator runs "shop-msg prime --lead"'))
+def when_operator_runs_prime_lead(mcps_lead_name: str, context: dict) -> None:
+    """Run ``shop-msg prime --lead <name>`` for the named lead shop."""
+    result = subprocess.run(
+        ["shop-msg", "prime", "--lead", mcps_lead_name],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    parsers.parse(
+        'the key commands section lists "{cmd}" for assign_scenarios, '
+        "request_bugfix, request_maintenance, request_scenario_register, "
+        "and request_shop_card"
+    )
+)
+def then_key_commands_lists_send_types(context: dict, cmd: str) -> None:
+    stdout = context.get("cli_stdout", "")
+    assert cmd in stdout, (
+        f"expected stdout to advertise {cmd!r}; stdout was:\n{stdout}"
+    )
+    for send_type in (
+        "assign_scenarios",
+        "request_bugfix",
+        "request_maintenance",
+        "request_scenario_register",
+        "request_shop_card",
+    ):
+        assert send_type in stdout, (
+            f"expected stdout to list send type {send_type!r}; "
+            f"stdout was:\n{stdout}"
+        )
+
+
+@then(parsers.parse('the key commands section lists "{cmd_a}" and "{cmd_b}"'))
+def then_key_commands_lists_nudge_consume(
+    context: dict, cmd_a: str, cmd_b: str
+) -> None:
+    stdout = context.get("cli_stdout", "")
+    for cmd in (cmd_a, cmd_b):
+        assert cmd in stdout, (
+            f"expected stdout to advertise {cmd!r}; stdout was:\n{stdout}"
+        )
+
+
+@then(
+    parsers.parse(
+        'the output does not advertise "{c1}", "{c2}", or "{c3}" as '
+        "lead-side commands"
+    )
+)
+def then_output_does_not_advertise_respond(
+    context: dict, c1: str, c2: str, c3: str
+) -> None:
+    stdout = context.get("cli_stdout", "")
+    for cmd in (c1, c2, c3):
+        for line in stdout.splitlines():
+            # Allow the disclaimer note that names "shop-msg respond" only to
+            # state it is a BC->lead vehicle (not a lead-side command).
+            if cmd in line and "vehicle" not in line and "does NOT" not in line:
+                raise AssertionError(
+                    f"prime --lead must not advertise {cmd!r} as a lead-side "
+                    f"command, but stdout had the line:\n{line}\n\n"
+                    f"full stdout:\n{stdout}"
+                )
+
+
+@then(
+    "the output states that the lead answers a BC clarify by re-dispatch "
+    "on a fresh lead bead, not by respond"
+)
+def then_output_states_redispatch(context: dict) -> None:
+    stdout = context.get("cli_stdout", "")
+    lowered = stdout.lower()
+    assert "re-dispatch" in lowered or "redispatch" in lowered, (
+        f"expected stdout to mention re-dispatch; stdout was:\n{stdout}"
+    )
+    assert "fresh lead bead" in lowered, (
+        f"expected stdout to mention a fresh lead bead; stdout was:\n{stdout}"
+    )
+    assert "respond" in lowered, (
+        f"expected stdout to contrast with respond; stdout was:\n{stdout}"
+    )
+
+
+# -----------------------------------------------------------------------
+# lead-mcps: BC-authored guard scenario — `shop-msg respond <verb>` is
+# REFUSED from a lead-shop CWD context, directing to send/nudge/consume.
+# -----------------------------------------------------------------------
+
+
+@given(
+    parsers.parse('a lead-shop CWD context registered as "{lead_name}"'),
+    target_fixture="lead_cwd_root",
+)
+def given_lead_cwd_context(tmp_path: Path, lead_name: str) -> Path:
+    """Create a temp dir with a .claude/shop/ marker whose type.md is 'lead'.
+
+    Invoking shop-msg with cwd=this path makes the CLI's caller-type
+    walk-up resolver (_walk_up_resolve_shop) see a confirmed 'lead'
+    caller — the condition the respond direction-guard refuses on.
+    """
+    root = _make_shop_dir(tmp_path, lead_name, "lead", subdir_name="lead_cwd")
+    registry_add(lead_name, shop_type="lead")
+    return root
+
+
+@when(
+    parsers.re(
+        r'shop-msg respond (?P<verb>clarify|work_done|mechanism_observation) '
+        r'is run from the lead-shop CWD context$'
+    )
+)
+def when_respond_run_from_lead_cwd(
+    verb: str, lead_cwd_root: Path, context: dict
+) -> None:
+    """Run a respond sub-verb from the lead-shop CWD (no --bc; caller-type
+    is resolved by walk-up from the lead-shop directory)."""
+    argv = ["shop-msg", "respond", verb, "--work-id", "lead-guard-probe"]
+    if verb == "clarify":
+        argv += ["--question", "probe"]
+    elif verb == "work_done":
+        argv += ["--status", "complete"]
+    elif verb == "mechanism_observation":
+        argv += ["--subject", "probe", "--body", "probe body"]
+    result = subprocess.run(
+        argv, cwd=str(lead_cwd_root), capture_output=True, text=True
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    "stderr directs the caller to shop-msg send, shop-msg nudge, and "
+    "shop-msg consume"
+)
+def then_stderr_directs_to_lead_vehicles(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    for vehicle in ("shop-msg send", "shop-msg nudge", "shop-msg consume"):
+        assert vehicle in stderr, (
+            f"expected stderr to direct the caller to {vehicle!r}; "
+            f"stderr was:\n{stderr}"
+        )
+
+
+@then('stderr states that "shop-msg respond" is a BC->lead vehicle only')
+def then_stderr_states_bc_to_lead_only(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "shop-msg respond" in stderr and "BC->lead" in stderr, (
+        f"expected stderr to state 'shop-msg respond' is a BC->lead "
+        f"vehicle only; stderr was:\n{stderr}"
+    )
+
+
 @then(parsers.parse('stdout contains "{text}"'))
 def then_stdout_contains(context: dict, text: str) -> None:
     stdout = context.get("cli_stdout", "")
     assert text in stdout, (
         f"expected stdout to contain {text!r}; stdout was:\n{stdout}"
-    )
-
-
-@then(
-    parsers.parse(
-        'stdout contains "{text}" on a line that also contains text indicating'
-        " the lead answers BC questions"
-    )
-)
-def then_stdout_contains_lead_answers_bc(context: dict, text: str) -> None:
-    """Assert stdout has a line containing both `text` and a phrase that
-    indicates the lead shop (not a BC) is the caller of respond clarify.
-    """
-    stdout = context.get("cli_stdout", "")
-    for line in stdout.splitlines():
-        if text in line:
-            # Any of the following phrases qualifies as "indicating lead answers BC".
-            lead_indicators = [
-                "lead answers",
-                "lead responds",
-                "answer BC",
-                "answer bc",
-                "responds to BC",
-                "responds to bc",
-            ]
-            if any(indicator in line for indicator in lead_indicators):
-                return
-    raise AssertionError(
-        f"expected a stdout line containing both {text!r} and text indicating "
-        f"'the lead answers BC questions'; stdout was:\n{stdout}"
     )
 
 

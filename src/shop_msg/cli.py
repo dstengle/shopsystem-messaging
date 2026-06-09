@@ -240,6 +240,51 @@ def _walk_up_resolve_shop(start: Path | None = None) -> tuple[str, str]:
     sys.exit(1)
 
 
+def _refuse_lead_side_respond(verb: str) -> int | None:
+    """Refuse `shop-msg respond <verb>` when the CALLER is a lead shop.
+
+    Worldview A (ADR-018 / 05-inter-shop-protocol.md §5.3): `shop-msg
+    respond` is a BC->lead vehicle ONLY. There is no lead->BC `respond`
+    row. When the CALLER's shop (resolved by CWD walk-up to the nearest
+    `.claude/shop/type.md`) is a `lead`, every respond sub-verb
+    (clarify / work_done / mechanism_observation) is refused with a
+    non-zero exit and a stderr message directing the lead to the
+    lead->BC vehicles.
+
+    Keys on the CALLER (CWD), never on the target `--bc`. Returns an
+    exit code (1) when the caller is a confirmed lead — the sub-verb
+    must return it immediately. Returns None otherwise (BC caller, or
+    no/partial marker, or the resolver could not confirm a lead), in
+    which case the sub-verb proceeds normally. The guard NEVER crashes
+    the command on a missing/partial marker: it only REFUSES on a
+    confirmed `lead` caller, so a BC-side respond (caller type `bc`)
+    and the no-marker case both fall through untouched.
+    """
+    try:
+        _name, shop_type = _walk_up_resolve_shop()
+    except SystemExit:
+        # No marker, partial marker, or an unrecognized shop type: the
+        # resolver could not confirm a `lead` caller. Do not refuse —
+        # and do not let the resolver's own non-zero exit escape, since
+        # that would crash an otherwise-legitimate BC-side respond run
+        # from a directory without a marker. Fall through.
+        return None
+    if shop_type == "lead":
+        print(
+            f"shop-msg respond {verb}: refused — 'shop-msg respond' is a "
+            f"BC->lead vehicle only; a lead shop does not 'respond'. The "
+            f"lead->BC vehicles are: 'shop-msg send' (assign_scenarios | "
+            f"request_bugfix | request_maintenance | request_scenario_register "
+            f"| request_shop_card), 'shop-msg nudge', and 'shop-msg consume'. "
+            f"To answer a BC clarify, RE-DISPATCH on a fresh lead bead (e.g. "
+            f"'shop-msg send request_bugfix ...'); the lead does not answer a "
+            f"clarify with 'respond'.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
 def _apply_cwd_resolution(args: argparse.Namespace) -> None:
     """Populate args.bc or args.lead from CWD if neither was given.
 
@@ -439,6 +484,10 @@ def _render_message_yaml(message) -> str:
 
 
 def _cmd_respond_clarify(args: argparse.Namespace) -> int:
+    refusal = _refuse_lead_side_respond("clarify")
+    if refusal is not None:
+        return refusal
+
     bc_root = _resolve_bc(args)
 
     if not args.question:
@@ -543,6 +592,10 @@ def _apply_bc_bead_response(
 
 
 def _cmd_respond_work_done(args: argparse.Namespace) -> int:
+    refusal = _refuse_lead_side_respond("work_done")
+    if refusal is not None:
+        return refusal
+
     bc_root = _resolve_bc(args)
 
     lead_root = _resolve_registered_lead()
@@ -596,6 +649,10 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
 
 
 def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
+    refusal = _refuse_lead_side_respond("mechanism_observation")
+    if refusal is not None:
+        return refusal
+
     bc_root = _resolve_bc(args)
 
     # Path-safety: refuse work_ids that would escape safe naming.
@@ -1972,11 +2029,15 @@ def _print_prime_lead_reminder(lead_name: str) -> None:
         "Key commands:\n"
         f"  shop-msg pending inbox --lead {lead_name}\n"
         f"  shop-msg read inbox --lead {lead_name} --work-id <id>\n"
-        "  shop-msg respond clarify  # lead answers BC questions\n"
-        "  shop-msg respond work_done | mechanism_observation ...\n"
-        "  shop-msg send ...        # dispatch into a BC inbox\n"
+        "  shop-msg send assign_scenarios | request_bugfix | request_maintenance"
+        " | request_scenario_register | request_shop_card  # dispatch into a BC inbox\n"
+        "  shop-msg nudge ...       # nudge a BC about a pending dispatch\n"
+        "  shop-msg consume ...     # consume a BC outbox response\n"
         f"  shop-msg watch --lead {lead_name}    # LISTEN/NOTIFY outbox watcher\n"
-        "  shop-msg registry ...    # add | remove | list shop registrations"
+        "  shop-msg registry ...    # add | remove | list shop registrations\n"
+        "Note: 'shop-msg respond' is a BC->lead vehicle only; the lead does NOT respond.\n"
+        "The lead answers a BC clarify by RE-DISPATCH on a fresh lead bead (a new\n"
+        "'shop-msg send ...'), not by 'shop-msg respond'."
     )
 
 

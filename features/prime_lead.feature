@@ -16,21 +16,14 @@ Feature: shop-msg prime --lead — lead shop context priming
   Then the command exits zero
   And stdout contains "Pending outbox responses: 2"
 
-  @scenario_hash:998dc8df4b103a22 @bc:shopsystem-messaging
-  Scenario: shop-msg prime --lead output includes shop-msg respond clarify in the key commands section
-  Given a registered lead shop at a temporary path
-  And the environment variable SHOPMSG_DSN is set to a reachable Postgres instance
-  When I run shop-msg prime --lead <name> for the registered lead shop
-  Then the command exits zero
-  And stdout contains "shop-msg respond clarify"
-
-  @scenario_hash:d16569f25194d6bc @bc:shopsystem-messaging
-  Scenario: shop-msg prime --lead annotates respond clarify to show the lead is the caller
-  Given a registered lead shop at a temporary path
-  And the environment variable SHOPMSG_DSN is set to a reachable Postgres instance
-  When I run shop-msg prime --lead <name> for the registered lead shop
-  Then the command exits zero
-  And stdout contains "shop-msg respond clarify" on a line that also contains text indicating the lead answers BC questions
+  @scenario_hash:0c1ecd9b9127edfa @bc:shopsystem-messaging
+  Scenario: prime --lead directs the lead to send/nudge/consume and does not advertise lead-side respond
+    Given a lead shop named "shopsystem-product"
+    When the operator runs "shop-msg prime --lead"
+    Then the key commands section lists "shop-msg send" for assign_scenarios, request_bugfix, request_maintenance, request_scenario_register, and request_shop_card
+    And the key commands section lists "shop-msg nudge" and "shop-msg consume"
+    And the output does not advertise "shop-msg respond clarify", "shop-msg respond work_done", or "shop-msg respond mechanism_observation" as lead-side commands
+    And the output states that the lead answers a BC clarify by re-dispatch on a fresh lead bead, not by respond
 
   @scenario_hash:af462b8837827091 @bc:shopsystem-messaging
   Scenario: shop-msg prime --lead exits non-zero with an error message when the lead name is not registered
