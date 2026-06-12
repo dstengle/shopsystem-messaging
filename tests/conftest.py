@@ -2450,8 +2450,16 @@ def _schema_class_for(name: str):
     return cls
 
 
+# The schema_name is restricted to a single alphabetic token via parsers.re
+# (not parsers.parse) so this step does NOT greedily capture multi-word
+# schema designators like "RequestCompletionJournal request" / "... response"
+# used by the request_completion_journal scenarios (lead-f1ui), which carry
+# their own dedicated exact-match Given steps. All six bd-decoupling schema
+# names are single tokens, so this restriction leaves their matching intact.
 @given(
-    parsers.parse("the {schema_name} schema from the shop-msg catalog"),
+    parsers.re(
+        r"the (?P<schema_name>[A-Za-z]+) schema from the shop-msg catalog"
+    ),
     target_fixture="bd_decoupling_schema_name",
 )
 def given_schema_from_catalog(schema_name: str) -> str:
@@ -11824,3 +11832,63 @@ def fnj5_then_pin_strict_authoritative(context: dict) -> None:
 )
 def fnj5_then_pin_queue_no_defer(context: dict) -> None:
     assert context["cli_returncode"] == 0
+
+
+# ===========================================================================
+# request_completion_journal (lead-f1ui) — request + response message type
+# ===========================================================================
+#
+# A request_completion_journal asks a target BC for the set of block-only
+# canonical scenario hashes it has completed. The request names the target BC
+# and carries no completion entries of its own; the response carries the
+# completed entries back as a bare set of hashes. Step defs below drive the
+# four assigned scenarios (hashes 65c85ffce8f88507, 7afa72ede6099ee1,
+# 79dd275d8584c8fc, 5138b2335150db4c).
+
+# The shared "Then construction succeeds" / "Then no schema validation error
+# is raised" steps (defined for the bd-decoupling scenarios above) read from
+# context["bd_decoupling_error"] / context["bd_decoupling_instance"]. The
+# request_completion_journal construction scenarios (1 and 2) reuse those
+# shared Then steps by populating the SAME context keys in their When steps,
+# so we do NOT redefine them here.
+
+# --- Behavior 1: request schema minimal valid construction -----------------
+
+@given(
+    "the RequestCompletionJournal request schema from the shop-msg catalog",
+    target_fixture="rcj_request_cls",
+)
+def rcj_request_schema():
+    from catalog.schemas import RequestCompletionJournal
+    return RequestCompletionJournal
+
+
+@when(
+    "I construct a RequestCompletionJournal request instance supplying only the "
+    "fields the schema marks as required, naming the target bounded context "
+    "whose completed scenarios are sought"
+)
+def rcj_construct_request_minimal(rcj_request_cls, context: dict) -> None:
+    try:
+        instance = rcj_request_cls(
+            message_type="request_completion_journal",
+            work_id="lead-rcj-min",
+            target_bc="shopsystem-scenarios",
+        )
+        context["bd_decoupling_error"] = None
+        context["bd_decoupling_instance"] = instance
+    except Exception as exc:  # noqa: BLE001
+        context["bd_decoupling_error"] = exc
+        context["bd_decoupling_instance"] = None
+
+
+@then(
+    "the constructed request carries the named target bounded context and no "
+    "scenario-completion entry of its own"
+)
+def rcj_request_carries_target_no_entries(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    assert instance.target_bc == "shopsystem-scenarios"
+    # The request schema must NOT carry a completed-entries field at all: it
+    # is a request for the journal, not a carrier of completion state.
+    assert not hasattr(instance, "completed_entries")
