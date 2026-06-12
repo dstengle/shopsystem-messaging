@@ -515,7 +515,18 @@ def list_dispatch_beads(lead_root: Path) -> list[dict[str, Any]]:
 # `bd dep add <dependent> <predecessor>`. shop-msg consults those edges (it
 # never re-checks acyclicity at dispatch time — ADR-013 decision 8 makes the
 # graph invariantly acyclic by construction, enforced bd-side).
+#
+# The dispatch guard gates ONLY on true depends-on / blocks edges (ADR-013
+# decision 4). A bd ``parent-child`` edge is an EPIC-CONTAINER relation, not a
+# dispatch predecessor: an epic is open by design for its whole work-stream, so
+# gating on its parent-child edge would make every child permanently
+# undispatchable (lead-j4ne). Such edges are therefore EXCLUDED from the
+# gating-predecessor set below.
 # ---------------------------------------------------------------------------
+
+# bd ``dependency_type`` values that are container relations, NOT dispatch
+# predecessors. These never gate a dispatch.
+NON_GATING_DEPENDENCY_TYPES = frozenset({"parent-child"})
 
 
 def list_depends_on(lead_root: Path, work_id: str) -> list[str]:
@@ -526,6 +537,10 @@ def list_depends_on(lead_root: Path, work_id: str) -> list[str]:
     shop-msg's strict mode walks; it trusts the graph is a DAG (ADR-013
     decision 8) so a simple one-hop enumeration of direct predecessors is the
     consultation contract the scenarios pin.
+
+    Only GATING edges are returned: ``parent-child`` (epic-container) edges are
+    excluded (lead-j4ne), so the dispatch guard gates strictly on true
+    depends-on / blocks predecessors per ADR-013 decision 4.
     """
     proc = _run_bd(["dep", "list", work_id, "--json"], cwd=lead_root, check=False)
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -535,7 +550,13 @@ def list_depends_on(lead_root: Path, work_id: str) -> list[str]:
     except json.JSONDecodeError:
         return []
     rows = data if isinstance(data, list) else data.get("dependencies", [])
-    return [r["id"] for r in rows if isinstance(r, dict) and r.get("id")]
+    return [
+        r["id"]
+        for r in rows
+        if isinstance(r, dict)
+        and r.get("id")
+        and r.get("dependency_type") not in NON_GATING_DEPENDENCY_TYPES
+    ]
 
 
 def predecessor_dispatch_state(lead_root: Path, work_id: str) -> str | None:

@@ -81,6 +81,18 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And per ADR-013 decision 8, acyclicity is enforced on the bd side; shop-msg send does NOT need to re-check at dispatch time, because the depends-on graph is invariantly acyclic by construction
     And the load-bearing property pinned here is that the bd-side cycle-rejection contract is what makes shop-msg send's introspection step safe from infinite-loop pathology: shop-msg send walks the graph trusting it is a DAG — the participant-naming detail in bd's error text is UX, NOT the architectural property pinned here
 
+  @scenario_hash:6b3559d0bf3141ff @bc:shopsystem-messaging
+  Scenario: a parent-child epic-container edge to an open epic does NOT gate dispatch — only true depends-on / blocks edges gate (PDR-010 ADR-013 decision 4 tightening)
+    Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
+    And a BC "shopsystem-messaging" registered in the messaging registry
+    And an open epic lead bd entry "lead-epic" exists (open by container design for its whole work-stream)
+    And the lead architect has recorded a parent-child edge with "bd dep add lead-rch lead-epic --type parent-child" so lead-rch is a child of the epic lead-epic
+    And a payload file at "/tmp/payload-rch.yaml" pinning a valid request_bugfix
+    When the lead architect runs "shop-msg send request_bugfix --bc shopsystem-messaging --work-id lead-rch --payload /tmp/payload-rch.yaml" (no --queue-on-dependency flag)
+    Then the command exits zero (the parent-child epic edge is a container relation, not a gating predecessor)
+    And a postgres outbox row at (bc=shopsystem-messaging, direction='outbox', work_id='lead-rch', message_type='request_bugfix') IS inserted
+    And the load-bearing property pinned here is that a parent-child epic-container edge is EXCLUDED from the gating-predecessor set: an epic is open by design for its whole work-stream, so gating on its parent-child edge would make every child permanently undispatchable
+
   @scenario_hash:a326c2f50eeceed4 @bc:shopsystem-messaging
   Scenario: shop-msg sweep does NOT promote a queued bead whose predecessor is still open
     Given a lead bd entry "lead-ppp" at dispatch_state=outbox_pending with pending_dependency="lead-qqq" and an outbox_pending_at older than the sweep threshold

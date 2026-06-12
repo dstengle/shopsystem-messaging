@@ -8575,6 +8575,44 @@ def eow5_given_dep_edge(
 
 @given(
     parsers.parse(
+        'an open epic lead bd entry "{work_id}" exists (open by container '
+        'design for its whole work-stream)'
+    )
+)
+def eow5_given_open_epic(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # A plain (non-dispatch) planning bead standing in for the epic container.
+    # It is left OPEN — that is exactly the condition under which gating on its
+    # parent-child edge would (wrongly) refuse every child's dispatch.
+    _eow5_create_plain_bead(lead_root, work_id)
+
+
+@given(
+    parsers.parse(
+        'the lead architect has recorded a parent-child edge with "bd dep add '
+        '{dependent} {predecessor} --type parent-child" so {child} is a child '
+        'of the epic {predecessor2}'
+    )
+)
+def eow5_given_parent_child_edge(
+    dependent: str, predecessor: str, child: str, predecessor2: str,
+    context: dict,
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The child is a plain planning bead whose ONLY edge to the epic is the
+    # epic-container parent-child relation (NOT a depends-on / blocks edge).
+    _eow5_create_plain_bead(lead_root, dependent)
+    if not _eow5_bead_exists(lead_root, predecessor):
+        _eow5_create_plain_bead(lead_root, predecessor)
+    proc = subprocess.run(
+        ["bd", "dep", "add", dependent, predecessor, "--type", "parent-child"],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"bd dep add --type parent-child failed: {proc.stderr}"
+
+
+@given(
+    parsers.parse(
         'the lead architect has already recorded a depends-on edge "bd dep add '
         '{dependent} {predecessor}" so {dependent2} depends on {predecessor2}'
     )
@@ -8805,6 +8843,59 @@ def eow5_then_strict_refusal_message(
     err = (context.get("cli_stderr") or "") + (context.get("cli_stdout") or "")
     assert predecessor in err, f"refusal must name predecessor {predecessor!r}: {err!r}"
     assert state in err, f"refusal must name state {state!r}: {err!r}"
+
+
+@then(
+    parsers.parse(
+        'the command exits zero (the parent-child epic edge is a container '
+        'relation, not a gating predecessor)'
+    )
+)
+def eow5_then_exit_zero_parent_child(context: dict) -> None:
+    assert context["cli_returncode"] == 0, (
+        "expected zero exit; a parent-child epic edge must NOT gate dispatch. "
+        f"stderr={context.get('cli_stderr')!r} stdout={context.get('cli_stdout')!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        "a postgres outbox row at (bc={bc}, direction='outbox', "
+        "work_id='{work_id}', message_type='{mtype}') IS inserted"
+    )
+)
+def eow5_then_postgres_row_inserted(
+    bc: str, work_id: str, mtype: str, context: dict
+) -> None:
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [
+        r for r in rows
+        if r["work_id"] == work_id and r["message_type"] == mtype
+    ]
+    assert matching, (
+        f"expected a deposited row for {work_id}; "
+        f"found rows={[r['work_id'] for r in rows]}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that a parent-child '
+        'epic-container edge is EXCLUDED from the gating-predecessor set: an '
+        'epic is open by design for its whole work-stream, so gating on its '
+        'parent-child edge would make every child permanently undispatchable'
+    )
+)
+def eow5_then_parent_child_excluded_property(context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    work_id = context["eow5_active_work_id"]
+    # The dispatch succeeded and produced real dispatch state — proving the
+    # epic-container edge was excluded from the gating set, not merely tolerated.
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == _bd_facade.STATE_DISPATCHED, (
+        f"dispatch must have proceeded to 'dispatched' for {work_id}; meta={meta}"
+    )
 
 
 @then(
