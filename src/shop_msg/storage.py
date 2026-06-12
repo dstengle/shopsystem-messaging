@@ -219,8 +219,40 @@ CREATE TABLE IF NOT EXISTS shop_registry (
 # addresses (ADR-020). A canonical BC name "shopsystem-messaging" projects
 # to the abstract address "shopsystem/messaging"; the lead collapses to the
 # sentinel "shopsystem/lead" regardless of its canonical name.
-SYSTEM_SLUG = "shopsystem"
-LEAD_ABSTRACT_ADDRESS = f"{SYSTEM_SLUG}/lead"
+#
+# DEFAULT_SYSTEM_SLUG is the deployment default and is what every projection
+# resolves to when the slug is not externally configured (scenarios 50/53).
+# It is NOT a fixed binding: lead-tgsb / PDR-018 gate condition #2 externalizes
+# the slug so a genuinely-distinct second product obtains a distinct ADR-020
+# identity end-to-end. The slug is derived from an explicit configuration
+# surface following the established SHOPMSG_DSN pattern (see _get_system_slug).
+DEFAULT_SYSTEM_SLUG = "shopsystem"
+
+# Back-compat alias. The legacy module constant SYSTEM_SLUG is retained for
+# the addressing-migration DDL (which backfills LEGACY rows under the
+# deployment default) and for tests/importers that reference the default
+# slug by name. Live projection no longer binds to this constant — it calls
+# _get_system_slug() so the configured slug flows through.
+SYSTEM_SLUG = DEFAULT_SYSTEM_SLUG
+LEAD_ABSTRACT_ADDRESS = f"{DEFAULT_SYSTEM_SLUG}/lead"
+
+
+def _get_system_slug() -> str:
+    """Return the deployment system slug from the documented config surface.
+
+    Precedence (option (c) in the lead-tgsb dispatch — the established
+    SHOPMSG_DSN-style environment override):
+
+      1. SHOPMSG_SYSTEM_SLUG, if set and non-empty after stripping.
+      2. The deployment default ``shopsystem`` (DEFAULT_SYSTEM_SLUG).
+
+    Mirrors _get_dsn(): a single env-var read with a default, so the slug is
+    configured the same way the DSN is. When the override is unset (or empty)
+    the default projection pinned by scenarios 50/53 holds unchanged.
+    """
+    raw = os.environ.get("SHOPMSG_SYSTEM_SLUG", "")
+    slug = raw.strip()
+    return slug if slug else DEFAULT_SYSTEM_SLUG
 
 
 def _abstract_address_for(name: str, shop_type: str) -> str:
@@ -230,14 +262,19 @@ def _abstract_address_for(name: str, shop_type: str) -> str:
     canonical name. A BC name of the form ``<system>-<rest>`` projects to
     ``<system>/<rest>``; a name carrying no recognizable system prefix is
     placed under the deployment system slug as ``<system>/<name>``.
+
+    The ``<system>`` segment is the configured deployment slug
+    (_get_system_slug) — by default ``shopsystem`` (scenarios 50/53), or the
+    product's slug when SHOPMSG_SYSTEM_SLUG is set (PDR-018 gate #2).
     """
+    slug = _get_system_slug()
     if shop_type == "lead":
-        return LEAD_ABSTRACT_ADDRESS
-    prefix = f"{SYSTEM_SLUG}-"
+        return f"{slug}/lead"
+    prefix = f"{slug}-"
     if name.startswith(prefix):
         rest = name[len(prefix):]
-        return f"{SYSTEM_SLUG}/{rest}"
-    return f"{SYSTEM_SLUG}/{name}"
+        return f"{slug}/{rest}"
+    return f"{slug}/{name}"
 
 
 # ADR-020 addressing migration. A pre-migration shop_registry keyed on a
