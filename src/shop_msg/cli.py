@@ -99,6 +99,8 @@ from catalog.schemas import (
     MechanismObservation,
     Nudge,
     RequestBugfix,
+    RequestCompletionJournal,
+    RequestCompletionJournalResponse,
     RequestMaintenance,
     ScenarioPayload,
     WorkDone,
@@ -925,6 +927,7 @@ def _load_payload_file(path_str: str, message_type: str, work_id: str) -> dict:
         "request_maintenance": RequestMaintenance,
         "request_bugfix": RequestBugfix,
         "assign_scenarios": AssignScenarios,
+        "request_completion_journal": RequestCompletionJournal,
     }[message_type]
     message = model_cls(**data)
     return message.model_dump(exclude_none=True)
@@ -973,6 +976,51 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
         message_type="request_maintenance",
         payload=payload,
         scenario_hashes_pinned=hashes,
+        depends_on_dispatch=getattr(args, "depends_on", None),
+        bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
+        payload_ref=getattr(args, "payload", None),
+        queue_on_dependency=getattr(args, "queue_on_dependency", False),
+    )
+
+
+def _cmd_send_request_completion_journal(args: argparse.Namespace) -> int:
+    """`shop-msg send request_completion_journal` (lead-f1ui).
+
+    Deposits a request_completion_journal inbox message naming the target BC
+    whose completed scenarios are sought. Like the other lead->BC sends it runs
+    through the bd-first send protocol, which gracefully degrades to a bare
+    postgres deposit when no lead shop is registered.
+    """
+    bc_root = _resolve_bc(args)
+
+    if getattr(args, "payload", None):
+        payload = _load_payload_file(
+            args.payload, "request_completion_journal", args.work_id
+        )
+    else:
+        if args.target_bc is None:
+            print(
+                "shop-msg send request_completion_journal: --target-bc is "
+                "required unless --payload is supplied",
+                file=sys.stderr,
+            )
+            return 2
+        message = RequestCompletionJournal(
+            message_type="request_completion_journal",
+            work_id=args.work_id,
+            target_bc=args.target_bc,
+            from_shop=_resolve_send_sender(),
+        )
+        payload = message.model_dump(exclude_none=True)
+
+    return _bd_first_send(
+        command="request_completion_journal",
+        bc_root=bc_root,
+        bc_name=args.bc,
+        work_id=args.work_id,
+        message_type="request_completion_journal",
+        payload=payload,
+        scenario_hashes_pinned=None,
         depends_on_dispatch=getattr(args, "depends_on", None),
         bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
         payload_ref=getattr(args, "payload", None),
@@ -2505,6 +2553,55 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     request_bugfix.set_defaults(func=_cmd_send_request_bugfix)
+
+    request_completion_journal = send_sub.add_parser(
+        "request_completion_journal",
+        help="write a request_completion_journal message (lead-f1ui)",
+    )
+    request_completion_journal.add_argument(
+        "--bc", required=True, help="canonical BC name (resolved via registry)"
+    )
+    _add_removed_flag(request_completion_journal, "--bc-root")
+    request_completion_journal.add_argument(
+        "--work-id", required=True, help="work_id identifying this request"
+    )
+    request_completion_journal.add_argument(
+        "--target-bc",
+        default=None,
+        help=(
+            "the bounded context whose completed scenarios are sought "
+            "(required unless --payload)"
+        ),
+    )
+    request_completion_journal.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the complete message body; when "
+            "supplied it is the authoritative content source and --target-bc "
+            "is not required"
+        ),
+    )
+    request_completion_journal.add_argument(
+        "--depends-on",
+        default=None,
+        help=(
+            "work_id of a prior dispatch this one depends on; recorded on the "
+            "lead bd entry as depends_on_dispatch metadata"
+        ),
+    )
+    request_completion_journal.add_argument(
+        "--queue-on-dependency",
+        action="store_true",
+        help=(
+            "when a bd depends-on predecessor is not yet at "
+            "dispatch_state=closed, defer the postgres deposit (PDR-010 / "
+            "ADR-013 decision 4)"
+        ),
+    )
+    request_completion_journal.set_defaults(
+        func=_cmd_send_request_completion_journal
+    )
 
     send_nudge = send_sub.add_parser(
         "nudge",
