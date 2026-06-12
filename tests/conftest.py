@@ -11892,3 +11892,55 @@ def rcj_request_carries_target_no_entries(context: dict) -> None:
     # The request schema must NOT carry a completed-entries field at all: it
     # is a request for the journal, not a carrier of completion state.
     assert not hasattr(instance, "completed_entries")
+
+
+# --- Behavior 2: response schema bare set of completed hashes --------------
+
+@given(
+    "the RequestCompletionJournal response schema from the shop-msg catalog",
+    target_fixture="rcj_response_cls",
+)
+def rcj_response_schema():
+    from catalog.schemas import RequestCompletionJournalResponse
+    return RequestCompletionJournalResponse
+
+
+@when(
+    'I construct a RequestCompletionJournal response instance whose '
+    'completed-entries field is a set of block-only canonical hashes "h1" '
+    'and "h2"'
+)
+def rcj_construct_response_set(rcj_response_cls, context: dict) -> None:
+    try:
+        instance = rcj_response_cls(
+            message_type="request_completion_journal_response",
+            work_id="lead-rcj-resp",
+            completed_entries={"h1", "h2"},
+        )
+        context["bd_decoupling_error"] = None
+        context["bd_decoupling_instance"] = instance
+    except Exception as exc:  # noqa: BLE001
+        context["bd_decoupling_error"] = exc
+        context["bd_decoupling_instance"] = None
+
+
+@then(
+    'the constructed response carries exactly the completed block-only '
+    'canonical hashes "h1" and "h2" as a bare set, with no per-entry record '
+    'beyond the hash'
+)
+def rcj_response_carries_bare_set(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    # The completed-entries field is a bare set of hash strings — not a list
+    # of per-entry records. Exactly {"h1", "h2"}, with set semantics.
+    assert isinstance(instance.completed_entries, set), (
+        f"completed_entries must be a set (bare set of hashes), got "
+        f"{type(instance.completed_entries).__name__}"
+    )
+    assert instance.completed_entries == {"h1", "h2"}
+    # No per-entry record beyond the hash: every member is a plain string.
+    for entry in instance.completed_entries:
+        assert isinstance(entry, str), (
+            f"each completed entry must be a bare hash string, got "
+            f"{type(entry).__name__}"
+        )
