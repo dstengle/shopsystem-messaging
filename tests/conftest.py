@@ -2450,8 +2450,16 @@ def _schema_class_for(name: str):
     return cls
 
 
+# The schema_name is restricted to a single alphabetic token via parsers.re
+# (not parsers.parse) so this step does NOT greedily capture multi-word
+# schema designators like "RequestCompletionJournal request" / "... response"
+# used by the request_completion_journal scenarios (lead-f1ui), which carry
+# their own dedicated exact-match Given steps. All six bd-decoupling schema
+# names are single tokens, so this restriction leaves their matching intact.
 @given(
-    parsers.parse("the {schema_name} schema from the shop-msg catalog"),
+    parsers.re(
+        r"the (?P<schema_name>[A-Za-z]+) schema from the shop-msg catalog"
+    ),
     target_fixture="bd_decoupling_schema_name",
 )
 def given_schema_from_catalog(schema_name: str) -> str:
@@ -11824,3 +11832,265 @@ def fnj5_then_pin_strict_authoritative(context: dict) -> None:
 )
 def fnj5_then_pin_queue_no_defer(context: dict) -> None:
     assert context["cli_returncode"] == 0
+
+
+# ===========================================================================
+# request_completion_journal (lead-f1ui) — request + response message type
+# ===========================================================================
+#
+# A request_completion_journal asks a target BC for the set of block-only
+# canonical scenario hashes it has completed. The request names the target BC
+# and carries no completion entries of its own; the response carries the
+# completed entries back as a bare set of hashes. Step defs below drive the
+# four assigned scenarios (hashes 65c85ffce8f88507, 7afa72ede6099ee1,
+# 79dd275d8584c8fc, 5138b2335150db4c).
+
+# The shared "Then construction succeeds" / "Then no schema validation error
+# is raised" steps (defined for the bd-decoupling scenarios above) read from
+# context["bd_decoupling_error"] / context["bd_decoupling_instance"]. The
+# request_completion_journal construction scenarios (1 and 2) reuse those
+# shared Then steps by populating the SAME context keys in their When steps,
+# so we do NOT redefine them here.
+
+# --- Behavior 1: request schema minimal valid construction -----------------
+
+@given(
+    "the RequestCompletionJournal request schema from the shop-msg catalog",
+    target_fixture="rcj_request_cls",
+)
+def rcj_request_schema():
+    from catalog.schemas import RequestCompletionJournal
+    return RequestCompletionJournal
+
+
+@when(
+    "I construct a RequestCompletionJournal request instance supplying only the "
+    "fields the schema marks as required, naming the target bounded context "
+    "whose completed scenarios are sought"
+)
+def rcj_construct_request_minimal(rcj_request_cls, context: dict) -> None:
+    try:
+        instance = rcj_request_cls(
+            message_type="request_completion_journal",
+            work_id="lead-rcj-min",
+            target_bc="shopsystem-scenarios",
+        )
+        context["bd_decoupling_error"] = None
+        context["bd_decoupling_instance"] = instance
+    except Exception as exc:  # noqa: BLE001
+        context["bd_decoupling_error"] = exc
+        context["bd_decoupling_instance"] = None
+
+
+@then(
+    "the constructed request carries the named target bounded context and no "
+    "scenario-completion entry of its own"
+)
+def rcj_request_carries_target_no_entries(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    assert instance.target_bc == "shopsystem-scenarios"
+    # The request schema must NOT carry a completed-entries field at all: it
+    # is a request for the journal, not a carrier of completion state.
+    assert not hasattr(instance, "completed_entries")
+
+
+# --- Behavior 2: response schema bare set of completed hashes --------------
+
+@given(
+    "the RequestCompletionJournal response schema from the shop-msg catalog",
+    target_fixture="rcj_response_cls",
+)
+def rcj_response_schema():
+    from catalog.schemas import RequestCompletionJournalResponse
+    return RequestCompletionJournalResponse
+
+
+@when(
+    'I construct a RequestCompletionJournal response instance whose '
+    'completed-entries field is a set of block-only canonical hashes "h1" '
+    'and "h2"'
+)
+def rcj_construct_response_set(rcj_response_cls, context: dict) -> None:
+    try:
+        instance = rcj_response_cls(
+            message_type="request_completion_journal_response",
+            work_id="lead-rcj-resp",
+            completed_entries={"h1", "h2"},
+        )
+        context["bd_decoupling_error"] = None
+        context["bd_decoupling_instance"] = instance
+    except Exception as exc:  # noqa: BLE001
+        context["bd_decoupling_error"] = exc
+        context["bd_decoupling_instance"] = None
+
+
+@then(
+    'the constructed response carries exactly the completed block-only '
+    'canonical hashes "h1" and "h2" as a bare set, with no per-entry record '
+    'beyond the hash'
+)
+def rcj_response_carries_bare_set(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    # The completed-entries field is a bare set of hash strings — not a list
+    # of per-entry records. Exactly {"h1", "h2"}, with set semantics.
+    assert isinstance(instance.completed_entries, set), (
+        f"completed_entries must be a set (bare set of hashes), got "
+        f"{type(instance.completed_entries).__name__}"
+    )
+    assert instance.completed_entries == {"h1", "h2"}
+    # No per-entry record beyond the hash: every member is a plain string.
+    for entry in instance.completed_entries:
+        assert isinstance(entry, str), (
+            f"each completed entry must be a bare hash string, got "
+            f"{type(entry).__name__}"
+        )
+
+
+# --- Behavior 3: shop-msg send request_completion_journal deposits inbox ----
+
+@when(
+    parsers.parse(
+        'shop-msg send request_completion_journal is run for work-id '
+        '"{work_id}" naming target bounded context "{target_bc}"'
+    )
+)
+def rcj_send(bc_root: Path, work_id: str, target_bc: str, context: dict) -> None:
+    cmd = [
+        "shop-msg", "send", "request_completion_journal",
+        "--bc", _get_or_register_bc_name(bc_root),
+        "--work-id", work_id,
+        "--target-bc", target_bc,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    assert result.returncode == 0, (
+        f"send request_completion_journal failed: {result.stderr}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the inbox holds exactly one unprocessed request_completion_journal '
+        'message for work_id "{work_id}"'
+    )
+)
+def rcj_inbox_holds_exactly_one(bc_root: Path, work_id: str, context: dict) -> None:
+    rows = _fetch_inbox_rows(bc_root)
+    rcj_rows = [
+        r for r in rows
+        if r["message_type"] == "request_completion_journal"
+        and r["work_id"] == work_id
+    ]
+    assert len(rcj_rows) == 1, (
+        f"expected exactly one request_completion_journal inbox row for "
+        f"{work_id!r}, found {len(rcj_rows)}"
+    )
+    context["rcj_deposited_payload"] = rcj_rows[0]["payload"]
+
+
+@then(
+    parsers.parse(
+        'that deposited message validates against the RequestCompletionJournal '
+        'request schema and names target bounded context "{target_bc}"'
+    )
+)
+def rcj_deposited_validates(target_bc: str, context: dict) -> None:
+    from catalog.schemas import RequestCompletionJournal
+    payload = context["rcj_deposited_payload"]
+    model = RequestCompletionJournal(**payload)
+    assert model.message_type == "request_completion_journal"
+    assert model.target_bc == target_bc
+
+
+# --- Behavior 4: respond request_completion_journal -> requester reads back -
+
+@given(
+    parsers.parse(
+        'an inbox holding an unprocessed request_completion_journal request '
+        'for work_id "{work_id}" naming target bounded context "{target_bc}"'
+    ),
+    target_fixture="bc_root",
+)
+def rcj_given_inbox_request(
+    tmp_path: Path, work_id: str, target_bc: str, context: dict
+) -> Path:
+    bc_root = tmp_path
+    (bc_root / "inbox").mkdir(exist_ok=True)
+    (bc_root / "outbox").mkdir(exist_ok=True)
+    payload = {
+        "message_type": "request_completion_journal",
+        "work_id": work_id,
+        "target_bc": target_bc,
+    }
+    insert_message(
+        _bc_address(bc_root), work_id, "inbox",
+        "request_completion_journal", payload,
+    )
+    context["rcj_request_work_id"] = work_id
+    context["rcj_request_target_bc"] = target_bc
+    return bc_root
+
+
+@when(
+    parsers.parse(
+        'shop-msg responds to request_completion_journal for work_id '
+        '"{work_id}" with the completed block-only canonical hashes "{h1}" '
+        'and "{h2}"'
+    )
+)
+def rcj_respond(
+    bc_root: Path, work_id: str, h1: str, h2: str, context: dict
+) -> None:
+    cmd = [
+        "shop-msg", "respond", "request_completion_journal",
+        "--bc", _get_or_register_bc_name(bc_root),
+        "--work-id", work_id,
+        "--completed", h1,
+        "--completed", h2,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    assert result.returncode == 0, (
+        f"respond request_completion_journal failed: {result.stderr}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the requester can read a request_completion_journal response for '
+        'work_id "{work_id}" whose completed-entries set is exactly the '
+        'block-only canonical hashes "{h1}" and "{h2}"'
+    )
+)
+def rcj_requester_reads_response(
+    work_id: str, h1: str, h2: str, context: dict
+) -> None:
+    lead_root = get_session_lead_root()
+    payload = _fetch_lead_inbox_payload(
+        lead_root, work_id, "request_completion_journal_response"
+    )
+    assert payload is not None, (
+        f"no request_completion_journal_response delivered to the requester "
+        f"for work_id {work_id!r}"
+    )
+    entries = set(payload["completed_entries"])
+    assert entries == {h1, h2}, (
+        f"expected completed-entries {{{h1!r}, {h2!r}}}, got {entries!r}"
+    )
+    context["rcj_response_payload"] = payload
+
+
+@then(
+    "that response validates against the RequestCompletionJournal response "
+    "schema"
+)
+def rcj_response_validates(context: dict) -> None:
+    from catalog.schemas import RequestCompletionJournalResponse
+    payload = context["rcj_response_payload"]
+    model = RequestCompletionJournalResponse(**payload)
+    assert model.message_type == "request_completion_journal_response"
+    assert isinstance(model.completed_entries, set)

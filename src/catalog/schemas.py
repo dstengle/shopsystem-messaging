@@ -273,9 +273,62 @@ class MechanismObservation(BaseModel):
     )
 
 
+class RequestCompletionJournal(BaseModel):
+    """Lead -> BC request for a target BC's completion journal (lead-f1ui).
+
+    A request_completion_journal asks the named target bounded context for the
+    set of block-only canonical scenario hashes it has completed. The request
+    is purely a *request*: it names the target BC whose completed scenarios are
+    sought and carries NO scenario-completion entry of its own — the completed
+    set travels back on the paired ``RequestCompletionJournalResponse``, not on
+    this request. (Deliberately no ``completed_entries`` field here; a request
+    that carried completion state would conflate the ask with the answer.)
+    """
+    message_type: Literal["request_completion_journal"]
+    work_id: str
+    # The bounded context whose completed scenarios are sought. Required: a
+    # completion-journal request is meaningless without naming its target.
+    target_bc: str = Field(min_length=1)
+    # See RequestMaintenance.from_shop. Populated by `shop-msg send` when the
+    # sender is resolved implicitly from CWD (PDR-008).
+    from_shop: str | None = None
+
+
+class RequestCompletionJournalResponse(BaseModel):
+    """BC -> requester response carrying a completion journal (lead-f1ui).
+
+    The paired response to ``RequestCompletionJournal``. It carries the set of
+    block-only canonical scenario hashes the target BC has completed, back to
+    the requester. ``completed_entries`` is a BARE SET of hash strings — not a
+    list of per-entry records: the journal is identified by hash alone, with no
+    additional per-entry metadata. Set semantics mean duplicate hashes collapse
+    and order is not significant; the wire form (JSON) serializes the set as an
+    array, but the in-model contract is a ``set[str]``.
+    """
+    message_type: Literal["request_completion_journal_response"]
+    work_id: str
+    # The completed block-only canonical scenario hashes, as a bare set. A set
+    # (not a list) so the schema itself enforces "no per-entry record beyond
+    # the hash" and de-duplicates. Defaults to the empty set: a target BC that
+    # has completed nothing yet returns an empty journal.
+    completed_entries: set[str] = Field(default_factory=set)
+
+
 # A nudge is auxiliary signaling that flows BOTH directions: lead -> BC
 # (`shop-msg send nudge`) and BC -> lead (`shop-msg nudge`). It is therefore
 # a member of both message unions. It is NOT a dispatch (no lifecycle) and
 # not a work-response (no scenario state) — ADR-015 decisions 6 & 7.
-LeadMessage = Union[RequestMaintenance, AssignScenarios, RequestBugfix, Nudge]
-BCResponse = Union[Clarify, WorkDone, MechanismObservation, Nudge]
+LeadMessage = Union[
+    RequestMaintenance,
+    AssignScenarios,
+    RequestBugfix,
+    RequestCompletionJournal,
+    Nudge,
+]
+BCResponse = Union[
+    Clarify,
+    WorkDone,
+    MechanismObservation,
+    RequestCompletionJournalResponse,
+    Nudge,
+]

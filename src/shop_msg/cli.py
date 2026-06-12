@@ -99,6 +99,8 @@ from catalog.schemas import (
     MechanismObservation,
     Nudge,
     RequestBugfix,
+    RequestCompletionJournal,
+    RequestCompletionJournalResponse,
     RequestMaintenance,
     ScenarioPayload,
     WorkDone,
@@ -719,6 +721,69 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_respond_request_completion_journal(args: argparse.Namespace) -> int:
+    """`shop-msg respond request_completion_journal` (lead-f1ui).
+
+    The BC's response to a request_completion_journal: it carries the set of
+    completed block-only canonical scenario hashes back to the requester. Like
+    the other respond verbs it is a BC->requester vehicle, delivered into the
+    requester (lead) inbox via insert_bc_response under the
+    `request_completion_journal_response` message_type.
+    """
+    refusal = _refuse_lead_side_respond("request_completion_journal")
+    if refusal is not None:
+        return refusal
+
+    bc_root = _resolve_bc(args)
+
+    if "/" in args.work_id or ".." in args.work_id or not args.work_id:
+        print(
+            f"shop-msg respond request_completion_journal: refusing unsafe "
+            f"work_id {args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    lead_root = _resolve_registered_lead()
+    if lead_root is None:
+        print(
+            "shop-msg respond request_completion_journal: no lead shop is "
+            "registered in the registry. Run 'shop-msg registry add "
+            "--lead-shop' to register the lead first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    message = RequestCompletionJournalResponse(
+        message_type="request_completion_journal_response",
+        work_id=args.work_id,
+        completed_entries=set(args.completed or []),
+    )
+
+    try:
+        insert_bc_response(
+            lead_root,
+            bc_root,
+            args.work_id,
+            "request_completion_journal_response",
+            message.model_dump(mode="json"),
+            force=getattr(args, "force", False),
+        )
+    except CollisionError:
+        existing = existing_lead_inbox_message_type(
+            lead_root, args.work_id, "request_completion_journal_response"
+        ) or "request_completion_journal_response"
+        print(
+            f"shop-msg respond request_completion_journal: refusing to "
+            f"overwrite existing {existing} response for "
+            f"work_id={args.work_id!r} (use --force to replace)",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
 def _resolve_send_sender() -> str | None:
     """Resolve the sender's canonical name for `shop-msg send`.
 
@@ -925,6 +990,7 @@ def _load_payload_file(path_str: str, message_type: str, work_id: str) -> dict:
         "request_maintenance": RequestMaintenance,
         "request_bugfix": RequestBugfix,
         "assign_scenarios": AssignScenarios,
+        "request_completion_journal": RequestCompletionJournal,
     }[message_type]
     message = model_cls(**data)
     return message.model_dump(exclude_none=True)
@@ -973,6 +1039,51 @@ def _cmd_send_request_maintenance(args: argparse.Namespace) -> int:
         message_type="request_maintenance",
         payload=payload,
         scenario_hashes_pinned=hashes,
+        depends_on_dispatch=getattr(args, "depends_on", None),
+        bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
+        payload_ref=getattr(args, "payload", None),
+        queue_on_dependency=getattr(args, "queue_on_dependency", False),
+    )
+
+
+def _cmd_send_request_completion_journal(args: argparse.Namespace) -> int:
+    """`shop-msg send request_completion_journal` (lead-f1ui).
+
+    Deposits a request_completion_journal inbox message naming the target BC
+    whose completed scenarios are sought. Like the other lead->BC sends it runs
+    through the bd-first send protocol, which gracefully degrades to a bare
+    postgres deposit when no lead shop is registered.
+    """
+    bc_root = _resolve_bc(args)
+
+    if getattr(args, "payload", None):
+        payload = _load_payload_file(
+            args.payload, "request_completion_journal", args.work_id
+        )
+    else:
+        if args.target_bc is None:
+            print(
+                "shop-msg send request_completion_journal: --target-bc is "
+                "required unless --payload is supplied",
+                file=sys.stderr,
+            )
+            return 2
+        message = RequestCompletionJournal(
+            message_type="request_completion_journal",
+            work_id=args.work_id,
+            target_bc=args.target_bc,
+            from_shop=_resolve_send_sender(),
+        )
+        payload = message.model_dump(exclude_none=True)
+
+    return _bd_first_send(
+        command="request_completion_journal",
+        bc_root=bc_root,
+        bc_name=args.bc,
+        work_id=args.work_id,
+        message_type="request_completion_journal",
+        payload=payload,
+        scenario_hashes_pinned=None,
         depends_on_dispatch=getattr(args, "depends_on", None),
         bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
         payload_ref=getattr(args, "payload", None),
@@ -2330,6 +2441,46 @@ def build_parser() -> argparse.ArgumentParser:
         func=_cmd_respond_mechanism_observation, _cwd_resolves=True
     )
 
+    rcj_resp = respond_sub.add_parser(
+        "request_completion_journal",
+        help=(
+            "write a request_completion_journal response carrying the BC's "
+            "completed block-only canonical scenario hashes (lead-f1ui)"
+        ),
+    )
+    _rcj_resp_mode = rcj_resp.add_mutually_exclusive_group(required=False)
+    _rcj_resp_mode.add_argument(
+        "--bc", default=None,
+        help=(
+            "canonical BC name. Optional: when omitted the shop is resolved "
+            "from CWD via .claude/shop/ marker walk-up (PDR-008)."
+        ),
+    )
+    _add_removed_flag(rcj_resp, "--bc-root")
+    rcj_resp.add_argument(
+        "--work-id", required=True,
+        help="work_id of the request_completion_journal being responded to",
+    )
+    rcj_resp.add_argument(
+        "--completed", action="append", default=None,
+        help=(
+            "a completed block-only canonical scenario hash (repeatable). The "
+            "collected hashes form the response's bare completed-entries set."
+        ),
+    )
+    rcj_resp.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace an existing same-message_type lead-inbox response for this "
+            "work_id (recovery path; lead-2id). Without --force the command "
+            "refuses on collision."
+        ),
+    )
+    rcj_resp.set_defaults(
+        func=_cmd_respond_request_completion_journal, _cwd_resolves=True
+    )
+
     send = sub.add_parser("send", help="write a lead-to-BC message into a BC's inbox")
     send_sub = send.add_subparsers(dest="message_type", required=True)
 
@@ -2505,6 +2656,55 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     request_bugfix.set_defaults(func=_cmd_send_request_bugfix)
+
+    request_completion_journal = send_sub.add_parser(
+        "request_completion_journal",
+        help="write a request_completion_journal message (lead-f1ui)",
+    )
+    request_completion_journal.add_argument(
+        "--bc", required=True, help="canonical BC name (resolved via registry)"
+    )
+    _add_removed_flag(request_completion_journal, "--bc-root")
+    request_completion_journal.add_argument(
+        "--work-id", required=True, help="work_id identifying this request"
+    )
+    request_completion_journal.add_argument(
+        "--target-bc",
+        default=None,
+        help=(
+            "the bounded context whose completed scenarios are sought "
+            "(required unless --payload)"
+        ),
+    )
+    request_completion_journal.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the complete message body; when "
+            "supplied it is the authoritative content source and --target-bc "
+            "is not required"
+        ),
+    )
+    request_completion_journal.add_argument(
+        "--depends-on",
+        default=None,
+        help=(
+            "work_id of a prior dispatch this one depends on; recorded on the "
+            "lead bd entry as depends_on_dispatch metadata"
+        ),
+    )
+    request_completion_journal.add_argument(
+        "--queue-on-dependency",
+        action="store_true",
+        help=(
+            "when a bd depends-on predecessor is not yet at "
+            "dispatch_state=closed, defer the postgres deposit (PDR-010 / "
+            "ADR-013 decision 4)"
+        ),
+    )
+    request_completion_journal.set_defaults(
+        func=_cmd_send_request_completion_journal
+    )
 
     send_nudge = send_sub.add_parser(
         "nudge",
