@@ -10,6 +10,15 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And shop-msg registry list includes an entry for "shopsystem-messaging" whose abstract address is "shopsystem/messaging"
 
   @bc:shopsystem-messaging
+  @scenario_hash:8a156a4326984f6b
+  Scenario: registry add projects under the configured product system slug
+    Given no shop named "acme-widget" is registered in the messaging registry
+    And the deployment system slug is configured as "dummyco" via the SHOPMSG_SYSTEM_SLUG environment knob
+    When I run shop-msg registry add with canonical name "acme-widget"
+    Then the command exits zero
+    And shop-msg registry list includes an entry for "acme-widget" whose abstract address is "dummyco/acme-widget"
+
+  @bc:shopsystem-messaging
   @scenario_hash:cf22ce33ba3edeea
   Scenario: Passing a filesystem-path positional to registry add exits non-zero with a migration message
     Given the shop-msg CLI has shipped abstract-address routing identity

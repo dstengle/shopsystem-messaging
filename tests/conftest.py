@@ -11188,6 +11188,41 @@ def given_adr020_cli_shipped() -> None:
     pass
 
 
+# lead-tgsb / PDR-018 gate #2: the deployment system slug is externalized via
+# the documented SHOPMSG_SYSTEM_SLUG environment knob (the established
+# SHOPMSG_DSN-style configuration surface). A non-`shopsystem` slug must flow
+# through `registry add` AND address projection end-to-end.
+@given(parsers.parse(
+    'the deployment system slug is configured as "{slug}" via the '
+    'SHOPMSG_SYSTEM_SLUG environment knob'
+))
+def given_tgsb_system_slug_configured(slug: str, context: dict) -> None:
+    context["tgsb_system_slug"] = slug
+
+
+@when(parsers.parse(
+    'I run shop-msg registry add with canonical name "{name}"'
+))
+def when_tgsb_registry_add_with_configured_slug(
+    name: str, context: dict, request
+) -> None:
+    _adr020_cleanup_name(name, request)
+    _adr020_registry_remove(name)
+    env = dict(os.environ)
+    slug = context.get("tgsb_system_slug")
+    if slug is not None:
+        env["SHOPMSG_SYSTEM_SLUG"] = slug
+    result = subprocess.run(
+        ["shop-msg", "registry", "add", name],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
 # NOTE: the bare phrasings '"{name}" is registered in the messaging registry'
 # and '"{name}" is registered as the lead shop' are already defined above
 # (given_bc_registered / given_lead_registered) and register under the
