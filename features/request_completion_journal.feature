@@ -27,3 +27,10 @@ Feature: request_completion_journal — request and response message types
     When shop-msg send request_completion_journal is run for work-id "lead-300" naming target bounded context "shopsystem-scenarios"
     Then the inbox holds exactly one unprocessed request_completion_journal message for work_id "lead-300"
     And that deposited message validates against the RequestCompletionJournal request schema and names target bounded context "shopsystem-scenarios"
+
+  @scenario_hash:5138b2335150db4c @bc:shopsystem-messaging
+  Scenario: responding to a request_completion_journal carries the completed-entries set back over the wire to the requester
+    Given an inbox holding an unprocessed request_completion_journal request for work_id "lead-301" naming target bounded context "shopsystem-scenarios"
+    When shop-msg responds to request_completion_journal for work_id "lead-301" with the completed block-only canonical hashes "h1" and "h2"
+    Then the requester can read a request_completion_journal response for work_id "lead-301" whose completed-entries set is exactly the block-only canonical hashes "h1" and "h2"
+    And that response validates against the RequestCompletionJournal response schema
