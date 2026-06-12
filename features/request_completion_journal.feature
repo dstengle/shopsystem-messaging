@@ -20,3 +20,10 @@ Feature: request_completion_journal — request and response message types
     Then construction succeeds
     And no schema validation error is raised
     And the constructed response carries exactly the completed block-only canonical hashes "h1" and "h2" as a bare set, with no per-entry record beyond the hash
+
+  @scenario_hash:79dd275d8584c8fc @bc:shopsystem-messaging
+  Scenario: shop-msg send request_completion_journal deposits a well-formed request naming the target bounded context
+    Given an empty BC at a temporary path with no unprocessed inbox messages
+    When shop-msg send request_completion_journal is run for work-id "lead-300" naming target bounded context "shopsystem-scenarios"
+    Then the inbox holds exactly one unprocessed request_completion_journal message for work_id "lead-300"
+    And that deposited message validates against the RequestCompletionJournal request schema and names target bounded context "shopsystem-scenarios"

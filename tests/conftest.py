@@ -11944,3 +11944,61 @@ def rcj_response_carries_bare_set(context: dict) -> None:
             f"each completed entry must be a bare hash string, got "
             f"{type(entry).__name__}"
         )
+
+
+# --- Behavior 3: shop-msg send request_completion_journal deposits inbox ----
+
+@when(
+    parsers.parse(
+        'shop-msg send request_completion_journal is run for work-id '
+        '"{work_id}" naming target bounded context "{target_bc}"'
+    )
+)
+def rcj_send(bc_root: Path, work_id: str, target_bc: str, context: dict) -> None:
+    cmd = [
+        "shop-msg", "send", "request_completion_journal",
+        "--bc", _get_or_register_bc_name(bc_root),
+        "--work-id", work_id,
+        "--target-bc", target_bc,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    assert result.returncode == 0, (
+        f"send request_completion_journal failed: {result.stderr}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the inbox holds exactly one unprocessed request_completion_journal '
+        'message for work_id "{work_id}"'
+    )
+)
+def rcj_inbox_holds_exactly_one(bc_root: Path, work_id: str, context: dict) -> None:
+    rows = _fetch_inbox_rows(bc_root)
+    rcj_rows = [
+        r for r in rows
+        if r["message_type"] == "request_completion_journal"
+        and r["work_id"] == work_id
+    ]
+    assert len(rcj_rows) == 1, (
+        f"expected exactly one request_completion_journal inbox row for "
+        f"{work_id!r}, found {len(rcj_rows)}"
+    )
+    context["rcj_deposited_payload"] = rcj_rows[0]["payload"]
+
+
+@then(
+    parsers.parse(
+        'that deposited message validates against the RequestCompletionJournal '
+        'request schema and names target bounded context "{target_bc}"'
+    )
+)
+def rcj_deposited_validates(target_bc: str, context: dict) -> None:
+    from catalog.schemas import RequestCompletionJournal
+    payload = context["rcj_deposited_payload"]
+    model = RequestCompletionJournal(**payload)
+    assert model.message_type == "request_completion_journal"
+    assert model.target_bc == target_bc
