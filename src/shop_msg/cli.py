@@ -721,6 +721,69 @@ def _cmd_respond_mechanism_observation(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_respond_request_completion_journal(args: argparse.Namespace) -> int:
+    """`shop-msg respond request_completion_journal` (lead-f1ui).
+
+    The BC's response to a request_completion_journal: it carries the set of
+    completed block-only canonical scenario hashes back to the requester. Like
+    the other respond verbs it is a BC->requester vehicle, delivered into the
+    requester (lead) inbox via insert_bc_response under the
+    `request_completion_journal_response` message_type.
+    """
+    refusal = _refuse_lead_side_respond("request_completion_journal")
+    if refusal is not None:
+        return refusal
+
+    bc_root = _resolve_bc(args)
+
+    if "/" in args.work_id or ".." in args.work_id or not args.work_id:
+        print(
+            f"shop-msg respond request_completion_journal: refusing unsafe "
+            f"work_id {args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    lead_root = _resolve_registered_lead()
+    if lead_root is None:
+        print(
+            "shop-msg respond request_completion_journal: no lead shop is "
+            "registered in the registry. Run 'shop-msg registry add "
+            "--lead-shop' to register the lead first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    message = RequestCompletionJournalResponse(
+        message_type="request_completion_journal_response",
+        work_id=args.work_id,
+        completed_entries=set(args.completed or []),
+    )
+
+    try:
+        insert_bc_response(
+            lead_root,
+            bc_root,
+            args.work_id,
+            "request_completion_journal_response",
+            message.model_dump(mode="json"),
+            force=getattr(args, "force", False),
+        )
+    except CollisionError:
+        existing = existing_lead_inbox_message_type(
+            lead_root, args.work_id, "request_completion_journal_response"
+        ) or "request_completion_journal_response"
+        print(
+            f"shop-msg respond request_completion_journal: refusing to "
+            f"overwrite existing {existing} response for "
+            f"work_id={args.work_id!r} (use --force to replace)",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
 def _resolve_send_sender() -> str | None:
     """Resolve the sender's canonical name for `shop-msg send`.
 
@@ -2376,6 +2439,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mech_obs.set_defaults(
         func=_cmd_respond_mechanism_observation, _cwd_resolves=True
+    )
+
+    rcj_resp = respond_sub.add_parser(
+        "request_completion_journal",
+        help=(
+            "write a request_completion_journal response carrying the BC's "
+            "completed block-only canonical scenario hashes (lead-f1ui)"
+        ),
+    )
+    _rcj_resp_mode = rcj_resp.add_mutually_exclusive_group(required=False)
+    _rcj_resp_mode.add_argument(
+        "--bc", default=None,
+        help=(
+            "canonical BC name. Optional: when omitted the shop is resolved "
+            "from CWD via .claude/shop/ marker walk-up (PDR-008)."
+        ),
+    )
+    _add_removed_flag(rcj_resp, "--bc-root")
+    rcj_resp.add_argument(
+        "--work-id", required=True,
+        help="work_id of the request_completion_journal being responded to",
+    )
+    rcj_resp.add_argument(
+        "--completed", action="append", default=None,
+        help=(
+            "a completed block-only canonical scenario hash (repeatable). The "
+            "collected hashes form the response's bare completed-entries set."
+        ),
+    )
+    rcj_resp.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace an existing same-message_type lead-inbox response for this "
+            "work_id (recovery path; lead-2id). Without --force the command "
+            "refuses on collision."
+        ),
+    )
+    rcj_resp.set_defaults(
+        func=_cmd_respond_request_completion_journal, _cwd_resolves=True
     )
 
     send = sub.add_parser("send", help="write a lead-to-BC message into a BC's inbox")
