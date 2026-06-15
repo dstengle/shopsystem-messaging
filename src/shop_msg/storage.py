@@ -228,13 +228,32 @@ CREATE TABLE IF NOT EXISTS shop_registry (
 # surface following the established SHOPMSG_DSN pattern (see _get_system_slug).
 DEFAULT_SYSTEM_SLUG = "shopsystem"
 
-# Back-compat alias. The legacy module constant SYSTEM_SLUG is retained for
-# the addressing-migration DDL (which backfills LEGACY rows under the
-# deployment default) and for tests/importers that reference the default
-# slug by name. Live projection no longer binds to this constant — it calls
-# _get_system_slug() so the configured slug flows through.
+# Back-compat aliases. The legacy module constants SYSTEM_SLUG and
+# LEAD_ABSTRACT_ADDRESS name the DEPLOYMENT-DEFAULT slug / lead sentinel
+# (slug ``shopsystem`` / ``shopsystem/lead``). They are retained for
+# tests/importers that reference the default by name (e.g. conftest's
+# ``_lead_address`` helper, which runs on the default-path projection).
+#
+# Live projection no longer binds to these constants — both the lead
+# sentinel and the addressing-migration backfill CASE call
+# _get_system_slug() at OPERATION time (lead-ikp5) so the configured
+# SHOPMSG_SYSTEM_SLUG flows through. A module-level constant captures the
+# env value once at import; resolving inside the function/query-builder is
+# what lets a configured slug take effect per operation.
 SYSTEM_SLUG = DEFAULT_SYSTEM_SLUG
 LEAD_ABSTRACT_ADDRESS = f"{DEFAULT_SYSTEM_SLUG}/lead"
+
+
+def _lead_abstract_address() -> str:
+    """Return the lead sentinel abstract address for the CONFIGURED slug.
+
+    The lead collapses to ``<slug>/lead`` where ``<slug>`` is resolved from
+    SHOPMSG_SYSTEM_SLUG at call time (defaulting to ``shopsystem``). This is
+    the per-operation counterpart to the frozen ``LEAD_ABSTRACT_ADDRESS``
+    constant; live code paths (the addressing-migration backfill) consult
+    this so a configured slug takes effect (lead-ikp5).
+    """
+    return f"{_get_system_slug()}/lead"
 
 
 def _get_system_slug() -> str:
@@ -287,7 +306,33 @@ def _abstract_address_for(name: str, shop_type: str) -> str:
 #   3. Drop the legacy shop_root column so no entry retains a path.
 # Idempotent: re-running finds abstract_address already present and shop_root
 # already gone, and performs no row deletion the second time.
-_DDL_REGISTRY_ADDRESS_MIGRATION = """
+#
+# lead-ikp5: the backfill CASE projection MUST consult the env-resolved slug
+# at OPERATION time, not a constant frozen at import. The SQL is therefore
+# built per-call by _registry_address_migration_sql() (run inside
+# _ensure_schema on every _connect()) rather than interpolated once at import.
+# Under SHOPMSG_SYSTEM_SLUG=dummyco the CASE projects dummyco/<rest> and the
+# lead collapses to dummyco/lead; with the slug unset it projects
+# shopsystem/<rest> / shopsystem/lead (non-regressing, scenarios 50/53/e9a31b6f).
+def _registry_address_migration_sql() -> str:
+    """Build the ADR-020 addressing-migration DO block for the CURRENT slug.
+
+    The ``<system>`` segment of the backfill CASE and the lead sentinel are
+    resolved from _get_system_slug() at call time so a configured
+    SHOPMSG_SYSTEM_SLUG flows through. The slug is validated against a strict
+    charset before interpolation (it is a deployment-config identifier, not
+    user input, but interpolating into SQL warrants the guard); the prefix
+    length is computed from the live slug so the ``substring`` offset matches.
+    """
+    slug = _get_system_slug()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
+        raise ValueError(
+            f"shop-msg: SHOPMSG_SYSTEM_SLUG {slug!r} is not a valid system slug "
+            f"(allowed characters: letters, digits, '-', '_')."
+        )
+    lead_sentinel = f"{slug}/lead"
+    prefix_offset = str(len(slug) + 2)
+    return """
 DO $$
 BEGIN
   -- Step 1: ensure the abstract_address column exists.
@@ -306,13 +351,14 @@ BEGIN
   WHERE name LIKE '/%' OR name LIKE '%/pytest-%' OR name LIKE '/tmp/%';
 
   -- Step 3: backfill abstract_address from the canonical name + shop_type for
-  -- any row that does not yet carry one.
+  -- any row that does not yet carry one. The <system> segment is the
+  -- env-resolved slug (lead-ikp5), not a frozen constant.
   UPDATE shop_registry
   SET abstract_address = CASE
-    WHEN shop_type = 'lead' THEN '""" + LEAD_ABSTRACT_ADDRESS + """'
-    WHEN name LIKE '""" + SYSTEM_SLUG + """-%'
-      THEN '""" + SYSTEM_SLUG + """/' || substring(name from """ + str(len(SYSTEM_SLUG) + 2) + """)
-    ELSE '""" + SYSTEM_SLUG + """/' || name
+    WHEN shop_type = 'lead' THEN '""" + lead_sentinel + """'
+    WHEN name LIKE '""" + slug + """-%'
+      THEN '""" + slug + """/' || substring(name from """ + prefix_offset + """)
+    ELSE '""" + slug + """/' || name
   END
   WHERE abstract_address IS NULL;
 
@@ -358,7 +404,10 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
         cur.execute(_DDL_PARTIAL_UNIQUE_MIGRATION)
         cur.execute(_DDL_PARTIAL_UNIQUE_INDEX)
         cur.execute(_DDL_REGISTRY)
-        cur.execute(_DDL_REGISTRY_ADDRESS_MIGRATION)
+        # lead-ikp5: build the addressing-migration SQL per-call so the
+        # backfill CASE consults the env-resolved slug at operation time
+        # rather than a constant frozen at import.
+        cur.execute(_registry_address_migration_sql())
         cur.execute(_DDL_PRESENCE)
     conn.commit()
 
