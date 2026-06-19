@@ -23,6 +23,48 @@ from pydantic import BaseModel, Field, model_validator
 from scenarios.hash import compute_scenario_hash as _canonical_scenario_hash
 
 
+# Canonical work_id grammar, shared by EVERY message-type schema (lead-4wy).
+#
+# History / the bug this fixes: work_id constraints had drifted apart across
+# the catalog. Clarify.work_id and Nudge.work_id carried `^[a-zA-Z0-9-]+$`
+# (hyphens only, dots REJECTED), while AssignScenarios / RequestBugfix /
+# RequestMaintenance / WorkDone / RequestCompletionJournal[Response] left
+# work_id as a bare `str` that accepted anything — including dotted lead
+# child-bead ids like `lead-231.1` AND path separators like `../escape`.
+# The asymmetry was latent: a dispatch sent with a dotted work_id (accepted
+# by assign_scenarios/request_bugfix) could not be answered, because
+# `shop-msg respond clarify --work-id lead-231.1` failed Clarify validation
+# on the dot. Cross-message-type symmetry broke at clarify-time.
+#
+# The fix is ONE canonical pattern applied via ONE shared type alias so the
+# same work_id is valid/invalid on every vehicle:
+#
+#   ^[A-Za-z0-9][A-Za-z0-9_.-]*$
+#
+#   - First char must be alphanumeric, so leading dots (`.hidden`) and the
+#     `..` path-escape are rejected.
+#   - Subsequent chars may be alphanumerics, `_`, `.`, or `-`, so dotted
+#     child-bead ids (`lead-231.1`) round-trip through every vehicle,
+#     including Clarify.
+#   - Slashes and whitespace are absent from the charset, so path separators
+#     (`../escape`, `foo/bar`) and whitespace stay rejected — preserving the
+#     Clarify input-safety hardening (lead-008) that the path-separator and
+#     empty-work_id scenarios pin.
+#
+# This is the same shape as MechanismObservation.provenance_ref's input-safety
+# pattern; reusing it keeps the catalog's identifier-safety story uniform.
+_WORK_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+
+# Required work_id field, shared by every message type that carries one.
+WorkId = Annotated[str, Field(min_length=1, pattern=_WORK_ID_PATTERN)]
+
+# Optional work_id field (only Nudge: a bare liveness ping need not reference
+# a dispatch). Same grammar when present.
+OptionalWorkId = Annotated[
+    str | None, Field(default=None, min_length=1, pattern=_WORK_ID_PATTERN)
+]
+
+
 # Matches an "@bc:<name>" token where <name> is one or more non-space
 # characters. Used by ScenarioPayload to enforce that every scenario's
 # gherkin body declares which BC owns the scenario, regardless of which
@@ -62,7 +104,7 @@ def _gherkin_has_bc_tag_line(gherkin: str) -> bool:
 
 class RequestMaintenance(BaseModel):
     message_type: Literal["request_maintenance"]
-    work_id: str
+    work_id: WorkId
     description: str
     acceptance_criteria: list[str] | None = None
     file_hints: list[str] | None = None
@@ -126,7 +168,7 @@ class ScenarioPayload(BaseModel):
 
 class AssignScenarios(BaseModel):
     message_type: Literal["assign_scenarios"]
-    work_id: str
+    work_id: WorkId
     scenarios: list[ScenarioPayload]
     # See RequestMaintenance.from_shop. Populated by `shop-msg send` when
     # the sender is resolved implicitly from CWD (PDR-008).
@@ -135,7 +177,7 @@ class AssignScenarios(BaseModel):
 
 class RequestBugfix(BaseModel):
     message_type: Literal["request_bugfix"]
-    work_id: str
+    work_id: WorkId
     description: str
     scenarios: list[ScenarioPayload] = Field(default_factory=list)
     # See RequestMaintenance.from_shop. Populated by `shop-msg send` when
@@ -172,9 +214,11 @@ class Nudge(BaseModel):
         "stuck-on-you", "status-check", "predecessor-landed", "general"
     ]
     # work_id is optional: a nudge MAY reference an in-flight dispatch by id,
-    # but a bare liveness ping need not. When present it is path-safe-shaped,
-    # matching Clarify.work_id (lead-008 hardening).
-    work_id: str | None = Field(default=None, min_length=1, pattern=r"^[a-zA-Z0-9-]+$")
+    # but a bare liveness ping need not. When present it is path-safe-shaped
+    # and uses the SHARED canonical work_id grammar (lead-4wy), so a dotted
+    # child-bead id round-trips through a nudge exactly as it does through
+    # every other vehicle.
+    work_id: OptionalWorkId = None
     note: str | None = None
     # See RequestMaintenance.from_shop. Populated by `shop-msg` when the
     # sender is resolved implicitly from CWD (PDR-008).
@@ -215,17 +259,21 @@ def _nudge_payload_rejects_scenario_state(data: object) -> None:
 
 class Clarify(BaseModel):
     message_type: Literal["clarify"]
-    # work_id is constrained to a safe identifier shape: alphanumerics and
-    # hyphens only, length >= 1. This rejects path separators ("/", ".."),
-    # whitespace, and empty strings in one rule, so callers (CLI and any
-    # future tools) cannot weaponize the value via crafted arguments.
-    work_id: str = Field(min_length=1, pattern=r"^[a-zA-Z0-9-]+$")
+    # work_id uses the SHARED canonical work_id grammar (lead-4wy): a safe
+    # identifier shape that still rejects path separators ("/", ".."),
+    # whitespace, and empty strings — so callers (CLI and any future tools)
+    # cannot weaponize the value via crafted arguments — while ADMITTING
+    # dotted lead child-bead ids (`lead-231.1`). Previously this field
+    # carried `^[a-zA-Z0-9-]+$`, which rejected the dot and made a dotted
+    # dispatch unanswerable at clarify-time; the shared alias closes that
+    # asymmetry so the same work_id is valid on every message type.
+    work_id: WorkId
     question: str = Field(min_length=1)
 
 
 class WorkDone(BaseModel):
     message_type: Literal["work_done"]
-    work_id: str
+    work_id: WorkId
     status: Literal["complete", "partial", "blocked"]
     summary: str | None = None
     scenario_hashes: list[str] = Field(default_factory=list)
@@ -285,7 +333,7 @@ class RequestCompletionJournal(BaseModel):
     that carried completion state would conflate the ask with the answer.)
     """
     message_type: Literal["request_completion_journal"]
-    work_id: str
+    work_id: WorkId
     # The bounded context whose completed scenarios are sought. Required: a
     # completion-journal request is meaningless without naming its target.
     target_bc: str = Field(min_length=1)
@@ -306,7 +354,7 @@ class RequestCompletionJournalResponse(BaseModel):
     array, but the in-model contract is a ``set[str]``.
     """
     message_type: Literal["request_completion_journal_response"]
-    work_id: str
+    work_id: WorkId
     # The completed block-only canonical scenario hashes, as a bare set. A set
     # (not a list) so the schema itself enforces "no per-entry record beyond
     # the hash" and de-duplicates. Defaults to the empty set: a target BC that
