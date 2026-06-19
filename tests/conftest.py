@@ -2883,7 +2883,7 @@ def watch_outputs_exactly_one_line_for_work_id(
 def no_additional_output_line_within_2_seconds(context: dict) -> None:
     """Assert that no second line arrives from the watch process within 2 seconds.
 
-    This step tightens scenario 6b5910b7b30777d8: a buggy implementation
+    This step tightens scenario cf3b43277fa2f513: a buggy implementation
     that emits the same work_id twice would have passed the 'exactly one
     line' check alone, but will fail here because a second line would be
     detected.

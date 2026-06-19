@@ -10,7 +10,7 @@ Scenario: shop-msg watch drains unprocessed inbox messages on startup before ent
   Then before the process enters the LISTEN loop, it outputs one line for work_id "lead-100"
   And it outputs one line for work_id "lead-101"
 
-  @scenario_hash:6b5910b7b30777d8 @bc:shopsystem-messaging
+  @scenario_hash:cf3b43277fa2f513 @bc:shopsystem-messaging
   @bc:shopsystem-messaging
 Scenario: shop-msg watch outputs one line to stdout when a new message is inserted into the inbox after startup drain
   Given an empty BC at a temporary path with no unprocessed inbox messages
