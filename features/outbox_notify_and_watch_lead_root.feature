@@ -8,7 +8,7 @@ Feature: shop-msg watch — lead and BC inbox watching
   # These two scenarios are retired; see
   # features/respond_routes_to_lead_inbox.feature for the replacement.
 
-  @scenario_hash:d13a5258dd3971d1 @bc:shopsystem-messaging
+  @scenario_hash:ea19b835157f8a69 @bc:shopsystem-messaging
   @bc:shopsystem-messaging
 Scenario: shop-msg watch --bc behavior is unchanged after outbox routing change
   Given an empty BC at a temporary path with no unprocessed inbox messages

@@ -1,6 +1,6 @@
 Feature: shop-msg respond mechanism_observation — refuse on lead-inbox collision
 
-  @scenario_hash:7c7a6d58fa71a60c @bc:shop-msg
+  @scenario_hash:16806a4d609d021a @bc:shop-msg
   Scenario: Refuse to overwrite an existing mechanism_observation for the same work_id
     Given an empty BC at a temporary path
     And the lead's inbox already contains a response named "lead-col3-mechanism_observation.yaml"

@@ -1,6 +1,6 @@
 Feature: shop-msg respond work_done — refuse on lead-inbox collision
 
-  @scenario_hash:35fece8e1f96e074 @bc:shop-msg
+  @scenario_hash:c222c26d9ea4ac2b @bc:shop-msg
   Scenario: Refuse to overwrite an existing work_done for the same work_id
     Given an empty BC at a temporary path
     And the lead's inbox already contains a response named "lead-col1-work_done.yaml"

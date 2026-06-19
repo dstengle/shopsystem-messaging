@@ -1,7 +1,7 @@
 Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
 
   @bc:shopsystem-messaging
-  @scenario_hash:5374f77354187b06
+  @scenario_hash:b1fbd8070695aa52
   Scenario: registry add accepts a canonical name with no filesystem path and assigns the abstract address
     Given no shop named "shopsystem-messaging" is registered in the messaging registry
     And the deployment's system slug is "shopsystem"
@@ -10,7 +10,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And shop-msg registry list includes an entry for "shopsystem-messaging" whose abstract address is "shopsystem/messaging"
 
   @bc:shopsystem-messaging
-  @scenario_hash:8a156a4326984f6b
+  @scenario_hash:84a1fd2ccd320909
   Scenario: registry add projects under the configured product system slug
     Given no shop named "acme-widget" is registered in the messaging registry
     And the deployment system slug is configured as "dummyco" via the SHOPMSG_SYSTEM_SLUG environment knob
@@ -19,7 +19,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And shop-msg registry list includes an entry for "acme-widget" whose abstract address is "dummyco/acme-widget"
 
   @bc:shopsystem-messaging
-  @scenario_hash:cf22ce33ba3edeea
+  @scenario_hash:b4a81d70bd7bdf7d
   Scenario: Passing a filesystem-path positional to registry add exits non-zero with a migration message
     Given the shop-msg CLI has shipped abstract-address routing identity
     When I run shop-msg registry add with canonical name "shopsystem-messaging" and a filesystem-path positional argument
@@ -28,7 +28,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And no entry for "shopsystem-messaging" is added to the registry
 
   @bc:shopsystem-messaging
-  @scenario_hash:3d9da19b3174fcf6
+  @scenario_hash:16349a51d1cac290
   Scenario: registry list emits abstract addresses and projects no path column
     Given "shopsystem-messaging" is registered in the messaging registry
     And "shopsystem-product" is registered as the lead shop
@@ -39,7 +39,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And no entry in stdout contains a filesystem path field
 
   @bc:shopsystem-messaging
-  @scenario_hash:166aac0254d757a2
+  @scenario_hash:0f08498b8731112b
   Scenario: A message sent to a BC by name routes to that BC's abstract address and resolves there for read pending and watch
     Given "shopsystem-messaging" is registered in the messaging registry with abstract address "shopsystem/messaging"
     And "shopsystem-product" is registered as the lead shop with abstract address "shopsystem/lead"
@@ -50,7 +50,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And shop-msg read inbox --bc shopsystem-messaging with work-id "reg-501" returns that message
 
   @bc:shopsystem-messaging
-  @scenario_hash:370b97bb12d82ead
+  @scenario_hash:4f7111e2bd6d4f68
   Scenario: A message to the lead routes to the lead sentinel address and does not land in any BC inbox
     Given "shopsystem-product" is registered as the lead shop with abstract address "shopsystem/lead"
     And "shopsystem-messaging" is registered in the messaging registry with abstract address "shopsystem/messaging"
@@ -61,7 +61,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And shop-msg pending inbox --bc shopsystem-messaging does not include work-id "reg-541"
 
   @bc:shopsystem-messaging
-  @scenario_hash:b324c650784c2378
+  @scenario_hash:659196b20eba0df7
   Scenario: A registered entry exposes no stored filesystem path on any observable surface
     Given "shopsystem-messaging" is registered in the messaging registry with abstract address "shopsystem/messaging"
     When I inspect the registered entry for "shopsystem-messaging" via shop-msg registry list
@@ -70,7 +70,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And the entry exposes no shop_root field and no filesystem path value
 
   @bc:shopsystem-messaging
-  @scenario_hash:f9910cf40291768c
+  @scenario_hash:e0d0748c3a40fad2
   Scenario: A name-addressed shop-msg operation resolves its bd working directory from the local invoking CWD and does not crash when no registry path exists
     Given "shopsystem-messaging" is registered in the messaging registry with abstract address "shopsystem/messaging"
     And the registry stores no filesystem path for any entry
@@ -81,7 +81,7 @@ Feature: ADR-020 abstract-address registry and routing (no stored shop_root)
     And the command emits no FileNotFoundError or NotADirectoryError arising from a registry-stored path
 
   @bc:shopsystem-messaging
-  @scenario_hash:e9a31b6fba19104d
+  @scenario_hash:925f60950cdbf7a7
   Scenario: Migration backfills abstract addresses from canonical names maps the lead to the sentinel and drops unmappable orphan rows
     Given a pre-migration shop_registry contains a path-keyed entry for canonical name "shopsystem-messaging"
     And it contains a path-keyed lead entry for canonical name "shopsystem-product"

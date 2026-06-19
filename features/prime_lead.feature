@@ -1,6 +1,6 @@
 Feature: shop-msg prime --lead — lead shop context priming
 
-  @scenario_hash:d61a143f647d632f @bc:shopsystem-messaging
+  @scenario_hash:bfe9b4175596ef4b @bc:shopsystem-messaging
   Scenario: shop-msg prime --lead exits zero and reports DB reachability when the database is reachable
   Given a registered lead shop at a temporary path
   And the environment variable SHOPMSG_DSN is set to a reachable Postgres instance
@@ -8,7 +8,7 @@ Feature: shop-msg prime --lead — lead shop context priming
   Then the command exits zero
   And stdout contains "DB reachable: yes"
 
-  @scenario_hash:b20b25a05f147ead @bc:shopsystem-messaging
+  @scenario_hash:289567739ad4bd02 @bc:shopsystem-messaging
   Scenario: shop-msg prime --lead output includes pending outbox count
   Given a registered lead shop at a temporary path
   And two BC outbox rows are present in Postgres for that lead shop, both unconsumed
@@ -25,7 +25,7 @@ Feature: shop-msg prime --lead — lead shop context priming
     And the output does not advertise "shop-msg respond clarify", "shop-msg respond work_done", or "shop-msg respond mechanism_observation" as lead-side commands
     And the output states that the lead answers a BC clarify by re-dispatch on a fresh lead bead, not by respond
 
-  @scenario_hash:af462b8837827091 @bc:shopsystem-messaging
+  @scenario_hash:148a803126ad2fd0 @bc:shopsystem-messaging
   Scenario: shop-msg prime --lead exits non-zero with an error message when the lead name is not registered
   Given no lead shop named "ghost-lead" is registered in the shop registry
   When I run shop-msg prime --lead ghost-lead

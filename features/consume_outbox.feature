@@ -1,6 +1,6 @@
 Feature: shop-msg consume outbox
 
-  @scenario_hash:edfe8c68149298fb @bc:shopsystem-messaging
+  @scenario_hash:7b34c54426a566e1 @bc:shopsystem-messaging
   @bc:shopsystem-messaging
 Scenario: Consuming a specific outbox row removes it from pending outbox output
   Given a lead shop at a temporary path with BC clone "bc-alpha" present as a sibling directory
@@ -9,7 +9,7 @@ Scenario: Consuming a specific outbox row removes it from pending outbox output
   Then the command exits zero
   And running shop-msg pending outbox --lead at the lead path contains no entry for work_id "lead-500"
 
-  @scenario_hash:40fb3c3e71063966 @bc:shopsystem-messaging
+  @scenario_hash:3865a2f6bbf460f9 @bc:shopsystem-messaging
   @bc:shopsystem-messaging
 Scenario: Consuming one message_type on a work_id that has multiple outbox rows leaves the other message_types visible in pending outbox
   Given a lead shop at a temporary path with BC clone "bc-alpha" present as a sibling directory
@@ -20,7 +20,7 @@ Scenario: Consuming one message_type on a work_id that has multiple outbox rows 
   And running shop-msg pending outbox --lead at the lead path includes an entry for work_id "lead-501" with message_type "clarify" originating from BC "bc-alpha"
   And running shop-msg pending outbox --lead at the lead path contains no entry for work_id "lead-501" with message_type "work_done"
 
-  @scenario_hash:a2e50c164ead0531 @bc:shopsystem-messaging
+  @scenario_hash:7ee6f13b3378e594 @bc:shopsystem-messaging
   @bc:shopsystem-messaging
 Scenario: pending outbox returns empty output when all outbox rows for all BCs have been consumed
   Given a lead shop at a temporary path with BC clone "bc-alpha" present as a sibling directory
@@ -30,7 +30,7 @@ Scenario: pending outbox returns empty output when all outbox rows for all BCs h
   Then the command exits zero
   And stdout contains no work_id entries
 
-  @scenario_hash:abefd734c20344db @bc:shopsystem-messaging
+  @scenario_hash:6bbb5877c405263a @bc:shopsystem-messaging
   @bc:shopsystem-messaging
 Scenario: Attempting to consume an outbox row that does not exist produces a clear error and exits non-zero
   Given a lead shop at a temporary path with BC clone "bc-alpha" present as a sibling directory

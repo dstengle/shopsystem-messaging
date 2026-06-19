@@ -1,6 +1,6 @@
 Feature: on a version-tag release, each framework-utility repo emits a repository_dispatch to the bc-launcher build workflow
 
-  @scenario_hash:a83760dcc40c57e6 @bc:shopsystem-messaging
+  @scenario_hash:b891abf0d7ce801f @bc:shopsystem-messaging
   Scenario: on a version-tag release of shopsystem-messaging, its release workflow emits a repository_dispatch to the bc-launcher repository
     Given the shopsystem-messaging source repository
     And a tag named "v0.2.0" is pushed to its "main" branch
