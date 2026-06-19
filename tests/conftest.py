@@ -2132,8 +2132,10 @@ def given_lead_shop_with_two_bcs(
         # ADR-020: register each sibling under its LITERAL directory name so
         # its abstract address (shopsystem/<name>) trailing component matches
         # the `pending outbox --bc-name <name>` filter (scenario d71fb7).
-        registry_add(name, shop_type="bc")
-        _test_registry[str(bc.resolve())] = name
+        # Route through _register_shop (not raw registry_add) so each synthetic
+        # name joins the lead-6c5 tracked-mutation path and is deregistered at
+        # per-test teardown by _per_test_registry_restore (lead-vvz).
+        _register_shop(name, bc, "bc")  # also syncs path->name cache
     return lead_root
 
 
@@ -3201,8 +3203,11 @@ def given_lead_shop_with_one_bc(tmp_path: Path, bc_a: str) -> Path:
     (bc / "outbox").mkdir()
     # Register the BC and lead in the registry under their canonical names so
     # name-based addressing (--bc <name> / --lead <name>) works in step defs.
-    registry_add(bc_a, shop_type="bc")
-    _test_registry[str(bc.resolve())] = bc_a  # sync with session cache
+    # Route through _register_shop (not raw registry_add) so the synthetic
+    # name joins the lead-6c5 tracked-mutation path: snapshotted into
+    # _SAVED_PRODUCTION_ENTRIES and recorded in _PER_TEST_MUTATED_NAMES, so the
+    # autouse _per_test_registry_restore deregisters it at teardown (lead-vvz).
+    _register_shop(bc_a, bc, "bc")  # also syncs _test_registry path->name cache
     _get_or_register_lead_name(lead_root)  # register lead under a uuid name
     return lead_root
 
@@ -4138,7 +4143,16 @@ def when_run_prime_lead(prime_lead_root: Path, context: dict) -> None:
     parsers.parse('no lead shop named "{lead_name}" is registered in the shop registry')
 )
 def given_no_lead_registered(lead_name: str) -> None:
-    """Ensure the given lead name is absent from the shop registry."""
+    """Ensure the given lead name is absent from the shop registry.
+
+    Track the synthetic name through the lead-6c5 mutation bookkeeping
+    (snapshot baseline + record in _PER_TEST_MUTATED_NAMES) before removing it,
+    so the autouse _per_test_registry_restore restores it to its pre-test
+    (absent) state at teardown and no residual ghost-lead row can survive the
+    suite (lead-vvz).
+    """
+    _snapshot_production_name(lead_name)
+    _PER_TEST_MUTATED_NAMES.add(lead_name)
     registry_remove(lead_name)
 
 
