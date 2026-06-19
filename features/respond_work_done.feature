@@ -5,7 +5,7 @@ Feature: shop-msg respond — write a work_done response to the lead inbox
   # outbox directory.  Under lead-e9x the response is routed to the lead's
   # inbox.  That scenario is retired; this file contains the replacement.
 
-  @scenario_hash:9dd3704219df47cc @bc:shopsystem-messaging
+  @scenario_hash:e96bb386330bb3fc @bc:shopsystem-messaging
   Scenario: BC respond work_done delivers the response to the lead inbox
     Given an empty BC at a temporary path
     When I run shop-msg respond work_done with work-id "lead-001" and status "complete" and scenario-hash "abc123"

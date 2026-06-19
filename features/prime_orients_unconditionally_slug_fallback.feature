@@ -1,6 +1,6 @@
 Feature: messaging registry: shop-msg prime orients unconditionally and supports slug-form fallback (retires scenario 34)
 
-  @scenario_hash:1368c39655a314fc @bc:shopsystem-messaging
+  @scenario_hash:b8828c5e3aecd7d0 @bc:shopsystem-messaging
   Scenario: bare "shop-msg prime" prints DSN, DB health, pending counts, and CLI catalog even when the CWD-derived shop name is not registered in the registry
   Given a shop directory tree containing ".claude/shop/name.md" with literal content "some-not-registered-form" and ".claude/shop/type.md" with literal content "lead"
   And no shop named "some-not-registered-form" is registered in the messaging registry
@@ -14,7 +14,7 @@ Feature: messaging registry: shop-msg prime orients unconditionally and supports
   And stderr contains a warning naming that the CWD-derived shop name "some-not-registered-form" did not resolve against the registry
   And the warning does not abort prime: the orientation output above is still emitted in full
 
-  @scenario_hash:63d10cdd53fab6bb @bc:shopsystem-messaging
+  @scenario_hash:e344045f0e8a82a0 @bc:shopsystem-messaging
   Scenario: bare "shop-msg prime" falls back to the slug form (spaces replaced with hyphens) of the CWD-derived name when the literal form does not match a registered canonical name
   Given a lead shop directory tree containing ".claude/shop/name.md" with literal content "shopsystem product" and ".claude/shop/type.md" with literal content "lead"
   And no shop with canonical name "shopsystem product" (with a literal space) is registered in the messaging registry
