@@ -29,6 +29,7 @@ from tests.conftest import (
     SRC_ROOT,
     GuardError,
     _assert_first_party_under_src,
+    _is_editable_src_path,
 )
 
 
@@ -76,18 +77,22 @@ def test_guard_message_names_every_shadowed_package():
         assert pkg in msg
 
 
-def test_guard_live_imports_resolve_under_src():
-    """End-to-end: the REAL live imports must resolve under src/ right now.
+def test_guard_live_imports_served_from_editable_src():
+    """End-to-end: the REAL live imports must be served from an editable src/.
 
     This is the guard running against the actual interpreter the suite uses
     (the editable install). If this ever fails, the suite is running against a
-    stale shadow and every other result is suspect.
+    stale site-packages shadow and every other result is suspect. The editable
+    install may be rooted at this checkout's src/ OR a sibling worktree's src/;
+    what matters is that it is NOT a frozen site-packages copy.
     """
     import catalog
     import shop_msg
 
     for pkg, mod in {"catalog": catalog, "shop_msg": shop_msg}.items():
         resolved = Path(mod.__file__).resolve()
-        assert SRC_ROOT in resolved.parents, (
-            f"{pkg} resolved to {resolved}, not under {SRC_ROOT}"
+        assert _is_editable_src_path(resolved), (
+            f"{pkg} resolved to {resolved}, which is not an editable src/ "
+            f"checkout (frozen site-packages shadow?)"
         )
+        assert "site-packages" not in resolved.parts

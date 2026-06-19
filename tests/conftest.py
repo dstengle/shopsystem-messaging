@@ -88,6 +88,114 @@ from shop_msg.storage import (
 
 
 # ---------------------------------------------------------------------------
+# First-party editable-install guard (lead-ym8f / bd shopsystem-messaging-c1f)
+# ---------------------------------------------------------------------------
+# A frozen NON-editable copy of `catalog` / `shop_msg` under site-packages can
+# SHADOW `src/`. When that happens `import catalog` resolves to the stale copy,
+# pytest validates against drifted code, and correct work in `src/` is masked as
+# a false regression (the c1f incident: test_work_id_pattern_symmetry failing
+# 32/56 with "DID NOT RAISE ValidationError" while src/ was in fact correct).
+#
+# This guard runs at COLLECTION time (it executes at conftest import, before any
+# test body) and asserts every first-party package the suite imports resolves
+# UNDER `src/`. If a site-packages copy shadows `src/`, collection FAILS FAST
+# with a message naming the offending package and its resolved __file__ vs the
+# expected `src/` path — so the contradictory pass-counts never reach a human.
+#
+# Remediation when this fires: reinstall editable with `pip install -e ".[dev]"`
+# (never a bare `pip install .`, which bakes a frozen copy into site-packages).
+#
+# SRC_ROOT names this checkout's own src/. It is the *expected* editable root
+# reported in the failure message. The guard does NOT require packages to resolve
+# under exactly this path, however: an editable install rooted at a sibling
+# worktree's src/ (e.g. running the suite from a worktree while the editable
+# install points at the main checkout's src/) is perfectly valid. What the guard
+# rejects is the c1f failure mode — a FROZEN copy under site-packages/dist-
+# packages shadowing the editable src/ checkout. The invariant is "served from an
+# editable src/ checkout, never from a baked site-packages copy".
+SRC_ROOT = (Path(__file__).resolve().parent.parent / "src").resolve()
+
+# Every first-party package the suite imports. Keep in sync with the imports
+# above (catalog.*, shop_msg.*); a new first-party package added to the suite
+# must be added here so the guard covers it too.
+FIRST_PARTY_PACKAGES = ("catalog", "shop_msg")
+
+# Path segments that mark a frozen, non-editable install location. A first-party
+# package resolving under one of these is the c1f staleness incident.
+_FROZEN_INSTALL_MARKERS = ("site-packages", "dist-packages")
+
+
+class GuardError(AssertionError):
+    """Raised at collection time when a first-party package is shadowed.
+
+    Subclasses AssertionError so pytest reports it as a hard collection error
+    (not merely a skipped/xfailed test).
+    """
+
+
+def _is_editable_src_path(resolved: Path) -> bool:
+    """True iff ``resolved`` is served from an editable ``src/`` checkout.
+
+    The package must live under a directory named ``src`` and must NOT live under
+    a frozen-install marker (``site-packages`` / ``dist-packages``). This accepts
+    this checkout's src/ AND any sibling-worktree src/ the editable install points
+    at, while rejecting a baked site-packages copy.
+    """
+    parts = resolved.parts
+    if any(marker in parts for marker in _FROZEN_INSTALL_MARKERS):
+        return False
+    return "src" in parts
+
+
+def _assert_first_party_under_src(resolved_files: dict[str, str]) -> None:
+    """Fail fast if any first-party package is served from a frozen install.
+
+    ``resolved_files`` maps package name -> the package's ``__file__``. A package
+    whose resolved file is not served from an editable ``src/`` checkout (i.e. it
+    lives under ``site-packages``/``dist-packages``) is the c1f staleness
+    incident. The raised :class:`GuardError` names every offending package, its
+    resolved path, and the expected ``src/`` root.
+    """
+    offenders = []
+    for pkg, file in resolved_files.items():
+        resolved = Path(file).resolve()
+        if not _is_editable_src_path(resolved):
+            offenders.append((pkg, resolved))
+    if offenders:
+        lines = [
+            "First-party editable-install guard TRIPPED: a stale/shadowing copy "
+            "of a first-party package is being imported instead of an editable "
+            "src/ checkout. This masks correct src/ work as a false regression "
+            "(bd shopsystem-messaging-c1f). Reinstall editable: "
+            'pip install -e ".[dev]"',
+            f"  expected all first-party packages under an editable src/ "
+            f"checkout (this checkout's is: {SRC_ROOT})",
+        ]
+        for pkg, resolved in offenders:
+            lines.append(f"  - {pkg} resolved to {resolved}")
+        raise GuardError("\n".join(lines))
+
+
+def _guard_live_first_party_imports() -> None:
+    """Run the editable-install guard against the live interpreter's imports.
+
+    Imports each first-party package and feeds its ``__file__`` to
+    :func:`_assert_first_party_under_src`. Called at conftest import time (below)
+    so a shadowing install fails collection before any test runs.
+    """
+    import importlib
+
+    resolved = {
+        pkg: importlib.import_module(pkg).__file__ for pkg in FIRST_PARTY_PACKAGES
+    }
+    _assert_first_party_under_src(resolved)
+
+
+# Execute the guard at conftest import (collection) time — fail fast.
+_guard_live_first_party_imports()
+
+
+# ---------------------------------------------------------------------------
 # Ephemeral test database lifecycle (lead-0bw)
 # ---------------------------------------------------------------------------
 # The module-top env override points SHOPMSG_DSN at `shopsystem_test`.
