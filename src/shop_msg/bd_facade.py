@@ -522,11 +522,41 @@ def list_dispatch_beads(lead_root: Path) -> list[dict[str, Any]]:
 # gating on its parent-child edge would make every child permanently
 # undispatchable (lead-j4ne). Such edges are therefore EXCLUDED from the
 # gating-predecessor set below.
+#
+# lead-z15d (additive correction): PROVENANCE / informational edge types are
+# likewise NOT dispatch predecessors and MUST NEVER gate a dispatch. A
+# ``discovered-from`` edge records lineage ("this bead was discovered while
+# working that one"), not sequencing; ``related`` / ``relates-to`` /
+# ``caused-by`` / ``validates`` / ``supersedes`` / ``tracks`` are equally
+# informational. Such a bead is frequently a plain authoring / sequencing /
+# provenance bead that was NEVER itself a shop-msg dispatch, so it can never
+# reach a dispatched-and-closed terminal state — gating on it spuriously
+# blocks a downstream dispatch forever even after the predecessor bd issue is
+# CLOSED (observed: 2026-06-08 lead-csas->lead-o0b5; 2026-06-15 lead-9qdn /
+# lead-7if5 over ``discovered-from:lead-l7uz``). This is an ADDITIVE
+# correction: only genuine BLOCKING edges (``blocks`` / ``until``) remain in
+# the gating set, so the queue-on-dependency / promote path (PDR-010 / ADR-013
+# decision 4) and genuine dispatch-to-dispatch sequencing are preserved
+# unchanged; no prior contract about the queue/promote mechanism is retired.
 # ---------------------------------------------------------------------------
 
-# bd ``dependency_type`` values that are container relations, NOT dispatch
-# predecessors. These never gate a dispatch.
-NON_GATING_DEPENDENCY_TYPES = frozenset({"parent-child"})
+# bd ``dependency_type`` values that are container or provenance/informational
+# relations, NOT dispatch predecessors. These never gate a dispatch. Only
+# genuine blocking edges (``blocks``, ``until``) gate; every other type bd can
+# record is excluded here so a provenance edge can never block a downstream
+# dispatch.
+NON_GATING_DEPENDENCY_TYPES = frozenset(
+    {
+        "parent-child",     # epic-container relation (lead-j4ne)
+        "discovered-from",  # provenance: lineage, not sequencing (lead-z15d)
+        "related",          # informational link
+        "relates-to",       # informational link (alias spelling)
+        "caused-by",        # provenance: causal lineage
+        "validates",        # informational: this validates that
+        "supersedes",       # informational: this supersedes that
+        "tracks",           # informational: this tracks that
+    }
+)
 
 
 def list_depends_on(lead_root: Path, work_id: str) -> list[str]:
