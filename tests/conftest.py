@@ -3910,6 +3910,104 @@ def then_pending_lead_inbox_includes_work_id(lead_name: str, work_id: str, conte
     )
 
 
+# lead-rcjf (scenario c4dbfe1cd31d0aea): shop-msg consume inbox --lead <name>
+# --work-id <id> removes a message from the lead's OWN inbox so it no longer
+# appears in 'pending inbox --lead'. Mirrors the existing consume-outbox surface
+# for the inbox direction.
+@given(
+    parsers.parse(
+        '"{lead_name}" is registered in the messaging registry as the lead shop'
+    )
+)
+def given_lead_registered_messaging_registry(
+    lead_name: str, context: dict, request
+) -> None:
+    """Register the named lead shop, recording its root for lead-inbox setup."""
+    saved = _registry_lookup(lead_name, ignore_test_paths=True)
+    lead_root = get_session_lead_root()
+    registry_add(lead_name, shop_type="lead")
+    _test_registry[str(lead_root.resolve())] = lead_name
+    context["named_lead_root"] = lead_root
+    context["named_lead_name"] = lead_name
+    request.addfinalizer(lambda: _registry_restore(lead_name, saved))
+
+
+@given(
+    parsers.parse(
+        'a message addressed to "{lead_name}" with work-id "{work_id}" is '
+        'present in the lead inbox'
+    )
+)
+def given_message_present_in_lead_inbox(
+    lead_name: str, work_id: str, context: dict
+) -> None:
+    """Insert a message into the named lead's OWN inbox namespace.
+
+    The lead's inbox is keyed on the lead's abstract address (the ADR-020
+    sentinel) with direction='inbox'. We insert directly so the scenario can
+    then drive consume inbox against a known work_id.
+    """
+    lead_root = context["named_lead_root"]
+    insert_message(
+        _lead_address(lead_root),
+        work_id,
+        "inbox",
+        "request_maintenance",
+        {
+            "message_type": "request_maintenance",
+            "work_id": work_id,
+            "description": "lead-rcjf consume-inbox setup row",
+        },
+        allow_multi_type=True,
+    )
+    context["consume_inbox_work_id"] = work_id
+
+
+@when(
+    parsers.parse(
+        'I run shop-msg consume inbox --lead {lead_name} with work-id "{work_id}"'
+    )
+)
+def when_run_consume_inbox(lead_name: str, work_id: str, context: dict) -> None:
+    """Run shop-msg consume inbox --lead <name> --work-id <id>."""
+    result = subprocess.run(
+        [
+            "shop-msg", "consume", "inbox",
+            "--lead", lead_name,
+            "--work-id", work_id,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    parsers.parse(
+        'shop-msg pending inbox --lead {lead_name} does not include '
+        'work-id "{work_id}"'
+    )
+)
+def then_pending_lead_inbox_excludes_work_id(
+    lead_name: str, work_id: str, context: dict
+) -> None:
+    """Assert the named work_id no longer appears in the lead's pending inbox."""
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--lead", lead_name],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    tokens_all = " ".join(lines)
+    assert work_id not in tokens_all, (
+        f"expected work_id={work_id!r} to be absent from pending inbox "
+        f"--lead {lead_name}; got lines: {lines}"
+    )
+
+
 @when(
     parsers.parse(
         'I run shop-msg read inbox --lead {lead_name} for work-id "{work_id}"'
