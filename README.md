@@ -21,20 +21,20 @@ for the BC-of-the-shopsystem framing that drove this packaging.
 
 The authoritative catalogue is `05-inter-shop-protocol.md` §5.3 (as
 amended 2026-06-12); this list mirrors it for count and contents. The
-catalogue enumerates **eight** message types: six lead → BC dispatch
-verbs plus the BC → lead responses.
+catalogue enumerates **eight** implemented message types: the lead → BC
+dispatch verbs plus the BC → lead responses, all carrying a `shop-msg`
+subcommand and a `catalog` schema class.
 
 **Lead → BC dispatch verbs:**
 
 - `assign_scenarios` — dispatch a feature's Gherkin scenarios to a BC.
 - `request_bugfix` — dispatch a bug repair (may carry scenarios).
 - `request_maintenance` — dispatch a non-behavioral chore (no scenarios).
-- `request_scenario_register` — **DEFERRED / UNIMPLEMENTED.** A pinned
-  named reservation per §5.3 with no schema class; not a selectable
-  dispatch vehicle.
-- `request_shop_card` — **DEFERRED / UNIMPLEMENTED.** A pinned named
-  reservation per §5.3 with no schema class; not a selectable dispatch
-  vehicle.
+- `request_completion_journal` — **implemented (lead-f1ui).** Symmetric
+  completion-journal request, live as both a `shop-msg send` and a
+  `shop-msg respond` subcommand, backed by the `RequestCompletionJournal`
+  / `RequestCompletionJournalResponse` schema classes. The journal
+  responder ships in shopsystem-scenarios (lead-8z3f).
 - `nudge` — symmetric operational-liveness ping (ADR-015), flowing both
   lead → BC and BC → lead; carries a reason enum and no `scenario_hashes`.
 
@@ -44,6 +44,12 @@ verbs plus the BC → lead responses.
 - `clarify` — ask a clarifying question on an ambiguous work item.
 - `mechanism_observation` — surface a load-bearing, out-of-scope property
   of the mechanism itself.
+- `request_completion_journal` — also surfaces as a BC → lead `respond`
+  subcommand (see above); the verb is symmetric.
+
+`request_scenario_register` and `request_shop_card` remain §5.3 named
+reservations with no schema class and no `shop-msg` subcommand; they are
+not part of the eight implemented types above.
 
 ## Install
 
