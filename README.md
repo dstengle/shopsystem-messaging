@@ -105,6 +105,17 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
+The dev/CI bootstrap MUST install first-party packages **editable**
+(`pip install -e ".[dev]"`) — never a bare `pip install .`, which bakes a
+frozen, non-editable copy of `catalog`/`shop_msg` into `site-packages` that
+can shadow `src/` and make pytest validate stale code (bd
+shopsystem-messaging-c1f). A collection-time guard in `tests/conftest.py`
+enforces this: if any first-party package resolves from a frozen
+`site-packages`/`dist-packages` copy instead of an editable `src/` checkout,
+pytest collection fails fast — before any test runs — naming the offending
+package and its resolved path. If you hit that guard, reinstall editable:
+`pip install -e ".[dev]"`.
+
 Two pytest suites: catalog schema tests (`tests/test_*.py`) and BDD
 features (`tests/test_features.py` discovers `features/*.feature`).
 The integration test under `tests/integration/` pins the cross-package
