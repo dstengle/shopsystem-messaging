@@ -955,6 +955,38 @@ def consume_outbox_message(bc_root: str, work_id: str, message_type: str) -> boo
     return rows_affected > 0
 
 
+def consume_lead_inbox_message(lead_root: str, work_id: str) -> bool:
+    """Mark a lead's OWN inbox row consumed so it drops from pending output.
+
+    Lead-side counterpart to :func:`consume_outbox_message` for the inbox
+    direction (lead-rcjf, scenario c4dbfe1cd31d0aea). The lead's inbox is
+    keyed on the lead's abstract address with direction='inbox'; this lets a
+    lead drain a consumed/superseded message from its own inbox via the CLI.
+
+    Scoped to (bc=lead_address, work_id, direction='inbox') and marks every
+    matching unconsumed row consumed (a work_id may carry more than one
+    message_type in the lead inbox). Returns True if at least one unconsumed
+    row was marked, False otherwise. Does not raise on missing rows; the CLI
+    layer translates False into a non-zero exit with a descriptive error.
+    """
+    bc = _bc_id(lead_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE messages
+                SET consumed = TRUE
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox'
+                  AND consumed = FALSE
+                """,
+                (bc, work_id),
+            )
+            rows_affected = cur.rowcount
+        conn.commit()
+    return rows_affected > 0
+
+
 def delete_bc_messages(bc_root: str) -> None:
     """Delete all messages for a bc_root. Used for test teardown."""
     bc = _bc_id(bc_root)

@@ -111,6 +111,7 @@ from shop_msg import bd_facade
 from shop_msg.storage import (
     CollisionError,
     OutboxDepositError,
+    consume_lead_inbox_message,
     consume_outbox_message,
     delete_bc_messages,
     dispatch_inbox_row_exists,
@@ -1663,6 +1664,27 @@ def _cmd_consume_outbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_consume_inbox(args: argparse.Namespace) -> int:
+    """Mark a specific lead-inbox row as consumed (lead side).
+
+    Lead-side counterpart to ``consume outbox`` for the inbox direction
+    (lead-rcjf, scenario c4dbfe1cd31d0aea): a lead drains a consumed or
+    superseded message from its OWN inbox so it no longer appears in
+    'pending inbox --lead' output. Exits non-zero if no matching unconsumed
+    inbox row exists.
+    """
+    lead_root = _resolve_lead(args)
+    found = consume_lead_inbox_message(lead_root, args.work_id)
+    if not found:
+        print(
+            f"shop-msg consume inbox: no unconsumed inbox row found for "
+            f"work_id={args.work_id!r} in lead={args.lead!r}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _sweep_is_stale(metadata: dict, threshold_seconds: int) -> bool:
     """Return True iff the outbox_pending bead is older than the threshold.
 
@@ -2943,6 +2965,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="message_type of the outbox row to consume",
     )
     consume_outbox.set_defaults(func=_cmd_consume_outbox)
+
+    consume_inbox = consume_sub.add_parser(
+        "inbox",
+        help=(
+            "mark a specific row in the lead's own inbox as consumed so it no "
+            "longer appears in 'pending inbox --lead' output"
+        ),
+    )
+    consume_inbox.add_argument(
+        "--lead",
+        required=True,
+        help="canonical lead shop name (resolved via registry)",
+    )
+    consume_inbox.add_argument(
+        "--work-id",
+        required=True,
+        help="work_id of the lead-inbox row to consume",
+    )
+    consume_inbox.set_defaults(func=_cmd_consume_inbox)
 
     sweep = sub.add_parser(
         "sweep",
