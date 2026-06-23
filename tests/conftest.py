@@ -12671,3 +12671,464 @@ def rcj_response_validates(context: dict) -> None:
     model = RequestCompletionJournalResponse(**payload)
     assert model.message_type == "request_completion_journal_response"
     assert isinstance(model.completed_entries, set)
+
+
+# ===========================================================================
+# clarify_response — in-band answer that re-opens the original dispatch
+# (lead-ox8). Step definitions for features/clarify_response_in_band_answer.feature.
+#
+# clarify_response is the lead's in-band answer to an outstanding BC clarify.
+# It RE-OPENS the original dispatch on the SAME work_id (no new work_id, no new
+# bead), COEXISTS with the dispatch inbox row (allow_multi_type), is REFUSED
+# unless a prior BC clarify exists, and carries NO scenario state.
+# ===========================================================================
+from catalog.schemas import ClarifyResponse as _ClarifyResponse  # noqa: E402
+
+
+def _cr_register_lead(lead_name: str, context: dict, request) -> None:
+    saved = _registry_lookup(lead_name, ignore_test_paths=True)
+    lead_root = get_session_lead_root()
+    registry_add(lead_name, shop_type="lead")
+    _test_registry[str(lead_root.resolve())] = lead_name
+    context["cr_lead_root"] = lead_root
+    context["cr_lead_name"] = lead_name
+    request.addfinalizer(lambda: _registry_restore(lead_name, saved))
+
+
+def _cr_register_bc(bc_name: str, tmp_path: Path, context: dict, request) -> None:
+    saved = _registry_lookup(bc_name, ignore_test_paths=True)
+    bc_root = tmp_path / bc_name
+    (bc_root / "inbox").mkdir(parents=True)
+    (bc_root / "outbox").mkdir()
+    registry_add(bc_name, shop_type="bc")
+    _test_registry[str(bc_root.resolve())] = bc_name
+    context["cr_bc_root"] = bc_root
+    context["cr_bc_name"] = bc_name
+    context["bc_root"] = bc_root
+    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
+
+
+@given(
+    parsers.parse(
+        'a lead shop "{lead_name}" registered as the lead in the messaging registry'
+    )
+)
+def cr_given_lead(lead_name: str, context: dict, request) -> None:
+    _cr_register_lead(lead_name, context, request)
+
+
+@given(parsers.parse('a BC "{bc_name}" registered in the messaging registry'))
+def cr_given_bc(bc_name: str, tmp_path: Path, context: dict, request) -> None:
+    _cr_register_bc(bc_name, tmp_path, context, request)
+
+
+@given(
+    parsers.re(
+        r'the lead previously dispatched (?P<mtype>assign_scenarios|request_bugfix) '
+        r'for work_id "(?P<work_id>[^"]+)", stored as an inbox row at '
+        r'\(bc=(?P<bc_name>[\w-]+), work_id="[^"]+", '
+        r"direction='inbox', message_type='(?P=mtype)'\).*"
+    )
+)
+def cr_given_dispatch_row(
+    mtype: str, work_id: str, bc_name: str, context: dict
+) -> None:
+    """Deposit the original dispatch inbox row for the BC.
+
+    Stored directly via insert_message so the test controls the exact
+    (bc, work_id, direction='inbox', message_type) row that clarify_response
+    must coexist with and must not overwrite. The payload and created_at of
+    this row are snapshotted so a later step can assert byte-identity.
+    """
+    bc_root = context["cr_bc_root"]
+    bc_addr = _bc_address(bc_root)
+    payload = {
+        "message_type": mtype,
+        "work_id": work_id,
+        "description": "lead-ox8 clarify_response dispatch-row setup",
+    }
+    if mtype == "assign_scenarios":
+        # assign_scenarios has no 'description'; carry a scenarios list instead.
+        payload = {"message_type": mtype, "work_id": work_id, "scenarios": []}
+    insert_message(bc_addr, work_id, "inbox", mtype, payload, allow_multi_type=False)
+    # Snapshot the stored dispatch row (payload + created_at) for byte-identity.
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT message_type, payload, created_at FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                  AND message_type = %s
+                LIMIT 1
+                """,
+                (bc_addr, work_id, mtype),
+            )
+            row = cur.fetchone()
+    context.setdefault("cr_dispatch_snapshots", {})[work_id] = {
+        "message_type": row["message_type"],
+        "payload": row["payload"],
+        "created_at": row["created_at"],
+        "expected_mtype": mtype,
+    }
+    context["cr_work_id"] = work_id
+
+
+def _cr_emit_bc_clarify(bc_name: str, work_id: str, question: str) -> None:
+    """Run `shop-msg respond clarify` so the BC-side outbox clarify marker exists.
+
+    insert_bc_response writes the BC-side marker at
+    (bc=bc_addr, direction='outbox', message_type='clarify'), which is the
+    authoritative "the BC asked something here" record the precondition checks.
+    """
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "clarify",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--question", question,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"respond clarify setup failed: {result.stderr}"
+    )
+
+
+@given(
+    parsers.re(
+        r'the BC previously emitted a clarify on that work_id, stored as an outbox '
+        r'row at \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)", '
+        r"direction='outbox', message_type='clarify'\) asking \"(?P<question>[^\"]+)\""
+    )
+)
+def cr_given_bc_clarify_asking(work_id: str, question: str, context: dict) -> None:
+    _cr_emit_bc_clarify(context["cr_bc_name"], work_id, question)
+
+
+@given(
+    parsers.re(
+        r'the BC previously emitted a clarify on work_id "(?P<work_id>[^"]+)" '
+        r"stored at \(bc=[\w-]+, work_id=\"[^\"]+\", direction='outbox', "
+        r"message_type='clarify'\)"
+    )
+)
+def cr_given_bc_clarify_plain(work_id: str, context: dict) -> None:
+    _cr_emit_bc_clarify(
+        context["cr_bc_name"], work_id, "which environment variable names the broker host?"
+    )
+
+
+@given(
+    parsers.re(
+        r'NO outbox clarify row exists for \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)"\) '
+        r"— the BC has not asked anything on this work_id"
+    )
+)
+def cr_given_no_bc_clarify(work_id: str, context: dict) -> None:
+    bc_root = context["cr_bc_root"]
+    assert not outbox_row_exists(_bc_address(bc_root), work_id, "clarify"), (
+        f"expected no prior BC clarify for work_id={work_id!r}"
+    )
+
+
+@when(parsers.re(r'the lead operator runs "(?P<command>[^"]+)"'))
+def cr_when_lead_runs(command: str, context: dict) -> None:
+    """Run the quoted shop-msg command, honoring single-quoted argument values."""
+    import shlex
+    argv = shlex.split(command)
+    assert argv[0] == "shop-msg"
+    result = subprocess.run(argv, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@when(parsers.parse('the lead operator inspects "{command}"'))
+def cr_when_lead_inspects_help(command: str, context: dict) -> None:
+    import shlex
+    argv = shlex.split(command)
+    result = subprocess.run(argv, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    parsers.re(
+        r'a clarify_response row is stored at \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)", '
+        r"direction='inbox', message_type='clarify_response'\) whose payload "
+        r'validates against the ClarifyResponse schema and carries resolution text '
+        r'"(?P<resolution>[^"]+)"'
+    )
+)
+def cr_then_row_stored_validates(work_id: str, resolution: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    payload = _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response")
+    assert payload is not None, "clarify_response inbox row not found"
+    model = _ClarifyResponse(**payload)
+    assert model.message_type == "clarify_response"
+    assert model.resolution == resolution
+
+
+def _cr_fetch_inbox_payload(bc_addr: str, work_id: str, message_type: str):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                  AND message_type = %s
+                LIMIT 1
+                """,
+                (bc_addr, work_id, message_type),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return payload
+
+
+@then(
+    parsers.re(
+        r'the original assign_scenarios dispatch for work_id "(?P<work_id>[^"]+)" is '
+        r'RE-OPENED for the BC\'s gated loop to resume on the SAME work_id '
+        r'"[^"]+" — no new work_id and no new bead are created'
+    )
+)
+def cr_then_reopened_same_work_id(work_id: str, context: dict) -> None:
+    """The dispatch is re-opened: pending inbox --bc surfaces the work_id with
+    the clarify_response message_type, on the SAME work_id, and the dispatch
+    inbox row is still present (no new work_id minted)."""
+    bc_name = context["cr_bc_name"]
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name],
+        capture_output=True, text=True, check=True,
+    )
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    # The clarify_response row makes the work_id pending again under the SAME
+    # work_id, distinguished by the clarify_response message_type.
+    assert any(
+        l.split()[0] == work_id and "clarify_response" in l for l in lines
+    ), f"expected re-opened clarify_response for {work_id!r}; got {lines}"
+    # No NEW work_id was minted: every pending line for this BC keys on a
+    # work_id that already existed (here, exactly work_id).
+    assert all(
+        l.split()[0] == work_id for l in lines
+    ), f"unexpected extra work_id in pending inbox: {lines}"
+
+
+@then(
+    parsers.re(
+        r'the resolution text "(?P<resolution>[^"]+)" is readable by the BC via '
+        r'"shop-msg pending inbox" against work_id "(?P<work_id>[^"]+)"'
+    )
+)
+def cr_then_resolution_readable(resolution: str, work_id: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    payload = _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response")
+    assert payload is not None and payload.get("resolution") == resolution, (
+        f"resolution {resolution!r} not readable for {work_id!r}: {payload}"
+    )
+    # And it surfaces via pending inbox --bc for that work_id.
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", context["cr_bc_name"]],
+        capture_output=True, text=True, check=True,
+    )
+    assert any(
+        l.split() and l.split()[0] == work_id and "clarify_response" in l
+        for l in result.stdout.splitlines()
+    )
+
+
+@then(
+    parsers.re(
+        r'a clarify_response row now exists at \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)", '
+        r"direction='inbox', message_type='clarify_response'\) carrying the "
+        r"resolution text"
+    )
+)
+def cr_then_row_now_exists(work_id: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    payload = _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response")
+    assert payload is not None and payload.get("resolution"), (
+        f"clarify_response row missing or has no resolution for {work_id!r}"
+    )
+
+
+@then(
+    parsers.re(
+        r'the original request_bugfix inbox row for \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)"\) '
+        r'is unchanged — its message_type, payload, and created_at are byte-identical '
+        r'to their pre-clarify_response state'
+    )
+)
+def cr_then_dispatch_byte_identical(work_id: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    snap = context["cr_dispatch_snapshots"][work_id]
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT message_type, payload, created_at FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                  AND message_type = %s
+                LIMIT 1
+                """,
+                (bc_addr, work_id, snap["expected_mtype"]),
+            )
+            row = cur.fetchone()
+    assert row is not None, "original dispatch row vanished"
+    assert row["message_type"] == snap["message_type"]
+    assert row["payload"] == snap["payload"], "dispatch payload mutated"
+    assert row["created_at"] == snap["created_at"], "dispatch created_at mutated"
+
+
+@then(
+    parsers.re(
+        r'both the request_bugfix row and the clarify_response row are independently '
+        r'present at direction=\'inbox\' for the same \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)"\), '
+        r'distinguished by their message_type discriminator'
+    )
+)
+def cr_then_both_present(work_id: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT message_type FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                ORDER BY message_type
+                """,
+                (bc_addr, work_id),
+            )
+            types = sorted(r["message_type"] for r in cur.fetchall())
+    assert "clarify_response" in types and "request_bugfix" in types, (
+        f"expected both request_bugfix and clarify_response inbox rows; got {types}"
+    )
+
+
+@then(
+    parsers.re(
+        r'the command exits non-zero with an error message explaining that '
+        r'clarify_response requires a prior BC clarify on that \(bc, work_id\) and '
+        r'none exists'
+    )
+)
+def cr_then_refused(context: dict) -> None:
+    assert context["cli_returncode"] != 0, "expected non-zero exit"
+    err = context.get("cli_stderr", "")
+    assert "clarify_response" in err and "prior BC clarify" in err, (
+        f"error did not explain the missing-prior-clarify precondition: {err!r}"
+    )
+
+
+@then(
+    parsers.re(
+        r'NO clarify_response row has been stored at \(bc=[\w-]+, work_id="(?P<work_id>[^"]+)", '
+        r"direction='inbox', message_type='clarify_response'\)"
+    )
+)
+def cr_then_no_row_stored(work_id: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    assert _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response") is None, (
+        f"a clarify_response row was stored for {work_id!r} despite refusal"
+    )
+
+
+@then(
+    parsers.re(
+        r'the original assign_scenarios dispatch for work_id "(?P<work_id>[^"]+)" is '
+        r'unchanged and is NOT re-opened'
+    )
+)
+def cr_then_dispatch_unchanged_not_reopened(work_id: str, context: dict) -> None:
+    bc_addr = _bc_address(context["cr_bc_root"])
+    snap = context["cr_dispatch_snapshots"][work_id]
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT message_type, payload, created_at FROM messages
+                WHERE bc = %s AND work_id = %s AND direction = 'inbox'
+                  AND message_type = %s
+                LIMIT 1
+                """,
+                (bc_addr, work_id, snap["expected_mtype"]),
+            )
+            row = cur.fetchone()
+    assert row is not None
+    assert row["payload"] == snap["payload"]
+    assert row["created_at"] == snap["created_at"]
+    # NOT re-opened: there is no clarify_response inbox row.
+    assert _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response") is None
+
+
+@then(
+    parsers.re(
+        r'the help text shows the flags --bc, --work-id, and --resolution and shows '
+        r'NO --scenario-file or any flag that carries scenario state'
+    )
+)
+def cr_then_help_flags(context: dict) -> None:
+    out = context.get("cli_stdout", "")
+    for flag in ("--bc", "--work-id", "--resolution"):
+        assert flag in out, f"help missing flag {flag}: {out}"
+    for forbidden in ("--scenario-file", "--scenario-hash", "scenario_hashes"):
+        assert forbidden not in out, (
+            f"help unexpectedly advertised scenario-state flag {forbidden}: {out}"
+        )
+
+
+@then(
+    parsers.re(
+        r'the ClarifyResponse schema accepts a resolution text and a work_id but has '
+        r'NO scenario_hashes field — construction supplying a scenario_hashes field '
+        r'raises a schema validation error'
+    )
+)
+def cr_then_schema_no_scenario_hashes(context: dict) -> None:
+    from pydantic import ValidationError
+    ok = _ClarifyResponse(
+        message_type="clarify_response", work_id="lead-703", resolution="x"
+    )
+    assert ok.resolution == "x"
+    assert not hasattr(ok, "scenario_hashes")
+    raised = False
+    try:
+        _ClarifyResponse(
+            message_type="clarify_response",
+            work_id="lead-703",
+            resolution="x",
+            scenario_hashes=["abc"],
+        )
+    except ValidationError:
+        raised = True
+    assert raised, "ClarifyResponse accepted a scenario_hashes field"
+
+
+@then(
+    parsers.re(
+        r'the command exits zero and the stored clarify_response payload carries no '
+        r'scenario_hashes field and asserts no scenario coverage'
+    )
+)
+def cr_then_stored_no_scenario_hashes(context: dict) -> None:
+    assert context["cli_returncode"] == 0, context.get("cli_stderr")
+    bc_addr = _bc_address(context["cr_bc_root"])
+    payload = _cr_fetch_inbox_payload(bc_addr, "lead-703", "clarify_response")
+    assert payload is not None, "clarify_response not stored"
+    assert "scenario_hashes" not in payload, (
+        f"stored clarify_response carried scenario_hashes: {payload}"
+    )
+
+
+@then(parsers.re(r'the load-bearing property pinned here is that.*'))
+def cr_then_load_bearing_noop(context: dict) -> None:
+    """Narrative load-bearing-property line; the property itself is pinned by the
+    preceding mechanical assertions in the same scenario."""
+    return None

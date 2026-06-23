@@ -712,9 +712,25 @@ def read_nudge_rows(recipient_root: str, work_id: str | None = None) -> list[dic
 def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
     """Return (work_id, message_type) pairs for unprocessed inbox messages.
 
-    A message is 'pending' iff its inbox row has no corresponding outbox
-    row for the same (bc, work_id). The query mirrors the directory-glob
-    approach the file-based backend used.
+    A message is 'pending' iff EITHER:
+
+    * its inbox row has no corresponding outbox row for the same
+      (bc, work_id) — the original, never-responded-to dispatch; OR
+
+    * it is a ``clarify_response`` inbox row that is NEWER than every outbox
+      row for that (bc, work_id) — i.e. the lead has answered the BC's
+      outstanding clarify IN BAND, RE-OPENING the dispatch on the SAME work_id
+      for the BC's gated loop to resume (lead-ox8).
+
+    The second clause is what makes ``shop-msg send clarify_response`` re-open a
+    dispatch the BC had already responded to with a ``clarify`` (which left a
+    BC-side ``direction='outbox', message_type='clarify'`` marker that the first
+    clause's ``NOT EXISTS (outbox)`` would otherwise suppress). The
+    clarify_response row carries the lead's answer; surfacing it here is how the
+    resolution becomes readable by the BC via ``shop-msg pending inbox``. The
+    clause is scoped to ``clarify_response`` precisely so a stale dispatch the BC
+    legitimately closed out does NOT spuriously re-open — only an in-band answer
+    that post-dates the BC's response re-opens it.
     """
     bc = _bc_id(bc_root)
     with _connect() as conn:
@@ -724,11 +740,22 @@ def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
                 SELECT i.work_id, i.message_type
                 FROM messages i
                 WHERE i.bc = %s AND i.direction = 'inbox'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM messages o
-                    WHERE o.bc = i.bc
-                      AND o.work_id = i.work_id
-                      AND o.direction = 'outbox'
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1 FROM messages o
+                      WHERE o.bc = i.bc
+                        AND o.work_id = i.work_id
+                        AND o.direction = 'outbox'
+                    )
+                    OR (
+                      i.message_type = 'clarify_response'
+                      AND i.created_at > (
+                        SELECT max(o2.created_at) FROM messages o2
+                        WHERE o2.bc = i.bc
+                          AND o2.work_id = i.work_id
+                          AND o2.direction = 'outbox'
+                      )
+                    )
                   )
                 ORDER BY i.created_at
                 """,
