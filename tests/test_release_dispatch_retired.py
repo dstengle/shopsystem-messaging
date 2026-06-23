@@ -3,8 +3,10 @@
 Per ADR-022 (accepted 2026-06-09), the centralized bc-launcher scheduled
 poll supersedes the per-repo `repository_dispatch` fan-in that
 .github/workflows/release.yml used to emit (the `dispatch-bc-launcher-build`
-job). lead-k6xq retired that job; this guard pins its absence so it cannot
-silently regress.
+job). lead-k6xq retired that job — the whole release.yml existed solely to
+emit it and carried no version-hygiene guard to keep, so the workflow file
+was removed. This guard pins the absence of the dispatch wiring across the
+entire workflows tree so it cannot silently regress.
 
 The BC-register scenario @scenario_hash:b891abf0d7ce801f
 (release_workflow_repository_dispatch_to_bc_launcher.feature, alias
@@ -16,32 +18,49 @@ from pathlib import Path
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_RELEASE_WF = _REPO_ROOT / ".github" / "workflows" / "release.yml"
+_WORKFLOWS_DIR = _REPO_ROOT / ".github" / "workflows"
+
+_FORBIDDEN_TOKENS = (
+    "repository_dispatch",
+    "shopsystem-bc-launcher/dispatches",
+    "BC_LAUNCHER_DISPATCH_TOKEN",
+    "dispatch-bc-launcher-build",
+)
 
 
-def test_release_workflow_exists_and_parses() -> None:
-    assert _RELEASE_WF.is_file(), "release.yml is missing"
-    spec = yaml.safe_load(_RELEASE_WF.read_text())
-    assert isinstance(spec, dict), "release.yml did not parse to a mapping"
+def _workflow_files() -> list[Path]:
+    if not _WORKFLOWS_DIR.is_dir():
+        return []
+    return sorted(_WORKFLOWS_DIR.glob("*.yml")) + sorted(
+        _WORKFLOWS_DIR.glob("*.yaml")
+    )
 
 
-def test_release_workflow_has_no_cross_repo_dispatch() -> None:
-    text = _RELEASE_WF.read_text()
-    for forbidden in (
-        "repository_dispatch",
-        "shopsystem-bc-launcher/dispatches",
-        "BC_LAUNCHER_DISPATCH_TOKEN",
-        "dispatch-bc-launcher-build",
-    ):
-        assert forbidden not in text, (
-            f"release.yml still references {forbidden!r}; the cross-repo "
-            f"repository_dispatch fan-in must be retired (ADR-022)"
+def test_no_workflow_carries_cross_repo_dispatch() -> None:
+    for wf in _workflow_files():
+        text = wf.read_text()
+        for forbidden in _FORBIDDEN_TOKENS:
+            assert forbidden not in text, (
+                f"{wf.name} still references {forbidden!r}; the cross-repo "
+                f"repository_dispatch fan-in must be retired (ADR-022)"
+            )
+
+
+def test_no_dispatch_bc_launcher_build_job() -> None:
+    for wf in _workflow_files():
+        spec = yaml.safe_load(wf.read_text())
+        if not isinstance(spec, dict):
+            continue
+        jobs = spec.get("jobs") or {}
+        assert "dispatch-bc-launcher-build" not in jobs, (
+            f"{wf.name} still defines the dispatch-bc-launcher-build job; it "
+            f"must be removed entirely (ADR-022)"
         )
 
 
-def test_dispatch_bc_launcher_build_job_removed() -> None:
-    spec = yaml.safe_load(_RELEASE_WF.read_text())
-    jobs = spec.get("jobs") or {}
-    assert "dispatch-bc-launcher-build" not in jobs, (
-        "the dispatch-bc-launcher-build job must be removed entirely"
-    )
+def test_all_workflows_still_parse() -> None:
+    # Whatever workflows remain must be valid YAML mappings (catches a
+    # botched deletion leaving an invalid file behind).
+    for wf in _workflow_files():
+        spec = yaml.safe_load(wf.read_text())
+        assert isinstance(spec, dict), f"{wf.name} did not parse to a mapping"
