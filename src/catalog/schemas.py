@@ -1,6 +1,6 @@
 import re
 from typing import Annotated, Literal, Union
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Delegate the canonical scenario-hash to the scenarios package. The
 # rule's true home is `scenarios.hash.compute_scenario_hash`; we re-
@@ -328,6 +328,42 @@ class MechanismObservation(BaseModel):
     )
 
 
+class ClarifyResponse(BaseModel):
+    """Lead -> BC in-band answer to an outstanding BC clarify (lead-ox8).
+
+    A clarify_response delivers the lead's answer to a clarify the BC raised,
+    RE-OPENING the original dispatch on the SAME work_id for the BC's gated
+    loop to resume — no new work_id and no new bead are minted. It coexists
+    with the original dispatch inbox row (it opts into allow_multi_type at the
+    storage layer, the same coexistence mechanism work_done/mechanism_observation
+    use), distinguished by its message_type discriminator.
+
+    Transmission-layer purity (mirrors Nudge / ADR-015 decision 7): the schema
+    has NO ``scenario_hashes`` field and forbids extra keys, so a payload that
+    smuggles scenario state is REJECTED at construction rather than silently
+    dropped. This is the bounding constraint pinned by ADR-009 layer (b) /
+    ADR-027: because clarify_response cannot carry scenarios, an answer that
+    would change the contract or add/tighten scenarios CANNOT be sent as a
+    clarify_response — it MUST route to re-dispatch (assign_scenarios /
+    request_bugfix).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    message_type: Literal["clarify_response"]
+    # work_id uses the SHARED canonical work_id grammar (lead-qbbk): a dotted
+    # child-bead id round-trips, while path separators and whitespace stay
+    # rejected. clarify_response answers an EXISTING dispatch, so it reuses
+    # the same work_id grammar every other vehicle carries — no asymmetric
+    # per-schema pattern is reintroduced here.
+    work_id: WorkId
+    # The lead's answer text. Required and non-empty: a clarify_response with
+    # no resolution answers nothing.
+    resolution: str = Field(min_length=1)
+    # See RequestMaintenance.from_shop. Populated by `shop-msg send` when the
+    # sender is resolved implicitly from CWD (PDR-008).
+    from_shop: str | None = None
+
+
 class RequestCompletionJournal(BaseModel):
     """Lead -> BC request for a target BC's completion journal (lead-f1ui).
 
@@ -378,6 +414,7 @@ LeadMessage = Union[
     AssignScenarios,
     RequestBugfix,
     RequestCompletionJournal,
+    ClarifyResponse,
     Nudge,
 ]
 BCResponse = Union[
