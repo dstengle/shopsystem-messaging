@@ -12685,41 +12685,22 @@ def rcj_response_validates(context: dict) -> None:
 from catalog.schemas import ClarifyResponse as _ClarifyResponse  # noqa: E402
 
 
-def _cr_register_lead(lead_name: str, context: dict, request) -> None:
-    saved = _registry_lookup(lead_name, ignore_test_paths=True)
-    lead_root = get_session_lead_root()
-    registry_add(lead_name, shop_type="lead")
-    _test_registry[str(lead_root.resolve())] = lead_name
-    context["cr_lead_root"] = lead_root
-    context["cr_lead_name"] = lead_name
-    request.addfinalizer(lambda: _registry_restore(lead_name, saved))
+# NOTE on shared steps: the lead/BC registration steps
+#   - 'a lead shop "{lead_name}" registered as the lead in the messaging registry'
+#   - 'a BC "{bc_name}" registered in the messaging registry'
+# are ALREADY defined above (nn5f_given_lead_registered / nn5f_given_bc_registered)
+# and set context["registered_bc_root"] / context["registered_bc_name"]. The
+# clarify_response steps below REUSE those keys rather than redefining the
+# registration steps (a redefinition would shadow them and break the nudge /
+# consume / sweep features that also use this exact phrasing).
 
 
-def _cr_register_bc(bc_name: str, tmp_path: Path, context: dict, request) -> None:
-    saved = _registry_lookup(bc_name, ignore_test_paths=True)
-    bc_root = tmp_path / bc_name
-    (bc_root / "inbox").mkdir(parents=True)
-    (bc_root / "outbox").mkdir()
-    registry_add(bc_name, shop_type="bc")
-    _test_registry[str(bc_root.resolve())] = bc_name
-    context["cr_bc_root"] = bc_root
-    context["cr_bc_name"] = bc_name
-    context["bc_root"] = bc_root
-    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
+def _cr_bc_root(context: dict) -> Path:
+    return Path(context["registered_bc_root"])
 
 
-@given(
-    parsers.parse(
-        'a lead shop "{lead_name}" registered as the lead in the messaging registry'
-    )
-)
-def cr_given_lead(lead_name: str, context: dict, request) -> None:
-    _cr_register_lead(lead_name, context, request)
-
-
-@given(parsers.parse('a BC "{bc_name}" registered in the messaging registry'))
-def cr_given_bc(bc_name: str, tmp_path: Path, context: dict, request) -> None:
-    _cr_register_bc(bc_name, tmp_path, context, request)
+def _cr_bc_name(context: dict) -> str:
+    return context["registered_bc_name"]
 
 
 @given(
@@ -12740,7 +12721,7 @@ def cr_given_dispatch_row(
     must coexist with and must not overwrite. The payload and created_at of
     this row are snapshotted so a later step can assert byte-identity.
     """
-    bc_root = context["cr_bc_root"]
+    bc_root = _cr_bc_root(context)
     bc_addr = _bc_address(bc_root)
     payload = {
         "message_type": mtype,
@@ -12803,7 +12784,7 @@ def _cr_emit_bc_clarify(bc_name: str, work_id: str, question: str) -> None:
     )
 )
 def cr_given_bc_clarify_asking(work_id: str, question: str, context: dict) -> None:
-    _cr_emit_bc_clarify(context["cr_bc_name"], work_id, question)
+    _cr_emit_bc_clarify(_cr_bc_name(context), work_id, question)
 
 
 @given(
@@ -12815,7 +12796,7 @@ def cr_given_bc_clarify_asking(work_id: str, question: str, context: dict) -> No
 )
 def cr_given_bc_clarify_plain(work_id: str, context: dict) -> None:
     _cr_emit_bc_clarify(
-        context["cr_bc_name"], work_id, "which environment variable names the broker host?"
+        _cr_bc_name(context), work_id, "which environment variable names the broker host?"
     )
 
 
@@ -12826,13 +12807,20 @@ def cr_given_bc_clarify_plain(work_id: str, context: dict) -> None:
     )
 )
 def cr_given_no_bc_clarify(work_id: str, context: dict) -> None:
-    bc_root = context["cr_bc_root"]
+    bc_root = _cr_bc_root(context)
     assert not outbox_row_exists(_bc_address(bc_root), work_id, "clarify"), (
         f"expected no prior BC clarify for work_id={work_id!r}"
     )
 
 
-@when(parsers.re(r'the lead operator runs "(?P<command>[^"]+)"'))
+# Scoped to `shop-msg send clarify_response` ONLY, so this step does not shadow
+# the nudge / consume / sweep / bc-status `the lead operator runs "..."` steps
+# that key on their own command shapes.
+@when(
+    parsers.re(
+        r'the lead operator runs "(?P<command>shop-msg send clarify_response[^"]*)"'
+    )
+)
 def cr_when_lead_runs(command: str, context: dict) -> None:
     """Run the quoted shop-msg command, honoring single-quoted argument values."""
     import shlex
@@ -12863,7 +12851,7 @@ def cr_when_lead_inspects_help(command: str, context: dict) -> None:
     )
 )
 def cr_then_row_stored_validates(work_id: str, resolution: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     payload = _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response")
     assert payload is not None, "clarify_response inbox row not found"
     model = _ClarifyResponse(**payload)
@@ -12903,7 +12891,7 @@ def cr_then_reopened_same_work_id(work_id: str, context: dict) -> None:
     """The dispatch is re-opened: pending inbox --bc surfaces the work_id with
     the clarify_response message_type, on the SAME work_id, and the dispatch
     inbox row is still present (no new work_id minted)."""
-    bc_name = context["cr_bc_name"]
+    bc_name = _cr_bc_name(context)
     result = subprocess.run(
         ["shop-msg", "pending", "inbox", "--bc", bc_name],
         capture_output=True, text=True, check=True,
@@ -12928,14 +12916,14 @@ def cr_then_reopened_same_work_id(work_id: str, context: dict) -> None:
     )
 )
 def cr_then_resolution_readable(resolution: str, work_id: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     payload = _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response")
     assert payload is not None and payload.get("resolution") == resolution, (
         f"resolution {resolution!r} not readable for {work_id!r}: {payload}"
     )
     # And it surfaces via pending inbox --bc for that work_id.
     result = subprocess.run(
-        ["shop-msg", "pending", "inbox", "--bc", context["cr_bc_name"]],
+        ["shop-msg", "pending", "inbox", "--bc", _cr_bc_name(context)],
         capture_output=True, text=True, check=True,
     )
     assert any(
@@ -12952,7 +12940,7 @@ def cr_then_resolution_readable(resolution: str, work_id: str, context: dict) ->
     )
 )
 def cr_then_row_now_exists(work_id: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     payload = _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response")
     assert payload is not None and payload.get("resolution"), (
         f"clarify_response row missing or has no resolution for {work_id!r}"
@@ -12967,7 +12955,7 @@ def cr_then_row_now_exists(work_id: str, context: dict) -> None:
     )
 )
 def cr_then_dispatch_byte_identical(work_id: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     snap = context["cr_dispatch_snapshots"][work_id]
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -12995,7 +12983,7 @@ def cr_then_dispatch_byte_identical(work_id: str, context: dict) -> None:
     )
 )
 def cr_then_both_present(work_id: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -13034,7 +13022,7 @@ def cr_then_refused(context: dict) -> None:
     )
 )
 def cr_then_no_row_stored(work_id: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     assert _cr_fetch_inbox_payload(bc_addr, work_id, "clarify_response") is None, (
         f"a clarify_response row was stored for {work_id!r} despite refusal"
     )
@@ -13047,7 +13035,7 @@ def cr_then_no_row_stored(work_id: str, context: dict) -> None:
     )
 )
 def cr_then_dispatch_unchanged_not_reopened(work_id: str, context: dict) -> None:
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     snap = context["cr_dispatch_snapshots"][work_id]
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -13119,7 +13107,7 @@ def cr_then_schema_no_scenario_hashes(context: dict) -> None:
 )
 def cr_then_stored_no_scenario_hashes(context: dict) -> None:
     assert context["cli_returncode"] == 0, context.get("cli_stderr")
-    bc_addr = _bc_address(context["cr_bc_root"])
+    bc_addr = _bc_address(_cr_bc_root(context))
     payload = _cr_fetch_inbox_payload(bc_addr, "lead-703", "clarify_response")
     assert payload is not None, "clarify_response not stored"
     assert "scenario_hashes" not in payload, (
