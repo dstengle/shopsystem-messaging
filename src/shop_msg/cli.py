@@ -34,11 +34,16 @@ Subcommands:
                          --scenario-file PATH ...]
         Writes a RequestBugfix message to the Postgres messages table.
         Scenarios are optional.
-    read outbox --bc-root PATH --work-id ID
-        Reads the latest outbox row for a work_id from Postgres, validates
-        it against the BCResponse union, and dumps the canonical YAML to
-        stdout. Exits non-zero (with a stderr message) when no outbox
-        row matches the work_id or validation fails.
+    read outbox --bc PATH --work-id ID [--message-type TYPE]
+        Reads outbox rows for a work_id from Postgres, validates each against
+        the BCResponse union, and dumps the canonical YAML to stdout. The
+        outbox is keyed by (work_id, message_type), so multiple rows can
+        coexist under one work_id (e.g. a work_done AND a later
+        mechanism_observation). With no --message-type, EVERY coexisting row
+        is surfaced (created_at order, oldest first); --message-type narrows
+        to that single row. Exits non-zero (with a stderr message) when no
+        outbox row matches the work_id (or the --message-type), or validation
+        fails.
     read inbox --bc-root PATH --work-id ID
         Reads the inbox row for a work_id from Postgres, validates it
         against the LeadMessage union, and dumps the canonical YAML to
@@ -1437,19 +1442,47 @@ def _cmd_read_outbox(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    # Use the most-recently-inserted row (last in created_at order).
-    raw = rows[-1]
-    try:
-        message = _response_adapter.validate_python(raw)
-    except ValidationError as e:
-        print(
-            f"shop-msg read outbox: validation failed for "
-            f"work_id={args.work_id!r}:\n{e}",
-            file=sys.stderr,
+
+    # The outbox is keyed by (work_id, message_type), so multiple rows can
+    # legitimately coexist under one work_id (e.g. a work_done AND a later
+    # mechanism_observation). A reader that surfaced only the most-recent row
+    # masked the others — a router could then wrongly conclude an intact
+    # earlier response was overwritten and dispatch a destructive "restore".
+    #
+    # Default (no --message-type): surface EVERY coexisting row in
+    # created_at order (oldest first), so the full outbox state for the
+    # work_id is observable. --message-type narrows to exactly that row.
+    selector = getattr(args, "message_type", None)
+    if selector is not None:
+        selected = [r for r in rows if r.get("message_type") == selector]
+        if not selected:
+            present = sorted({str(r.get("message_type")) for r in rows})
+            print(
+                f"shop-msg read outbox: no {selector!r} outbox response found "
+                f"for work_id={args.work_id!r} in bc={bc_root!r}; "
+                f"present message_types: {present}",
+                file=sys.stderr,
+            )
+            return 1
+        rows = selected
+
+    rendered: list[str] = []
+    for raw in rows:
+        try:
+            message = _response_adapter.validate_python(raw)
+        except ValidationError as e:
+            print(
+                f"shop-msg read outbox: validation failed for "
+                f"work_id={args.work_id!r}:\n{e}",
+                file=sys.stderr,
+            )
+            return 1
+        rendered.append(
+            f"valid {message.message_type} from {args.work_id}:\n"
+            f"{_render_message_yaml(message)}"
         )
-        return 1
-    print(f"valid {message.message_type} from {args.work_id}:")
-    print(_render_message_yaml(message))
+
+    print("\n".join(rendered))
     return 0
 
 
@@ -2827,6 +2860,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_removed_flag(read_outbox, "--bc-root")
     read_outbox.add_argument(
         "--work-id", required=True, help="work_id whose response to read"
+    )
+    read_outbox.add_argument(
+        "--message-type",
+        default=None,
+        help=(
+            "optional selector: narrow to the single outbox row of this "
+            "message_type. The outbox is keyed by (work_id, message_type), so "
+            "multiple rows can coexist under one work_id (e.g. work_done + a "
+            "later mechanism_observation). When omitted, ALL coexisting rows "
+            "under the work_id are surfaced in created_at order."
+        ),
     )
     read_outbox.set_defaults(func=_cmd_read_outbox, _cwd_resolves=True)
 
