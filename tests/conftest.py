@@ -12890,3 +12890,155 @@ def cr_then_load_bearing_noop(context: dict) -> None:
     """Narrative load-bearing-property line; the property itself is pinned by the
     preceding mechanical assertions in the same scenario."""
     return None
+
+
+# ---------------------------------------------------------------------------
+# work_id lead-n8pf — @scenario_hash:974ee23c53cbb09a
+# Register parity (ADR-022): the shopsystem-messaging release workflow declares
+# NO repository_dispatch emit to shopsystem-bc-launcher and references no
+# BC_LAUNCHER_DISPATCH_TOKEN. The guarantee is inspected against THIS BC repo's
+# real .github/workflows/ tree with YAML comment lines EXCLUDED; absence of the
+# tree (release.yml deleted by lead-k6xq) satisfies the guarantee. The teeth of
+# the comment-stripped inspection are proved in
+# tests/test_release_no_emit_scenario_teeth.py.
+# ---------------------------------------------------------------------------
+from tests.release_emit_inspect import (  # noqa: E402
+    forbidden_tokens_in_executable_body,
+    strip_yaml_comments,
+)
+
+_BC_REPO_ROOT = Path(__file__).resolve().parent.parent
+_BC_WORKFLOWS_DIR = _BC_REPO_ROOT / ".github" / "workflows"
+
+
+@given(
+    parsers.parse(
+        'the shopsystem-messaging release workflow at "{workflow_path}"'
+    ),
+    target_fixture="n8pf_workflows_dir",
+)
+def n8pf_given_release_workflow(workflow_path: str) -> Path:
+    # The guarantee is inspected against this BC repo's real workflows tree.
+    # `workflow_path` (".github/workflows/release.yml") names the slot the
+    # retired emit lived in; the file is absent now and absence satisfies the
+    # no-emit guarantee. We return the workflows DIR so the absent / empty /
+    # populated tree are all handled uniformly.
+    assert workflow_path == ".github/workflows/release.yml", workflow_path
+    return _BC_WORKFLOWS_DIR
+
+
+@given(
+    parsers.parse(
+        "bc-base rebuilds are driven by shopsystem-bc-launcher's own "
+        "centralized scheduled poll per ADR-022, not by a per-repo "
+        "repository_dispatch emit"
+    )
+)
+def n8pf_given_centralized_poll() -> None:
+    """Narrative context (ADR-022). The mechanical guarantee is asserted by the
+    Then steps inspecting the comment-stripped executable body."""
+    return None
+
+
+@when(
+    parsers.parse(
+        "the release workflow's executable body, with YAML comment lines "
+        "excluded, is inspected on a version-tag release"
+    ),
+    target_fixture="n8pf_violations",
+)
+def n8pf_when_inspect_executable_body(n8pf_workflows_dir: Path) -> list:
+    return forbidden_tokens_in_executable_body(n8pf_workflows_dir)
+
+
+@then(
+    parsers.parse(
+        'the executable body declares no "dispatch-bc-launcher-build" job and '
+        "no step performing a repository_dispatch targeting "
+        '"dstengle/shopsystem-bc-launcher"'
+    )
+)
+def n8pf_then_no_dispatch_job_or_target(n8pf_violations: list) -> None:
+    offending = {tok for _, tok in n8pf_violations}
+    assert "dispatch-bc-launcher-build" not in offending, (
+        f"executable body declares the dispatch-bc-launcher-build job: "
+        f"{n8pf_violations}"
+    )
+    assert "dstengle/shopsystem-bc-launcher" not in offending, (
+        f"executable body performs a repository_dispatch targeting "
+        f"dstengle/shopsystem-bc-launcher: {n8pf_violations}"
+    )
+
+
+@then(
+    parsers.parse(
+        "the executable body declares no repository_dispatch with event_type "
+        '"framework-utility-release"'
+    )
+)
+def n8pf_then_no_event_type(n8pf_violations: list) -> None:
+    offending = {tok for _, tok in n8pf_violations}
+    assert "repository_dispatch" not in offending, (
+        f"executable body declares a repository_dispatch: {n8pf_violations}"
+    )
+    assert "framework-utility-release" not in offending, (
+        f"executable body declares event_type framework-utility-release: "
+        f"{n8pf_violations}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the executable body references no secret named '
+        '"BC_LAUNCHER_DISPATCH_TOKEN"'
+    )
+)
+def n8pf_then_no_secret(n8pf_violations: list) -> None:
+    offending = {tok for _, tok in n8pf_violations}
+    assert "BC_LAUNCHER_DISPATCH_TOKEN" not in offending, (
+        f"executable body references the BC_LAUNCHER_DISPATCH_TOKEN secret: "
+        f"{n8pf_violations}"
+    )
+
+
+@then(
+    parsers.parse(
+        "a repository_dispatch target or BC_LAUNCHER_DISPATCH_TOKEN reference "
+        "present only in a descriptive YAML comment, absent from the "
+        "executable body, does not fail this guarantee"
+    )
+)
+def n8pf_then_comment_only_does_not_fail(n8pf_workflows_dir: Path) -> None:
+    # Prove the comment-exclusion clause concretely: a workflow whose ONLY
+    # references to the retired tokens live in YAML comments must yield zero
+    # executable-body violations.
+    import tempfile
+
+    comment_only = (
+        "name: release\n"
+        "on:\n"
+        "  push:\n"
+        "    tags:\n"
+        '      - "v*"\n'
+        "# historical: dispatch-bc-launcher-build performed a repository_dispatch\n"
+        "# targeting dstengle/shopsystem-bc-launcher (event_type\n"
+        "# framework-utility-release) with secrets.BC_LAUNCHER_DISPATCH_TOKEN.\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        '      - run: echo "no cross-repo emit"\n'
+    )
+    # The stripped executable body of a comment-only workflow is clean.
+    stripped = strip_yaml_comments(comment_only)
+    assert "BC_LAUNCHER_DISPATCH_TOKEN" not in stripped
+    assert "dstengle/shopsystem-bc-launcher" not in stripped
+    assert "framework-utility-release" not in stripped
+
+    with tempfile.TemporaryDirectory() as td:
+        wf_dir = Path(td) / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "release.yml").write_text(comment_only)
+        assert forbidden_tokens_in_executable_body(wf_dir) == [], (
+            "a comment-only token reference must NOT fail the guarantee"
+        )
