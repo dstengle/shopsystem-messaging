@@ -53,6 +53,13 @@ from scenarios.hash import compute_scenario_hash as _canonical_scenario_hash
 #
 # This is the same shape as MechanismObservation.provenance_ref's input-safety
 # pattern; reusing it keeps the catalog's identifier-safety story uniform.
+#
+# Symmetry is regression-pinned two ways (lead-qbbk): per-vehicle in
+# tests/test_work_id_pattern_symmetry.py, and as a direct cross-type
+# accept/reject AGREEMENT battery in tests/test_work_id_symmetry_battery.py
+# (the same work_id yields one verdict across all 8 vehicles). Changing this
+# single constant — or reintroducing a per-schema work_id constraint — breaks
+# the agreement battery, which is the point: the pattern lives here ONCE.
 _WORK_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 
 # Required work_id field, shared by every message type that carries one.
