@@ -9645,6 +9645,332 @@ def _eow5_resolve_bc_root(context: dict, bc: str) -> Path:
     return Path(context["nn5f_bc_root"])
 
 
+# =======================================================================
+# lead-r8di regression teeth: the dispatch gate is a function of the LIVE bd
+# dep graph at send time, never a stale persisted snapshot.
+#
+# Backs features/dispatch_dependency_live_bd_dep_at_send.feature
+# (@scenario_hash d57229bc3d2de283 and 2bb889fc1fe2e4bb).
+#
+# These steps drive a REAL bd workspace (the nn5f-registered lead root) and a
+# REAL postgres outbox via `shop-msg send`, so the live-consultation contract
+# is exercised end-to-end: a removed OR reclassified-to-non-blocking edge must
+# let the send through even while the predecessor bead stays OPEN, and the
+# documented `bd dep remove` cure must deposit the row with no predecessor-close
+# step. A stale snapshot (or a NON_GATING set that omits the reclassified type)
+# regresses these.
+# =======================================================================
+
+
+def _r8di_predecessor_open(lead_root: Path, work_id: str) -> None:
+    """Create the predecessor bead and leave it OPEN (never closed).
+
+    A plain planning bead is open by construction (bd-native status=open, no
+    dispatch_state metadata), which is the strongest form of "predecessor still
+    open" — if the gate keyed on a stale snapshot it would still refuse here.
+    """
+    _eow5_create_plain_bead(lead_root, work_id)
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists and is NOT at dispatch_state='
+        '"{state}" (the predecessor is still open / in-flight)'
+    )
+)
+def r8di_given_predecessor_open(work_id: str, state: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _r8di_predecessor_open(lead_root, work_id)
+
+
+@given(
+    parsers.parse(
+        'a lead bd entry "{work_id}" exists and remains OPEN throughout this '
+        "scenario (it is never closed)"
+    )
+)
+def r8di_given_predecessor_open_blkr(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    _r8di_predecessor_open(lead_root, work_id)
+
+
+@given(
+    parsers.parse(
+        'the lead architect previously recorded a depends-on edge with "bd dep '
+        'add {dependent} {predecessor}" so {dependent2} depended on {predecessor2}'
+    )
+)
+def r8di_given_dep_edge_past(
+    dependent: str, predecessor: str, dependent2: str, predecessor2: str,
+    context: dict,
+) -> None:
+    eow5_given_dep_edge(dependent, predecessor, dependent2, predecessor2, context)
+
+
+@given(
+    parsers.parse(
+        'the lead architect recorded a depends-on edge with "bd dep add '
+        '{dependent} {predecessor}" so {dependent2} depended on {predecessor2}'
+    )
+)
+def r8di_given_dep_edge_recorded(
+    dependent: str, predecessor: str, dependent2: str, predecessor2: str,
+    context: dict,
+) -> None:
+    eow5_given_dep_edge(dependent, predecessor, dependent2, predecessor2, context)
+
+
+@given(
+    parsers.parse(
+        'the lead architect has since either removed that edge with "bd dep '
+        'remove {dependent} {predecessor}" OR reclassified it to a non-blocking '
+        "type (e.g. relates-to) so that \"bd dep list {dependent2}\" shows NO "
+        'depends-on edge to {predecessor2} and "bd ready" reports {dependent3} '
+        "as unblocked"
+    )
+)
+def r8di_given_edge_removed_or_reclassified(
+    dependent: str, predecessor: str, dependent2: str, predecessor2: str,
+    dependent3: str, context: dict,
+) -> None:
+    """RECLASSIFY the live edge to relates-to (a non-blocking type).
+
+    We exercise the reclassification arm specifically (not the plain-remove
+    arm): `bd dep remove` followed by `bd dep relate`, which is exactly the
+    "reclassify a blocks edge to relates-to" operator action. After this,
+    `bd dep list <dependent>` reports the edge with dependency_type=relates-to,
+    which is in NON_GATING_DEPENDENCY_TYPES — so the LIVE consultation finds no
+    blocking predecessor. (The plain-remove arm of the OR is covered end-to-end
+    by scenario 2bb889fc1fe2e4bb.)
+    """
+    lead_root = _eow5_lead_root(context)
+    rm = subprocess.run(
+        ["bd", "dep", "remove", dependent, predecessor],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    assert rm.returncode == 0, f"bd dep remove failed: {rm.stderr}"
+    rel = subprocess.run(
+        ["bd", "dep", "relate", dependent, predecessor],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    assert rel.returncode == 0, f"bd dep relate failed: {rel.stderr}"
+    # The live graph now shows no GATING edge to the predecessor.
+    assert _eow5_dep_list(lead_root, dependent) == [], (
+        "after reclassify-to-relates-to the LIVE dep list must show no gating "
+        f"predecessor for {dependent}; got "
+        f"{_eow5_dep_list(lead_root, dependent)}"
+    )
+    # The predecessor is still OPEN (never closed) — proving the send proceeds
+    # because the EDGE is gone-from-gating, not because the predecessor closed.
+    assert not _bd_facade.predecessor_satisfied(lead_root, predecessor), (
+        f"predecessor {predecessor} must still be open / unsatisfied"
+    )
+
+
+@given(
+    parsers.parse(
+        'an earlier "shop-msg send ... --work-id {work_id}" was refused in '
+        "strict mode naming {predecessor} as the unmet predecessor"
+    )
+)
+def r8di_given_earlier_refusal(
+    work_id: str, predecessor: str, tmp_path: Path, context: dict
+) -> None:
+    """Prove the gate WAS gating before the cure: run a strict send now and
+    assert it refuses naming the predecessor. This pins the precondition the
+    cure operates on — the edge was live-blocking — without depending on any
+    out-of-band state."""
+    lead_root = _eow5_lead_root(context)
+    payload_path = str(tmp_path / f"payload-precure-{work_id}.yaml")
+    _eow5_write_payload(payload_path)
+    proc = subprocess.run(
+        ["shop-msg", "send", "request_bugfix", "--bc", "shopsystem-messaging",
+         "--work-id", work_id, "--payload", payload_path],
+        capture_output=True, text=True,
+    )
+    err = (proc.stderr or "") + (proc.stdout or "")
+    assert proc.returncode != 0, (
+        f"earlier strict send must have been refused; got rc={proc.returncode} "
+        f"out={err!r}"
+    )
+    assert predecessor in err, (
+        f"earlier refusal must name predecessor {predecessor!r}: {err!r}"
+    )
+
+
+@when(
+    parsers.parse(
+        'the lead architect runs "bd dep remove {dependent} {predecessor}" and '
+        'then runs "shop-msg send request_bugfix --bc {bc} --work-id {work_id} '
+        '--payload {payload}"'
+    )
+)
+def r8di_when_remove_then_send(
+    dependent: str, predecessor: str, bc: str, work_id: str, payload: str,
+    context: dict,
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    rm = subprocess.run(
+        ["bd", "dep", "remove", dependent, predecessor],
+        cwd=str(lead_root), capture_output=True, text=True,
+    )
+    assert rm.returncode == 0, f"bd dep remove failed: {rm.stderr}"
+    # The cure removed the live edge; the predecessor is deliberately NOT closed.
+    assert _eow5_dep_list(lead_root, dependent) == [], (
+        f"bd dep remove must clear the live gating edge for {dependent}"
+    )
+    context["eow5_active_work_id"] = work_id
+    _run(
+        ["shop-msg", "send", "request_bugfix", "--bc", bc, "--work-id", work_id,
+         "--payload", payload],
+        context,
+    )
+
+
+@then(
+    parsers.parse(
+        "shop-msg send consults the CURRENT bd depends-on edges for {work_id} "
+        "at send time (not a snapshot persisted at an earlier send/queue time) "
+        "and finds no blocking predecessor"
+    )
+)
+def r8di_then_consults_live_no_blocker(work_id: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The send exited zero (no refusal) — proving the live consultation found no
+    # blocking predecessor. Corroborate against the live graph directly.
+    assert context["cli_returncode"] == 0, (
+        "send must consult the live graph and proceed; "
+        f"rc={context['cli_returncode']} stderr={context.get('cli_stderr')!r}"
+    )
+    assert _bd_facade.first_unclosed_predecessor(lead_root, work_id) is None, (
+        f"the LIVE graph must show no unmet predecessor for {work_id}"
+    )
+
+
+@then(
+    parsers.parse(
+        "the command exits zero and deposits the postgres outbox row at "
+        "(bc={bc}, direction='outbox', work_id='{work_id}', "
+        "message_type='{mtype}')"
+    )
+)
+def r8di_then_exit_zero_and_deposit(
+    bc: str, work_id: str, mtype: str, context: dict
+) -> None:
+    assert context["cli_returncode"] == 0, (
+        f"expected zero exit; the live gate must let the send through. "
+        f"stderr={context.get('cli_stderr')!r} stdout={context.get('cli_stdout')!r}"
+    )
+    bc_root = _eow5_resolve_bc_root(context, bc)
+    rows = _fetch_inbox_rows(bc_root)
+    matching = [
+        r for r in rows
+        if r["work_id"] == work_id and r["message_type"] == mtype
+    ]
+    assert matching, (
+        f"expected a deposited row for {work_id}; "
+        f"found rows={[r['work_id'] for r in rows]}"
+    )
+
+
+@then(
+    parsers.parse(
+        "the command does NOT refuse citing {predecessor}, even though "
+        "{predecessor2} is still open, because the live depends-on edge that "
+        "would have gated the send no longer exists"
+    )
+)
+def r8di_then_no_refusal_cite(
+    predecessor: str, predecessor2: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    err = (context.get("cli_stderr") or "") + (context.get("cli_stdout") or "")
+    assert context["cli_returncode"] == 0 and "refusing to dispatch" not in err, (
+        f"send must NOT refuse citing {predecessor!r}; got {err!r}"
+    )
+    # The predecessor is genuinely still open (never closed).
+    assert not _bd_facade.predecessor_satisfied(lead_root, predecessor), (
+        f"predecessor {predecessor} must still be open for this pin to bite"
+    )
+
+
+@then(
+    parsers.parse(
+        "the load-bearing property pinned here is that the gate is a function "
+        "of the LIVE bd dep graph at send time, never a stale persisted "
+        "dependency snapshot — this is the behavior already required by "
+        "scenario {ref} (strict-mode consults bd depends-on edges) extended to "
+        "the edge-removal / reclassification path"
+    )
+)
+def r8di_then_live_graph_property(ref: str, context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    work_id = context["eow5_active_work_id"]
+    # The dispatch proceeded to a real dispatched state — proving the live graph
+    # (not a snapshot) governed the gate.
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == _bd_facade.STATE_DISPATCHED, (
+        f"dispatch must have proceeded to 'dispatched' for {work_id}; meta={meta}"
+    )
+
+
+@then(
+    parsers.parse(
+        "no separate predecessor-close step (bd close {predecessor}) and no "
+        "promote scan is required for the deposit to occur — removing the live "
+        "edge is itself sufficient because the gate re-reads live bd dep state "
+        "at send time"
+    )
+)
+def r8di_then_no_close_or_promote_needed(
+    predecessor: str, context: dict
+) -> None:
+    lead_root = _eow5_lead_root(context)
+    # The predecessor was NEVER closed: assert its bd-native status is still not
+    # closed and its dispatch is not satisfied via the close path, yet the
+    # deposit already happened (proven by the prior Then). Removing the edge
+    # alone was sufficient.
+    assert not _bd_facade.predecessor_satisfied(lead_root, predecessor), (
+        f"predecessor {predecessor} must remain unclosed; the cure must not "
+        "rely on a close / promote step"
+    )
+    work_id = context["eow5_active_work_id"]
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == _bd_facade.STATE_DISPATCHED, (
+        f"the removed-edge send must have dispatched directly (no queued/promote "
+        f"path) for {work_id}; meta={meta}"
+    )
+    assert meta.get(_bd_facade.KEY_PENDING_DEPENDENCY) is None, (
+        f"the deposit must not have gone through a queued pending_dependency "
+        f"path for {work_id}; meta={meta}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that "bd dep remove" is a '
+        "complete, self-sufficient cure for an over-recorded dispatch "
+        "dependency: the operator-facing contract that \"remove the edge to "
+        'unblock the send" actually holds, with no reliance on a snapshot-clear '
+        "step the operator cannot reach"
+    )
+)
+def r8di_then_remove_is_self_sufficient_cure(context: dict) -> None:
+    lead_root = _eow5_lead_root(context)
+    work_id = context["eow5_active_work_id"]
+    # The only operator action between the refusal and the deposit was
+    # `bd dep remove`; the deposit happened and the dispatch is live. The live
+    # graph shows no gating predecessor, confirming the cure was self-sufficient.
+    assert _bd_facade.first_unclosed_predecessor(lead_root, work_id) is None, (
+        "after `bd dep remove` the live graph must show no gating predecessor"
+    )
+    meta = _bd_facade.get_dispatch_metadata(lead_root, work_id) or {}
+    assert meta.get("dispatch_state") == _bd_facade.STATE_DISPATCHED, (
+        f"the send must have dispatched after the remove cure for {work_id}; "
+        f"meta={meta}"
+    )
+
+
 # ---- scenario 7: sweep does NOT promote a dependency-gated queued bead -----
 # (lead-p0ez — sweep/queued-dispatch interaction resolution)
 #
