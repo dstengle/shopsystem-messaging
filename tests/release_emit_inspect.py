@@ -1,8 +1,8 @@
 """Comment-stripped inspection of a GitHub Actions workflows tree for the
 retired cross-repo bc-launcher repository_dispatch emit (ADR-022).
 
-This is the shared mechanism behind the @scenario_hash:974ee23c53cbb09a
-register scenario (work_id lead-n8pf) and its teeth-proof unit tests. The
+This is the shared mechanism behind the @scenario_hash:fd28deb48a7c75f4
+register scenario (work_id lead-0udp) and its teeth-proof unit tests. The
 no-emit guarantee is: with YAML comment lines EXCLUDED, the executable body
 of every workflow declares no `dispatch-bc-launcher-build` job, no
 `repository_dispatch` targeting `dstengle/shopsystem-bc-launcher`, no
@@ -11,7 +11,7 @@ named `BC_LAUNCHER_DISPATCH_TOKEN`.
 
 A token present ONLY inside a descriptive YAML comment (absent from the
 comment-stripped executable body) does NOT violate the guarantee — comment
-stripping is the load-bearing clause of scenario 974ee23c53cbb09a.
+stripping is the load-bearing clause of scenario fd28deb48a7c75f4.
 
 Absence of `.github/workflows/` (or an empty tree) trivially satisfies the
 guarantee: absence of the emit IS the guarantee, not presence of a file.

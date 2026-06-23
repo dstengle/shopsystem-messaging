@@ -12893,7 +12893,7 @@ def cr_then_load_bearing_noop(context: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# work_id lead-n8pf — @scenario_hash:974ee23c53cbb09a
+# work_id lead-0udp — @scenario_hash:fd28deb48a7c75f4
 # Register parity (ADR-022): the shopsystem-messaging release workflow declares
 # NO repository_dispatch emit to shopsystem-bc-launcher and references no
 # BC_LAUNCHER_DISPATCH_TOKEN. The guarantee is inspected against THIS BC repo's
