@@ -100,6 +100,7 @@ from catalog.schemas import (
     AssignScenarios,
     BCResponse,
     Clarify,
+    ClarifyResponse,
     LeadMessage,
     MechanismObservation,
     Nudge,
@@ -1265,6 +1266,76 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         payload_ref=getattr(args, "payload", None),
         queue_on_dependency=getattr(args, "queue_on_dependency", False),
     )
+
+
+def _cmd_send_clarify_response(args: argparse.Namespace) -> int:
+    """`shop-msg send clarify_response` — lead -> BC in-band clarify answer (lead-ox8).
+
+    Delivers the lead's answer to an outstanding BC clarify, RE-OPENING the
+    original dispatch on the SAME work_id for the BC's gated loop to resume. The
+    answer lands as a ``direction='inbox'`` row keyed
+    ``(bc, work_id, message_type='clarify_response')`` deposited with
+    ``allow_multi_type=True`` so it COEXISTS with the original dispatch inbox row
+    rather than colliding against the one-row-per-(bc,work_id,message_type)
+    invariant — the same coexistence mechanism work_done/mechanism_observation
+    use (lead-0lml). No new work_id and no new bead are minted: clarify_response
+    re-opens, it does not re-dispatch.
+
+    Precondition (enforced at the CLI surface): a prior BC clarify must exist for
+    that (bc, work_id). A clarify_response with nothing to answer is operator
+    error and is refused with a non-zero exit. The BC's clarify is recorded as a
+    BC-side outbox marker at ``(bc, work_id, direction='outbox',
+    message_type='clarify')`` by ``shop-msg respond clarify``; that marker is the
+    authoritative "the BC asked something here" check.
+
+    clarify_response carries NO scenario state: the ClarifyResponse schema has no
+    scenario_hashes field (and forbids extra keys), so a scope-changing answer
+    cannot ride a clarify_response and must route to re-dispatch
+    (assign_scenarios / request_bugfix) per ADR-009 layer (b) / ADR-027.
+    """
+    bc_root = _resolve_bc(args)
+
+    # Precondition: refuse unless the BC has an outstanding clarify on this
+    # (bc, work_id). Checked BEFORE any write so a refused send leaves no
+    # clarify_response row and does not re-open the dispatch.
+    if not outbox_row_exists(bc_root, args.work_id, "clarify"):
+        print(
+            f"shop-msg send clarify_response: refusing to send for "
+            f"work_id={args.work_id!r}: a clarify_response requires a prior BC "
+            f"clarify on that (bc, work_id), and none exists. clarify_response is "
+            f"valid ONLY as the answer to an outstanding clarify.",
+            file=sys.stderr,
+        )
+        return 1
+
+    message = ClarifyResponse(
+        message_type="clarify_response",
+        work_id=args.work_id,
+        resolution=args.resolution,
+        from_shop=_resolve_send_sender(),
+    )
+
+    # Deposit as a coexisting inbox row (allow_multi_type=True): re-opens the
+    # original dispatch on the SAME work_id without overwriting it. NOTIFY fires
+    # so the BC's inbox watcher wakes for the re-opened work.
+    try:
+        insert_message(
+            bc_root,
+            args.work_id,
+            "inbox",
+            "clarify_response",
+            message.model_dump(exclude_none=True),
+            notify=True,
+            allow_multi_type=True,
+        )
+    except CollisionError:
+        print(
+            f"shop-msg send clarify_response: a clarify_response already exists "
+            f"for work_id={args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 _NUDGE_REASONS = ("stuck-on-you", "status-check", "predecessor-landed", "general")
@@ -2651,6 +2722,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     assign_scenarios.set_defaults(func=_cmd_send_assign_scenarios)
+
+    # clarify_response (lead-ox8): the lead's in-band answer to an outstanding
+    # BC clarify. Re-opens the original dispatch on the SAME work_id. Carries
+    # ONLY --bc, --work-id, and --resolution — NO --scenario-file or any flag
+    # that carries scenario state, mirroring the no-scenario-state constraint
+    # the schema enforces (ADR-009 layer (b) / ADR-027).
+    clarify_response = send_sub.add_parser(
+        "clarify_response",
+        help=(
+            "answer an outstanding BC clarify in-band, re-opening the original "
+            "dispatch on the same work_id"
+        ),
+    )
+    clarify_response.add_argument(
+        "--bc", required=True, help="canonical BC name (resolved via registry)"
+    )
+    clarify_response.add_argument(
+        "--work-id",
+        required=True,
+        help="work_id of the dispatch whose clarify is being answered",
+    )
+    clarify_response.add_argument(
+        "--resolution",
+        required=True,
+        help="the lead's answer text delivered in-band to the BC",
+    )
+    clarify_response.set_defaults(func=_cmd_send_clarify_response)
 
     request_bugfix = send_sub.add_parser(
         "request_bugfix", help="write a request_bugfix message"
