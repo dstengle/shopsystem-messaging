@@ -1,5 +1,5 @@
-"""Teeth proof for the @scenario_hash:974ee23c53cbb09a no-emit register
-scenario (work_id lead-n8pf).
+"""Teeth proof for the @scenario_hash:fd28deb48a7c75f4 no-emit register
+scenario (work_id lead-0udp).
 
 A "behavior already true" formalization is worthless if its scenario would
 pass even when the emit is reintroduced. These tests prove the
