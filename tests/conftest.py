@@ -36,7 +36,38 @@ from typing import Any
 # drops it again so artefacts never persist across sessions.  The schema
 # (messages, shop_registry, consumed column) is auto-created on first
 # `_connect()` via the existing `_ensure_schema` path.
-SHOPMSG_TEST_DBNAME = "shopsystem_test"
+SHOPMSG_TEST_DBNAME_BASE = "shopsystem_test"
+
+
+def _worker_scoped_dbname(base: str, worker_id: str | None) -> str:
+    """Return a per-xdist-worker database name derived from ``base``.
+
+    Under ``pytest-xdist`` every worker runs an independent pytest session in
+    its own process; ``PYTEST_XDIST_WORKER`` names the worker (``gw0``,
+    ``gw1``, ...). Without per-worker isolation all workers target the SAME
+    ``shopsystem_test`` database, so one worker's session DROP/CREATE and the
+    per-test ``messages`` sweep wipe another worker's in-flight rows — a
+    catastrophic, order-and-timing-dependent cross-worker leak (the suite
+    crashes with worker INTERNALERRORs). Scoping the database name per worker
+    (``shopsystem_test_gw0``, ``shopsystem_test_gw1``, ...) gives each worker a
+    private database so workers never share message-row or registry state.
+
+    The controller / non-xdist case (no worker id, empty string, or the
+    ``master`` controller id some xdist versions report) keeps the bare base
+    name, so a plain ``pytest`` run targets ``shopsystem_test`` exactly as
+    before.
+    """
+    if not worker_id or worker_id == "master":
+        return base
+    return f"{base}_{worker_id}"
+
+
+# Scope the test database per xdist worker (no-op for a plain run). Read the
+# worker id from the environment at import time — xdist sets
+# PYTEST_XDIST_WORKER in each worker process BEFORE conftest is imported.
+SHOPMSG_TEST_DBNAME = _worker_scoped_dbname(
+    SHOPMSG_TEST_DBNAME_BASE, os.environ.get("PYTEST_XDIST_WORKER")
+)
 SHOPMSG_TEST_DSN = (
     f"postgresql://postgres:postgres@postgres:5432/{SHOPMSG_TEST_DBNAME}"
 )
