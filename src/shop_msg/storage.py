@@ -740,6 +740,7 @@ def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
                 SELECT i.work_id, i.message_type
                 FROM messages i
                 WHERE i.bc = %s AND i.direction = 'inbox'
+                  AND i.consumed = FALSE
                   AND (
                     NOT EXISTS (
                       SELECT 1 FROM messages o
@@ -926,6 +927,35 @@ def inbox_row_exists(bc_root: str, work_id: str) -> bool:
                 (bc, work_id),
             )
             return cur.fetchone() is not None
+
+
+def mark_bc_inbox_consumed(bc_root: str, work_id: str) -> bool:
+    """Mark the BC's OWN inbox dispatch row(s) consumed=TRUE.
+
+    A BC consumes an inbox dispatch once it has taken the work on; the
+    consumed marker is what drops the row from ``shop-msg pending inbox --bc``
+    (the BC-side counterpart to the lead-inbox consume). ``retract inbox``
+    distinguishes this consumed state — a consumed deposit is REFUSED
+    retraction, whereas a still-pending one is removed. Scoped to
+    (bc, work_id, direction='inbox'); marks every matching unconsumed row.
+    Returns True iff at least one row was marked.
+    """
+    bc = _bc_id(bc_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE messages
+                SET consumed = TRUE
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox'
+                  AND consumed = FALSE
+                """,
+                (bc, work_id),
+            )
+            rows_affected = cur.rowcount
+        conn.commit()
+    return rows_affected > 0
 
 
 def consume_outbox_message(bc_root: str, work_id: str, message_type: str) -> bool:
