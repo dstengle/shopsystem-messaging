@@ -108,6 +108,7 @@ from shop_msg.storage import (
     insert_raw_payload,
     listen_on_lead_inbox_channel,
     listen_on_outbox_channel,
+    mark_bc_inbox_consumed,
     outbox_row_exists,
     read_inbox_message,
     read_lead_inbox_message,
@@ -13267,3 +13268,343 @@ def e2e_then_loadbearing(context: dict) -> None:
     # Asserted by the online leg (live watch -> online) and the offline leg
     # (heartbeat aged out -> offline) above. This step pins the coupling.
     pass
+
+
+# ---------------------------------------------------------------------------
+# lead-9xrd: shop-msg retract inbox
+# ---------------------------------------------------------------------------
+# Two scenarios pin `shop-msg retract inbox`: a STILL-PENDING dispatch is
+# retracted (removed so the BC will not process it; idempotent; recorded in the
+# audit trail) and an ALREADY-CONSUMED dispatch is REFUSED (non-zero; the
+# consumed deposit left intact; the refused attempt recorded in the audit
+# trail). The step defs below drive the REAL shop-msg CLI against real postgres
+# and assert the audit records by querying the message_audit table directly.
+
+
+def _9xrd_audit_rows(bc_address: str, work_id: str, message_type: str) -> list[dict]:
+    """Return message_audit rows for a (bc, work_id, message_type) triple.
+
+    Queries the audit trail directly so the Then-steps ASSERT the record
+    exists rather than merely claiming it. Tolerant of the table not yet
+    existing (RED phase): a missing table yields an empty list.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT bc, work_id, message_type, event, created_at
+                    FROM message_audit
+                    WHERE bc = %s AND work_id = %s AND message_type = %s
+                    ORDER BY created_at
+                    """,
+                    (bc_address, work_id, message_type),
+                )
+                return list(cur.fetchall())
+            except Exception:
+                conn.rollback()
+                return []
+
+
+@given(
+    parsers.parse(
+        'a BC "{bc_name}" is registered in the messaging registry'
+    )
+)
+def given_9xrd_bc_registered(
+    bc_name: str, tmp_path: Path, context: dict, request
+) -> None:
+    """Register the named BC (literal canonical name) for the retract scenarios."""
+    saved = _registry_lookup(bc_name, ignore_test_paths=True)
+    bc_root = tmp_path / bc_name
+    (bc_root / "inbox").mkdir(parents=True, exist_ok=True)
+    (bc_root / "outbox").mkdir(exist_ok=True)
+    registry_add(bc_name, shop_type="bc")
+    _test_registry[str(bc_root.resolve())] = bc_name
+    context["registered_bc_root"] = bc_root
+    context["registered_bc_name"] = bc_name
+    context["bc_root"] = bc_root
+    request.addfinalizer(lambda: _registry_restore(bc_name, saved))
+
+
+@given(
+    parsers.parse(
+        'shop-msg send {mtype} was previously used to write an inbox message '
+        'addressed to "{bc_name}" with work-id "{work_id}" and message-type '
+        '"{message_type}"'
+    )
+)
+def given_9xrd_inbox_message_sent(
+    mtype: str, bc_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    """Deposit an inbox dispatch row for the named BC (direction='inbox')."""
+    bc_root = context["bc_root"]
+    insert_message(
+        _bc_address(bc_root),
+        work_id,
+        "inbox",
+        message_type,
+        {
+            "message_type": message_type,
+            "work_id": work_id,
+            "description": "lead-9xrd retract-inbox setup row",
+        },
+        allow_multi_type=True,
+    )
+    context["9xrd_work_id"] = work_id
+    context["9xrd_message_type"] = message_type
+
+
+@given(
+    parsers.parse(
+        'shop-msg pending inbox --bc {bc_name} includes work-id "{work_id}"'
+    )
+)
+def given_9xrd_pending_includes(bc_name: str, work_id: str, context: dict) -> None:
+    """Assert the dispatch is present in pending inbox before retraction."""
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name],
+        capture_output=True, text=True, check=True,
+    )
+    assert work_id in result.stdout, (
+        f"expected {work_id!r} in pending inbox --bc {bc_name}; got: {result.stdout!r}"
+    )
+
+
+@given(
+    parsers.parse(
+        'no outbox response for work-id "{work_id}" has been emitted by "{bc_name}"'
+    )
+)
+def given_9xrd_no_outbox(work_id: str, bc_name: str, context: dict) -> None:
+    """Assert no BC outbox response exists for the work_id (pre-state)."""
+    bc_root = context["bc_root"]
+    rows = read_outbox_messages(_bc_address(bc_root), work_id)
+    assert rows == [], f"expected no outbox rows for {work_id!r}; got {rows!r}"
+
+
+@given(
+    parsers.parse(
+        'the BC ran shop-msg consume inbox --work-id {work_id} so work-id '
+        '"{work_id2}" is no longer surfaced by shop-msg pending inbox --bc {bc_name}'
+    )
+)
+def given_9xrd_bc_consumed(
+    work_id: str, work_id2: str, bc_name: str, context: dict
+) -> None:
+    """The BC consumed its inbox dispatch: mark the inbox row consumed=TRUE.
+
+    After consumption the dispatch is no longer surfaced by pending inbox.
+    Drives the real consume path via the storage helper the CLI uses.
+    """
+    bc_root = context["bc_root"]
+    marked = mark_bc_inbox_consumed(_bc_address(bc_root), work_id)
+    assert marked, f"expected to mark inbox row consumed for {work_id!r}"
+    # Confirm it dropped from pending inbox.
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name],
+        capture_output=True, text=True, check=True,
+    )
+    assert work_id2 not in result.stdout, (
+        f"expected {work_id2!r} absent from pending inbox after consume; "
+        f"got: {result.stdout!r}"
+    )
+    context["9xrd_work_id"] = work_id2
+
+
+@when(
+    parsers.parse(
+        'the lead operator runs shop-msg retract inbox --bc {bc_name} '
+        '--work-id {work_id} --message-type {message_type}'
+    )
+)
+def when_9xrd_retract(
+    bc_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    result = subprocess.run(
+        [
+            "shop-msg", "retract", "inbox",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        capture_output=True, text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then("the command exits zero")
+def then_9xrd_exits_zero(context: dict) -> None:
+    assert context["cli_returncode"] == 0, (
+        f"expected exit 0; got {context['cli_returncode']}, "
+        f"stderr={context['cli_stderr']!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'shop-msg pending inbox --bc {bc_name} does not include work-id "{work_id}"'
+    )
+)
+def then_9xrd_pending_excludes(bc_name: str, work_id: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name],
+        capture_output=True, text=True, check=True,
+    )
+    assert work_id not in result.stdout, (
+        f"expected {work_id!r} absent from pending inbox --bc {bc_name}; "
+        f"got: {result.stdout!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'shop-msg read inbox --bc {bc_name} --work-id {work_id} exits non-zero '
+        'reporting no inbox message was found for that work_id'
+    )
+)
+def then_9xrd_read_notfound(bc_name: str, work_id: str, context: dict) -> None:
+    result = subprocess.run(
+        ["shop-msg", "read", "inbox", "--bc", bc_name, "--work-id", work_id],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0, (
+        f"expected read inbox to exit non-zero for retracted {work_id!r}; "
+        f"got 0, stdout={result.stdout!r}"
+    )
+    assert "no inbox message" in result.stderr, (
+        f"expected 'no inbox message' in stderr; got {result.stderr!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'a re-run of shop-msg retract inbox --bc {bc_name} --work-id {work_id} '
+        '--message-type {message_type} exits zero leaving "{work_id2}" absent '
+        'from shop-msg pending inbox --bc {bc_name2}'
+    )
+)
+def then_9xrd_idempotent_rerun(
+    bc_name: str, work_id: str, message_type: str, work_id2: str,
+    bc_name2: str, context: dict
+) -> None:
+    rerun = subprocess.run(
+        [
+            "shop-msg", "retract", "inbox",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        capture_output=True, text=True,
+    )
+    assert rerun.returncode == 0, (
+        f"expected idempotent re-run to exit zero; got {rerun.returncode}, "
+        f"stderr={rerun.stderr!r}"
+    )
+    result = subprocess.run(
+        ["shop-msg", "pending", "inbox", "--bc", bc_name2],
+        capture_output=True, text=True, check=True,
+    )
+    assert work_id2 not in result.stdout, (
+        f"expected {work_id2!r} still absent after idempotent re-run; "
+        f"got: {result.stdout!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the retraction is recorded against the (bc={bc_name}, work_id={work_id}, '
+        'message_type={message_type}) triple in the messaging audit trail'
+    )
+)
+def then_9xrd_retraction_recorded(
+    bc_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    bc_root = context["bc_root"]
+    bc_address = _bc_address(bc_root)
+    rows = _9xrd_audit_rows(bc_address, work_id, message_type)
+    events = [r["event"] for r in rows]
+    assert "retracted" in events, (
+        f"expected a 'retracted' audit record for "
+        f"(bc={bc_name}, work_id={work_id}, message_type={message_type}); "
+        f"got rows: {rows!r}"
+    )
+
+
+@then("the command exits non-zero")
+def then_9xrd_exits_nonzero(context: dict) -> None:
+    assert context["cli_returncode"] != 0, (
+        f"expected non-zero exit; got 0, stdout={context['cli_stdout']!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'stderr reports that work-id "{work_id}" was already consumed and '
+        'cannot be retracted'
+    )
+)
+def then_9xrd_stderr_consumed(work_id: str, context: dict) -> None:
+    stderr = context["cli_stderr"]
+    assert "already consumed" in stderr and "cannot be retracted" in stderr, (
+        f"expected 'already consumed and cannot be retracted' in stderr; "
+        f"got {stderr!r}"
+    )
+    assert work_id in stderr, (
+        f"expected {work_id!r} named in stderr; got {stderr!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the consumed deposit for the (bc={bc_name}, work_id={work_id}, '
+        'message_type={message_type}) triple is unchanged'
+    )
+)
+def then_9xrd_deposit_intact(
+    bc_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    bc_root = context["bc_root"]
+    bc_address = _bc_address(bc_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT consumed, payload FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
+                """,
+                (bc_address, work_id, message_type),
+            )
+            rows = cur.fetchall()
+    assert len(rows) == 1, (
+        f"expected the consumed deposit row to survive intact for "
+        f"(bc={bc_name}, work_id={work_id}, message_type={message_type}); "
+        f"got {len(rows)} rows: {rows!r}"
+    )
+    assert rows[0]["consumed"] is True, (
+        f"expected the surviving deposit to remain consumed=TRUE; got {rows[0]!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the refused retraction attempt is recorded against the (bc={bc_name}, '
+        'work_id={work_id}, message_type={message_type}) triple in the messaging '
+        'audit trail'
+    )
+)
+def then_9xrd_refusal_recorded(
+    bc_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    bc_root = context["bc_root"]
+    bc_address = _bc_address(bc_root)
+    rows = _9xrd_audit_rows(bc_address, work_id, message_type)
+    events = [r["event"] for r in rows]
+    assert "retract_refused" in events, (
+        f"expected a 'retract_refused' audit record for "
+        f"(bc={bc_name}, work_id={work_id}, message_type={message_type}); "
+        f"got rows: {rows!r}"
+    )

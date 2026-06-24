@@ -200,6 +200,25 @@ ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS consumed BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
+# lead-9xrd: the messaging audit trail. An append-only record of
+# lifecycle events against a (bc, work_id, message_type) triple. The
+# ``retract inbox`` command writes here on BOTH paths: a successful
+# retraction records event='retracted'; a refused retraction (the deposit
+# was already consumed) records event='retract_refused'. Keyed by triple +
+# event + timestamp; multiple events for one triple are expected, so there
+# is no uniqueness constraint (the append-only audit log is intentionally
+# multi-row per triple).
+_DDL_MESSAGE_AUDIT = """
+CREATE TABLE IF NOT EXISTS message_audit (
+  id           BIGSERIAL PRIMARY KEY,
+  bc           TEXT NOT NULL,
+  work_id      TEXT NOT NULL,
+  message_type TEXT NOT NULL,
+  event        TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 # ADR-020 / PDR-007 Option A: the registry stores NO filesystem path. Each
 # entry is keyed by canonical name and carries an abstract address
 # (``<system>/<name>``; the lead collapses to the sentinel
@@ -409,6 +428,7 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
         # rather than a constant frozen at import.
         cur.execute(_registry_address_migration_sql())
         cur.execute(_DDL_PRESENCE)
+        cur.execute(_DDL_MESSAGE_AUDIT)
     conn.commit()
 
 
@@ -740,6 +760,7 @@ def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
                 SELECT i.work_id, i.message_type
                 FROM messages i
                 WHERE i.bc = %s AND i.direction = 'inbox'
+                  AND i.consumed = FALSE
                   AND (
                     NOT EXISTS (
                       SELECT 1 FROM messages o
@@ -926,6 +947,112 @@ def inbox_row_exists(bc_root: str, work_id: str) -> bool:
                 (bc, work_id),
             )
             return cur.fetchone() is not None
+
+
+def mark_bc_inbox_consumed(bc_root: str, work_id: str) -> bool:
+    """Mark the BC's OWN inbox dispatch row(s) consumed=TRUE.
+
+    A BC consumes an inbox dispatch once it has taken the work on; the
+    consumed marker is what drops the row from ``shop-msg pending inbox --bc``
+    (the BC-side counterpart to the lead-inbox consume). ``retract inbox``
+    distinguishes this consumed state — a consumed deposit is REFUSED
+    retraction, whereas a still-pending one is removed. Scoped to
+    (bc, work_id, direction='inbox'); marks every matching unconsumed row.
+    Returns True iff at least one row was marked.
+    """
+    bc = _bc_id(bc_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE messages
+                SET consumed = TRUE
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox'
+                  AND consumed = FALSE
+                """,
+                (bc, work_id),
+            )
+            rows_affected = cur.rowcount
+        conn.commit()
+    return rows_affected > 0
+
+
+def _record_audit_event(
+    cur, bc: str, work_id: str, message_type: str, event: str
+) -> None:
+    """Append one row to the messaging audit trail (within an open cursor).
+
+    Called inside the same transaction as the action being audited so the
+    record and the action commit atomically.
+    """
+    cur.execute(
+        """
+        INSERT INTO message_audit (bc, work_id, message_type, event)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (bc, work_id, message_type, event),
+    )
+
+
+def retract_inbox_message(bc_root: str, work_id: str, message_type: str) -> str:
+    """Retract a still-pending inbox dispatch, or refuse a consumed one.
+
+    Semantics (lead-9xrd):
+
+    * **Still pending** — an inbox row exists for the (bc, work_id,
+      message_type) triple and is NOT consumed: DELETE it so it is absent
+      from ``pending inbox`` AND ``read inbox`` reports not-found. Record
+      event='retracted' in the audit trail. Returns ``"retracted"``.
+
+    * **Consumed** — the inbox row exists but is consumed=TRUE (the BC
+      already took the work on): REFUSE. The deposit is left INTACT (no
+      delete, no marker change). Record event='retract_refused'. Returns
+      ``"refused"``.
+
+    * **Absent / already-retracted** — no inbox row for the triple: a no-op
+      SUCCESS (idempotence). No audit record is written (there is no action
+      to record). Returns ``"absent"``.
+
+    The audit write shares the transaction with the delete (or the
+    no-op), so a successful retraction and its audit record commit
+    atomically.
+    """
+    bc = _bc_id(bc_root)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT consumed FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
+                LIMIT 1
+                """,
+                (bc, work_id, message_type),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Absent / already-retracted: idempotent no-op success.
+                conn.commit()
+                return "absent"
+            if row["consumed"]:
+                # Consumed deposit: refuse, leave it intact, record the
+                # refused attempt.
+                _record_audit_event(cur, bc, work_id, message_type, "retract_refused")
+                conn.commit()
+                return "refused"
+            # Still pending: remove it and record the retraction.
+            cur.execute(
+                """
+                DELETE FROM messages
+                WHERE bc = %s AND work_id = %s
+                  AND direction = 'inbox' AND message_type = %s
+                """,
+                (bc, work_id, message_type),
+            )
+            _record_audit_event(cur, bc, work_id, message_type, "retracted")
+        conn.commit()
+    return "retracted"
 
 
 def consume_outbox_message(bc_root: str, work_id: str, message_type: str) -> bool:

@@ -135,6 +135,7 @@ from shop_msg.storage import (
     read_inbox_message,
     read_lead_inbox_message,
     read_outbox_messages,
+    retract_inbox_message,
     registry_add,
     registry_list,
     registry_remove,
@@ -1789,6 +1790,38 @@ def _cmd_consume_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_retract_inbox(args: argparse.Namespace) -> int:
+    """Retract a still-pending inbox dispatch the BC has not yet consumed.
+
+    lead-9xrd. The lead retracts a dispatch it deposited in a BC's inbox so
+    the BC will NOT process it — but only while it is STILL PENDING:
+
+    * Still pending -> the inbox row is REMOVED. After retraction the
+      dispatch is absent from ``pending inbox`` and ``read inbox`` reports
+      not-found. The retraction is recorded in the messaging audit trail.
+      Exits zero.
+    * Absent / already-retracted -> idempotent no-op SUCCESS (exits zero),
+      leaving the dispatch absent. (Distinguished from the consumed case:
+      there is no row to refuse.)
+    * Already CONSUMED -> REFUSED. The BC has already taken the work on, so
+      the deposit is left intact and the command exits NON-zero naming the
+      already-consumed condition. The refused attempt is recorded in the
+      audit trail.
+    """
+    bc_root = _resolve_bc(args)
+    outcome = retract_inbox_message(bc_root, args.work_id, args.message_type)
+    if outcome == "refused":
+        print(
+            f"shop-msg retract inbox: work_id={args.work_id!r} was already "
+            f"consumed and cannot be retracted (the BC has taken the work on). "
+            f"The consumed deposit is left intact.",
+            file=sys.stderr,
+        )
+        return 1
+    # "retracted" (removed) and "absent" (idempotent no-op) are both success.
+    return 0
+
+
 def _sweep_is_stale(metadata: dict, threshold_seconds: int) -> bool:
     """Return True iff the outbox_pending bead is older than the threshold.
 
@@ -3126,6 +3159,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="work_id of the lead-inbox row to consume",
     )
     consume_inbox.set_defaults(func=_cmd_consume_inbox)
+
+    # lead-9xrd: retract a still-pending inbox dispatch (lead side).
+    retract = sub.add_parser(
+        "retract",
+        help="retract a still-pending inbox dispatch the BC has not yet consumed",
+    )
+    retract_sub = retract.add_subparsers(dest="retract_target", required=True)
+    retract_inbox = retract_sub.add_parser(
+        "inbox",
+        help=(
+            "remove a still-pending inbox dispatch so the BC will not process "
+            "it; refuses if the BC has already consumed it"
+        ),
+    )
+    retract_inbox.add_argument(
+        "--bc",
+        required=True,
+        help="canonical BC name (resolved via registry)",
+    )
+    retract_inbox.add_argument(
+        "--work-id",
+        required=True,
+        help="work_id of the inbox dispatch to retract",
+    )
+    retract_inbox.add_argument(
+        "--message-type",
+        required=True,
+        help="message_type of the inbox dispatch to retract",
+    )
+    retract_inbox.set_defaults(func=_cmd_retract_inbox)
 
     sweep = sub.add_parser(
         "sweep",
