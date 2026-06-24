@@ -1827,6 +1827,60 @@ def _start_presence_heartbeat_thread(bc_name: str):
     return thread, stop_event
 
 
+def _canonical_name_from_address(abstract_address: str) -> str | None:
+    """Reconstruct the canonical shop name from its abstract address.
+
+    Inverse of ``_abstract_address_for``: an address ``<slug>/<rest>`` projects
+    back to the canonical name ``<slug>-<rest>`` (the lead's sentinel
+    ``<slug>/lead`` projects to no recoverable BC name and yields None). When
+    the address carries no ``/`` it is not an abstract address and we return it
+    unchanged.
+
+    This is the deterministic, registry-independent recovery the presence-key
+    derivation falls back to when the registry reverse-lookup misses — it never
+    strips the system prefix the way ``basename`` does.
+    """
+    if "/" not in abstract_address:
+        return abstract_address
+    slug, _, rest = abstract_address.partition("/")
+    if not rest or rest == "lead":
+        return None
+    return f"{slug}-{rest}"
+
+
+def _resolve_presence_name(bc_root: str) -> str:
+    """Derive the bc_presence key the heartbeat must be written under.
+
+    This MUST equal the name ``shop-msg bc-status --bc <name>`` queries by (the
+    canonical shop name), or a live, heartbeating watch reads as a false
+    offline (work_id lead-bppa: the heartbeat row is written under one key while
+    bc-status looks under another, so the lookup misses and the fail-safe
+    classifier reports offline despite a live watch).
+
+    Resolution order:
+      1. Registry reverse-lookup (abstract address -> canonical name).
+      2. On a reverse-lookup MISS (a transient/race the false-offline defect
+         surfaced under), reconstruct the canonical name from the abstract
+         address (``<slug>/<rest>`` -> ``<slug>-<rest>``). This is registry
+         independent and prefix-preserving.
+      3. Only when neither yields a name (e.g. a non-address bc_root) fall back
+         to the basename, which is correct for a bare name with no ``/``.
+
+    The prior implementation fell straight from (1) to a ``basename`` that
+    stripped the system prefix (``shopsystem/live`` -> ``live``), which is the
+    root cause of the false-offline.
+    """
+    import os as _os
+
+    name = resolve_root_to_name(bc_root)
+    if name:
+        return name
+    reconstructed = _canonical_name_from_address(bc_root)
+    if reconstructed:
+        return reconstructed
+    return _os.path.basename(bc_root.rstrip("/"))
+
+
 # ---------------------------------------------------------------------------
 # LISTEN-drop reconnect (lead-m32 / supersedes lead-7v1)
 #
@@ -2102,13 +2156,14 @@ def watch_inbox(bc_root: str) -> None:
     # basename when the BC is not registered. The ticker runs in a daemon
     # thread so it composes with — and never blocks — the LISTEN loop, and is
     # stopped cleanly in the finally block.
-    import os as _os
-
     heartbeat_thread = None
     heartbeat_stop = None
-    presence_name = resolve_root_to_name(bc_root) or _os.path.basename(
-        bc_root.rstrip("/")
-    )
+    # The heartbeat MUST be keyed on the same canonical name `shop-msg
+    # bc-status --bc <name>` queries by, or a live watch reads as a false
+    # offline (work_id lead-bppa). _resolve_presence_name reconstructs the
+    # canonical name from the abstract address on a registry reverse-lookup
+    # miss instead of falling back to a prefix-stripping basename.
+    presence_name = _resolve_presence_name(bc_root)
 
     try:
         # Force line-buffering on stdout so each print() reaches the pipe
