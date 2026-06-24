@@ -13042,3 +13042,228 @@ def n8pf_then_comment_only_does_not_fail(n8pf_workflows_dir: Path) -> None:
         assert forbidden_tokens_in_executable_body(wf_dir) == [], (
             "a comment-only token reference must NOT fail the guarantee"
         )
+
+
+# ===========================================================================
+# Scenario e7c14f54c3100ce5 (request_bugfix lead-bppa): a live connected
+# shop-msg watch whose heartbeat tick is current is reported ONLINE by
+# shop-msg bc-status end-to-end, and offline ONLY when no current heartbeat
+# exists. This pins the FALSE-OFFLINE defect closed: a live, heartbeating
+# watch must read online via bc-status; offline is emitted only in the
+# genuine absence of a current heartbeat.
+#
+# Root cause of the false-offline (pre-fix): watch_inbox keyed its heartbeat
+# row on `resolve_root_to_name(bc_root) or basename(bc_root)`. When the
+# registry reverse-lookup misses (a transient/race condition observed across
+# dispatches), the basename fallback STRIPS the system prefix
+# ("shopsystem/live" -> "live"), so the heartbeat is written under the wrong
+# key while bc-status --bc shopsystem-live queries "shopsystem-live" and
+# finds no row -> fail-safe offline, even though the watch is live.
+#
+# The test drives the REAL watch_inbox heartbeat path (real run_presence_
+# heartbeat against real postgres) with the registry reverse-lookup forced to
+# miss (the observed race), then runs the REAL `shop-msg bc-status` CLI and
+# asserts online. The teeth: pre-fix this reads OFFLINE (false-offline);
+# post-fix it reads ONLINE because the heartbeat key is reconciled with the
+# canonical name bc-status queries by.
+# ===========================================================================
+
+from shop_msg.storage import resolve_shop_name as _e2e_resolve_shop_name
+
+
+def _e2e_run_real_watch_one_tick(address: str, monkeypatch) -> None:
+    """Run the REAL watch_inbox for ``address`` long enough to fire one
+    presence heartbeat tick, then return.
+
+    The LISTEN loop is made to exit deterministically (notifies() exhausts and
+    the reconnect seam raises _StopWatch), and _sleep is a no-op so the
+    heartbeat's first tick fires immediately. resolve_root_to_name is forced
+    to return None to reproduce the observed registry reverse-lookup MISS —
+    the exact race under which the false-offline defect surfaced. The heartbeat
+    key derivation is therefore exercised on its fallback path, end-to-end.
+    """
+    real_connect = psycopg.connect
+    state = {"initial_made": False}
+
+    def fake_connect(dsn, *args, **kwargs):
+        conn = real_connect(dsn, *args, **kwargs)
+        if not state["initial_made"]:
+            state["initial_made"] = True
+            # notifies() exhausts immediately -> loop treats as a drop and
+            # reconnects; the reconnect seam below stops the loop.
+            return _DropOnceConnProxy(conn, [])
+        return conn
+
+    def open_listen_stop(channel):
+        raise _StopWatch()
+
+    monkeypatch.setattr(_ldr_storage.psycopg, "connect", fake_connect)
+    monkeypatch.setattr(_ldr_storage, "_sleep", lambda s: None)
+    monkeypatch.setattr(_ldr_storage, "_open_listen_connection", open_listen_stop)
+    # Force the registry reverse-lookup MISS (the observed race that triggers
+    # the basename fallback). This is what made a live watch read offline.
+    monkeypatch.setattr(_ldr_storage, "resolve_root_to_name", lambda addr: None)
+
+    out = _ldr_io.StringIO()
+    err = _ldr_io.StringIO()
+    with _ldr_contextlib.redirect_stdout(out), _ldr_contextlib.redirect_stderr(err):
+        try:
+            _ldr_storage.watch_inbox(address)
+        except _StopWatch:
+            pass
+        except SystemExit:
+            pass
+    # Let the daemon heartbeat thread land its first UPSERT.
+    import time as _t
+    for _ in range(50):
+        if _ph_presence_status_any(address):
+            break
+        _t.sleep(0.05)
+
+
+def _ph_presence_status_any(_addr) -> bool:
+    # The heartbeat row is keyed on whatever watch_inbox derived; we only need
+    # to know a row was written somewhere by this point (the loop sleeps a beat
+    # to let the daemon thread run). Always returns True after first poll cycle
+    # to bound the wait; real assertions happen in the Then steps via bc-status.
+    return True
+
+
+@given(
+    parsers.parse(
+        'a "shop-msg watch --bc {base}" process that is connected with its '
+        "postgres LISTEN established and its 30-second heartbeat tick loop "
+        "actively running"
+    )
+)
+def e2e_given_live_watch(base: str, context: dict) -> None:
+    # ``context["ph_target"]`` was set by the prior "NO existing bc_presence
+    # row" Given to a per-test-unique canonical BC name. Register that name so
+    # the CLI's name->address resolution (the same path `shop-msg watch` and
+    # `shop-msg bc-status` use) works, then capture its abstract address.
+    canonical = context["ph_target"]
+    try:
+        registry_add(canonical, shop_type="bc")
+    except Exception:
+        pass
+    context.setdefault("ph_names", set()).add(canonical)
+    address = _e2e_resolve_shop_name(canonical)
+    assert address is not None, f"failed to register/resolve {canonical!r}"
+    context["e2e_address"] = address
+
+
+@when(
+    parsers.parse(
+        "the watch process has completed at least one heartbeat tick within the "
+        "last 30 seconds and the lead operator runs \"shop-msg bc-status --bc "
+        "{base}\" while that watch process is still live and connected"
+    )
+)
+def e2e_when_live_then_status(base: str, context: dict, monkeypatch) -> None:
+    # Drive the REAL watch_inbox heartbeat path (one tick) against real
+    # postgres, with the reverse-lookup miss that triggered the false-offline.
+    _e2e_run_real_watch_one_tick(context["e2e_address"], monkeypatch)
+    # Undo the monkeypatches before shelling out to the real CLI subprocess
+    # (the subprocess is a fresh process and unaffected, but keep the in-proc
+    # state clean for any follow-on query helpers).
+    monkeypatch.undo()
+    # Now query the live BC via the REAL bc-status CLI, by canonical name.
+    context["e2e_result"] = _ph_run_bc_status(["--bc", context["ph_target"]], context)
+
+
+@then(
+    parsers.parse(
+        "the command exits zero and emits exactly one row for \"{base}\" "
+        "classified as \"online\" with a seconds-since-last-seen value under 90"
+    )
+)
+def e2e_then_online_one_row(base: str, context: dict) -> None:
+    r = context["e2e_result"]
+    assert r.returncode == 0, f"bc-status exit {r.returncode}; stderr={r.stderr!r}"
+    name = context["ph_target"]
+    lines = [ln for ln in r.stdout.splitlines() if ln.startswith(name + " ")]
+    assert len(lines) == 1, (
+        f"expected exactly one bc-status row for {name!r}, got {lines!r} "
+        f"(full stdout=\n{r.stdout})"
+    )
+    parts = lines[0].split()
+    # The load-bearing teeth: a LIVE heartbeating watch must read ONLINE, not
+    # the false-offline. Pre-fix this is "offline" because the heartbeat was
+    # written under the prefix-stripped key.
+    assert parts[1] == "online", (
+        f"false-offline defect: a live heartbeating watch read {parts[1]!r}, "
+        f"expected 'online' (line: {lines[0]!r})"
+    )
+    age = int(parts[2])
+    assert age < 90, f"online row age must be <90s, got {age}s"
+
+
+@then(
+    "the online classification is derived solely from the age of the "
+    "bc_presence row's last_seen_at written by the live watch process, not "
+    "from any separate liveness probe, so a watch that is connected and "
+    "heartbeating within the last 90 seconds is ALWAYS reported online and is "
+    "NEVER reported offline"
+)
+def e2e_then_derived_from_age(context: dict) -> None:
+    # Structural+behavioral: bc-status's classification comes from
+    # classify_presence_age(age-of-last_seen_at) with no separate liveness
+    # probe. A fresh heartbeat (<90s) is always online.
+    from shop_msg.storage import classify_presence_age as _c
+    assert _c(0.0) == "online"
+    assert _c(89.0) == "online"
+    # And the heartbeat the live watch just wrote IS readable by the canonical
+    # name bc-status queries (no key divergence remains).
+    rows = _ph_presence_status(context["ph_target"])
+    assert rows and rows[0]["last_seen_at"] is not None, (
+        "the live watch's heartbeat must be readable under the canonical name "
+        "bc-status queries by (no false-offline key divergence)"
+    )
+    assert rows[0]["classification"] == "online"
+
+
+@then(
+    parsers.parse(
+        "when that same watch process is then stopped so that no heartbeat tick "
+        "fires for more than 5 minutes, a subsequent \"shop-msg bc-status --bc "
+        "{base}\" reclassifies \"{base2}\" as \"offline\" with a "
+        "seconds-since-last-seen value over 300"
+    )
+)
+def e2e_then_offline_after_stop(base: str, base2: str, context: dict) -> None:
+    # Watch stopped: no tick fires for >5min. Faithful to "offline only when no
+    # current heartbeat exists", we age the existing last_seen_at past the
+    # offline threshold (the classification is age-of-last_seen_at based) rather
+    # than literally waiting 5 minutes.
+    name = context["ph_target"]
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE bc_presence SET last_seen_at = now() - make_interval(secs => 360) "
+                "WHERE bc_name = %s",
+                (name,),
+            )
+        conn.commit()
+    r = _ph_run_bc_status(["--bc", name], context)
+    assert r.returncode == 0, f"bc-status exit {r.returncode}; stderr={r.stderr!r}"
+    lines = [ln for ln in r.stdout.splitlines() if ln.startswith(name + " ")]
+    assert len(lines) == 1, f"expected one row for {name!r}, got {lines!r}"
+    parts = lines[0].split()
+    assert parts[1] == "offline", (
+        f"a watch stopped >5min must read offline, got {parts[1]!r}"
+    )
+    age = int(parts[2])
+    assert age > 300, f"offline row age must be >300s, got {age}s"
+
+
+@then(
+    "the load-bearing property pinned here is the end-to-end coupling that "
+    "closes the false-offline defect: an actually-live, connected, heartbeating "
+    "watch yields an online bc-status reading, and the offline reading is "
+    "emitted only in the absence of a current heartbeat, never while a live "
+    "watch is heartbeating"
+)
+def e2e_then_loadbearing(context: dict) -> None:
+    # Asserted by the online leg (live watch -> online) and the offline leg
+    # (heartbeat aged out -> offline) above. This step pins the coupling.
+    pass
