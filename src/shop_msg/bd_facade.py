@@ -445,22 +445,62 @@ def create_dispatch_bead(
         metadata[KEY_OUTBOX_PENDING_AT] = outbox_pending_at
 
     title = f"dispatch {dispatch_message_type} -> {dispatched_to_bc} ({work_id})"
-    # --force allows forcing an id whose prefix does not match the workspace
-    # prefix (lead beads dispatched into a workspace whose default prefix may
-    # differ). The metadata is written atomically with create.
-    _run_bd(
-        [
-            "create",
-            title,
-            "--id",
-            work_id,
-            "--metadata",
-            json.dumps(metadata),
-            "--force",
-        ],
-        cwd=lead_root,
-    )
+    # lead-yyr9 fix: `bd create --metadata` is an UPSERT. When the dispatch
+    # work_id is a PRE-EXISTING lead bead (the normal lead-shop case, since the
+    # work_id IS an authored lead bead) the upsert OVERWRITES the bead's
+    # authored identity fields (title/type/priority/description) with a
+    # synthesized dispatch stub. Detect whether the bead pre-exists and, for a
+    # pre-existing bead, apply a STRICT ADDITIVE patch — set/update only the
+    # dispatch metadata keys and APPEND dispatch notes, NEVER touching
+    # title/type/priority/description. `bd create` is reserved for the
+    # genuinely-absent-bead case (where it carries the synthesized title).
+    if get_dispatch_bead(lead_root, work_id) is not None:
+        _patch_dispatch_bead(lead_root, work_id, metadata, notes=title)
+    else:
+        # --force allows forcing an id whose prefix does not match the
+        # workspace prefix (lead beads dispatched into a workspace whose
+        # default prefix may differ). The metadata is written atomically with
+        # create.
+        _run_bd(
+            [
+                "create",
+                title,
+                "--id",
+                work_id,
+                "--metadata",
+                json.dumps(metadata),
+                "--force",
+            ],
+            cwd=lead_root,
+        )
     _fsync_workspace(lead_root)
+
+
+def _patch_dispatch_bead(
+    lead_root: Path,
+    work_id: str,
+    metadata: dict[str, Any],
+    *,
+    notes: str | None = None,
+) -> None:
+    """Apply a strict ADDITIVE patch to a pre-existing dispatch bead (lead-yyr9).
+
+    Sets/updates ONLY the supplied dispatch metadata keys (via repeated
+    ``bd update --set-metadata key=value``, which replaces only that key and
+    leaves every other field untouched) and, when ``notes`` is given, APPENDS
+    them via ``--append-notes``. This NEVER mutates the bead's authored
+    identity fields (title/type/priority/description): ``bd update`` only
+    changes the flags it is given, so omitting --title/--type/--priority/
+    --description leaves them byte-for-byte intact. This is the patch path that
+    replaces the upserting ``bd create --metadata`` for the pre-existing-bead
+    case while preserving the canonical dispatch field set carried as metadata.
+    """
+    args: list[str] = ["update", work_id]
+    for key, value in metadata.items():
+        args += ["--set-metadata", f"{key}={value}"]
+    if notes:
+        args += ["--append-notes", notes]
+    _run_bd(args, cwd=lead_root)
 
 
 def set_dispatch_state(lead_root: Path, work_id: str, state: str) -> None:
