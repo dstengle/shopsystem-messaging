@@ -7440,17 +7440,21 @@ def tuu5_then_strategic_query_property(bc: str, context: dict) -> None:
 
 @then(
     parsers.parse(
-        'Step 1 fires first: a lead bd entry with id "{work_id}" is created '
-        'via "bd create --metadata <json>" carrying dispatch_state="{state}", '
-        'and the bd write is fsynced to disk before Step 2 begins'
+        'Step 1 fires first: for an absent work_id bead a lead bd entry with '
+        'id "{work_id}" is created via "bd create --metadata <json>", while '
+        'for a pre-existing work_id bead Step 1 instead additively patches it '
+        'via "bd update --set-metadata"/"--append-notes" (never re-creating '
+        'it); either way the Step-1 write carries dispatch_state="{state}" '
+        'and is fsynced to disk before Step 2 begins'
     )
 )
 def tuu5_then_step1(work_id: str, state: str, context: dict) -> None:
     lead_root = _tuu5_require_bd(context)
-    # After a successful send the state is dispatched; the durable record of
-    # intent at outbox_pending is pinned by the adversarial scenario. Here we
-    # assert the bead exists and carries structured metadata (created via
-    # --metadata, not prose).
+    # This scenario's work_id bead is ABSENT before the send, so Step 1 takes
+    # the create path. After a successful send the state is dispatched; the
+    # durable record of intent at outbox_pending is pinned by the adversarial
+    # scenario. Here we assert the bead exists and carries structured metadata
+    # (created via --metadata, not prose).
     rec = _bd_facade.get_dispatch_bead(lead_root, work_id)
     assert rec is not None, f"Step 1 bead {work_id} not created"
     assert (rec.get("metadata") or {}).get("dispatch_message_type"), rec
@@ -7509,6 +7513,175 @@ def tuu5_then_exit_after_step3(context: dict) -> None:
 )
 def tuu5_then_durability_property(context: dict) -> None:
     pass
+
+
+# ---- scenario 206 (lead-yyr9): additive-patch on a pre-existing work_id bead ----
+#
+# The defect: shop-msg send's Step-1 bd write uses `bd create --metadata`, an
+# UPSERT. When the dispatch work_id is a PRE-EXISTING lead bead (the normal
+# case) the upsert overwrites the bead's authored identity fields with a
+# synthesized dispatch stub. The fix detects the pre-existing bead and patches
+# it additively (metadata + appended notes only). These steps drive the REAL
+# `shop-msg send` against a REAL pre-created bd bead and assert byte-for-byte
+# retention of title/type/priority/description PLUS the additive dispatch keys.
+
+@given(
+    parsers.parse(
+        'a lead bd entry with id "{work_id}" ALREADY EXISTS before any '
+        'dispatch, carrying identity fields title="{title}", type="{btype}", '
+        'priority="{priority}", and description="{description}"'
+    )
+)
+def yyr9_given_preexisting_identity_bead(
+    work_id: str, title: str, btype: str, priority: str, description: str,
+    context: dict,
+) -> None:
+    lead_root = _tuu5_require_bd(context)
+    # Create the bead with its authored identity fields, BEFORE any dispatch.
+    # --force allows a forced id whose prefix may not match the workspace.
+    _bd_facade._run_bd(
+        [
+            "create", title,
+            "--id", work_id,
+            "--type", btype,
+            "--priority", priority,
+            "--description", description,
+            "--force",
+        ],
+        cwd=lead_root,
+    )
+    context["yyr9_work_id"] = work_id
+    context["yyr9_pre_identity"] = {
+        "title": title,
+        "type": btype,
+        "priority": priority,
+        "description": description,
+    }
+
+
+@given(
+    parsers.parse(
+        'a payload file at "{path}" pinning a valid request_bugfix carrying '
+        'one scenario hash "{h1}"'
+    )
+)
+def yyr9_given_payload_one_hash(path: str, h1: str, context: dict) -> None:
+    gherkin, real_hash = _tuu5_make_scenario_for_hash(0)
+    payload = {
+        "message_type": "request_bugfix",
+        "work_id": "PLACEHOLDER",
+        "description": "a bugfix carrying one tightened scenario",
+        "scenarios": [
+            {"hash": real_hash, "tags": ["@bc:shopsystem-messaging"], "gherkin": gherkin}
+        ],
+    }
+    Path(path).write_text(yaml.safe_dump(payload, sort_keys=False))
+    context["tuu5_payload_path"] = path
+    # The scenario's literal hash is illustrative; record the REAL pinned hash
+    # so the additive-keys Then-step asserts against the actual value written.
+    context["yyr9_expected_hashes"] = real_hash
+
+
+_PRIORITY_LABEL_TO_INT = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
+
+
+def _yyr9_bd_record(lead_root: Path, work_id: str) -> dict:
+    rec = _bd_facade.get_dispatch_bead(lead_root, work_id)
+    assert rec is not None, f"bead {work_id} not found"
+    return rec
+
+
+@then(
+    parsers.parse(
+        'the lead bd entry "{work_id}" retains every pre-existing identity '
+        'field byte-for-byte: title is still "{title}" (NOT replaced by a '
+        'synthesized "dispatch request_bugfix -> ..." stub), type is still '
+        '"{btype}" (NOT downgraded to "task"), priority is still "{priority}" '
+        '(NOT downgraded to "P2"), and description is still "{description}" '
+        '(NOT replaced)'
+    )
+)
+def yyr9_then_identity_retained(
+    work_id: str, title: str, btype: str, priority: str, description: str,
+    context: dict,
+) -> None:
+    lead_root = _tuu5_require_bd(context)
+    rec = _yyr9_bd_record(lead_root, work_id)
+    assert rec.get("title") == title, (
+        f"title CLOBBERED: expected {title!r}, got {rec.get('title')!r}"
+    )
+    actual_type = rec.get("issue_type") or rec.get("type")
+    assert actual_type == btype, (
+        f"type CLOBBERED: expected {btype!r}, got {actual_type!r}"
+    )
+    expected_prio_int = _PRIORITY_LABEL_TO_INT[priority]
+    actual_prio = rec.get("priority")
+    # bd returns priority as an integer (P1 -> 1); accept either form.
+    actual_prio_int = (
+        _PRIORITY_LABEL_TO_INT.get(actual_prio, actual_prio)
+        if isinstance(actual_prio, str)
+        else actual_prio
+    )
+    assert actual_prio_int == expected_prio_int, (
+        f"priority CLOBBERED: expected {priority!r} ({expected_prio_int}), "
+        f"got {actual_prio!r}"
+    )
+    assert rec.get("description") == description, (
+        f"description CLOBBERED: expected {description!r}, got "
+        f"{rec.get('description')!r}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the only changes applied to "{work_id}" are additive: dispatch '
+        'metadata keys dispatched_to_bc="{bc}", dispatch_message_type='
+        '"{mtype}", dispatch_state="{state}", and scenario_hashes_pinned='
+        '"{hashes}" are added or updated, and dispatch notes are appended, '
+        'with no other field mutated'
+    )
+)
+def yyr9_then_additive_changes(
+    work_id: str, bc: str, mtype: str, state: str, hashes: str, context: dict,
+) -> None:
+    lead_root = _tuu5_require_bd(context)
+    rec = _yyr9_bd_record(lead_root, work_id)
+    meta = rec.get("metadata") or {}
+    assert meta.get("dispatched_to_bc") == bc, meta
+    assert meta.get("dispatch_message_type") == mtype, meta
+    assert meta.get("dispatch_state") == state, meta
+    # scenario_hashes_pinned carries the REAL pinned hash (the scenario literal
+    # "abc123def456abcd" is illustrative).
+    expected_hashes = context.get("yyr9_expected_hashes")
+    assert meta.get("scenario_hashes_pinned") == expected_hashes, (
+        f"expected scenario_hashes_pinned={expected_hashes!r}; got "
+        f"{meta.get('scenario_hashes_pinned')!r}"
+    )
+    # Dispatch notes were appended (the additive notes side of the patch).
+    notes = rec.get("notes") or ""
+    assert notes.strip(), "expected dispatch notes appended on the pre-existing bead"
+
+
+@then(
+    parsers.parse(
+        'the load-bearing property pinned here is that when the work_id bead '
+        'pre-exists (the normal lead-shop case, since the work_id is a '
+        'pre-existing lead bead), the shop-msg bd write is a strict additive '
+        'metadata/notes-only patch — the Step-1 write detects the existing '
+        'bead and patches it rather than clobbering identity fields via an '
+        'upserting "bd create --metadata"'
+    )
+)
+def yyr9_then_loadbearing(context: dict) -> None:
+    # Demonstrate the property holds: every authored identity field recorded in
+    # the Given survived the real `shop-msg send` byte-for-byte.
+    lead_root = _tuu5_require_bd(context)
+    work_id = context["yyr9_work_id"]
+    rec = _yyr9_bd_record(lead_root, work_id)
+    pre = context["yyr9_pre_identity"]
+    assert rec.get("title") == pre["title"]
+    assert (rec.get("issue_type") or rec.get("type")) == pre["type"]
+    assert rec.get("description") == pre["description"]
 
 
 # ---- scenarios 3 & 4: sweep recovery ----
