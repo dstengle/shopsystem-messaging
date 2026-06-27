@@ -7440,17 +7440,21 @@ def tuu5_then_strategic_query_property(bc: str, context: dict) -> None:
 
 @then(
     parsers.parse(
-        'Step 1 fires first: a lead bd entry with id "{work_id}" is created '
-        'via "bd create --metadata <json>" carrying dispatch_state="{state}", '
-        'and the bd write is fsynced to disk before Step 2 begins'
+        'Step 1 fires first: for an absent work_id bead a lead bd entry with '
+        'id "{work_id}" is created via "bd create --metadata <json>", while '
+        'for a pre-existing work_id bead Step 1 instead additively patches it '
+        'via "bd update --set-metadata"/"--append-notes" (never re-creating '
+        'it); either way the Step-1 write carries dispatch_state="{state}" '
+        'and is fsynced to disk before Step 2 begins'
     )
 )
 def tuu5_then_step1(work_id: str, state: str, context: dict) -> None:
     lead_root = _tuu5_require_bd(context)
-    # After a successful send the state is dispatched; the durable record of
-    # intent at outbox_pending is pinned by the adversarial scenario. Here we
-    # assert the bead exists and carries structured metadata (created via
-    # --metadata, not prose).
+    # This scenario's work_id bead is ABSENT before the send, so Step 1 takes
+    # the create path. After a successful send the state is dispatched; the
+    # durable record of intent at outbox_pending is pinned by the adversarial
+    # scenario. Here we assert the bead exists and carries structured metadata
+    # (created via --metadata, not prose).
     rec = _bd_facade.get_dispatch_bead(lead_root, work_id)
     assert rec is not None, f"Step 1 bead {work_id} not created"
     assert (rec.get("metadata") or {}).get("dispatch_message_type"), rec

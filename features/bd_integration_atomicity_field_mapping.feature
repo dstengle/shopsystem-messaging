@@ -20,13 +20,13 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And no "## Dispatch state" prose block has been written to the bead's notes (ADR-011 explicitly removes this prose fallback)
     And the load-bearing property pinned here is that strategic queries against the lead bd ("what is in-flight to shopsystem-messaging right now") read structured metadata and do NOT need to parse prose
 
-  @scenario_hash:98c6065aca2b54c6 @bc:shopsystem-messaging
+  @scenario_hash:8edfb82fc6a07184 @bc:shopsystem-messaging
   Scenario: shop-msg send follows the bd-first 3-step protocol — bd entry written at outbox_pending with fsync, then postgres deposit, then bd flip to dispatched
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
     And a payload file at "/tmp/dispatch-payload.yaml" pinning a valid request_maintenance with no scenario hashes
     When the lead architect runs "shop-msg send request_maintenance --bc shopsystem-messaging --work-id lead-def --payload /tmp/dispatch-payload.yaml" and the run is observed step-by-step
-    Then Step 1 fires first: a lead bd entry with id "lead-def" is created via "bd create --metadata <json>" carrying dispatch_state="outbox_pending", and the bd write is fsynced to disk before Step 2 begins
+    Then Step 1 fires first: for an absent work_id bead a lead bd entry with id "lead-def" is created via "bd create --metadata <json>", while for a pre-existing work_id bead Step 1 instead additively patches it via "bd update --set-metadata"/"--append-notes" (never re-creating it); either way the Step-1 write carries dispatch_state="outbox_pending" and is fsynced to disk before Step 2 begins
     And Step 2 fires next: a postgres outbox row at (bc=shopsystem-messaging, direction='outbox', work_id='lead-def', message_type='request_maintenance') is inserted, carrying lead-def as the correlation key
     And Step 3 fires last: the lead bd entry "lead-def" has its dispatch_state flipped from "outbox_pending" to "dispatched" via "bd update --set-metadata dispatch_state=dispatched"
     And the command exits zero only after Step 3 succeeds; observable to the caller as the report-complete signal
