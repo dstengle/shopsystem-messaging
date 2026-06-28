@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shopsystem-messaging"
-version = "0.4.1"
+version = "0.4.2"
 description = "Messaging bounded context of the shopsystem product: Pydantic schemas for the eight inter-shop message types and the `shop-msg` CLI for reading/writing them."
 requires-python = ">=3.10"
 license = {text = "MIT"}
