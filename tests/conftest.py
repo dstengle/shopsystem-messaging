@@ -13781,3 +13781,105 @@ def then_9xrd_refusal_recorded(
         f"(bc={bc_name}, work_id={work_id}, message_type={message_type}); "
         f"got rows: {rows!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# lead-ay7j (scenario @scenario_hash:e45c01a40e4e4cbe): shop-msg consume outbox
+# accepts message-type request_completion_journal_response and drains the
+# matching BC-outbox row from `pending outbox --lead`. Step defs drive the REAL
+# CLI surface end-to-end: a real request_completion_journal_response outbox row
+# is deposited via `shop-msg respond request_completion_journal` (which routes
+# through insert_bc_response), then the real `shop-msg consume outbox` is run,
+# and the assertion reads real `shop-msg pending outbox --lead` output.
+# ---------------------------------------------------------------------------
+
+
+@given(
+    parsers.parse(
+        '"{lead_name}" is registered as the lead shop in the messaging registry'
+    )
+)
+def ay7j_given_lead_registered(lead_name: str, context: dict, request) -> None:
+    _nn5f_register_lead(lead_name, context, request)
+
+
+@given(
+    parsers.parse(
+        'a request_completion_journal_response from BC "{bc_name}" for work-id '
+        '"{work_id}" is present as an unconsumed outbox response, listed by '
+        '"shop-msg pending outbox --lead {lead_name}"'
+    )
+)
+def ay7j_given_rcj_response_present(
+    bc_name: str, work_id: str, lead_name: str, tmp_path: Path, context: dict, request
+) -> None:
+    # Register the BC under <lead_root>/repos/<bc_name> so its outbox marker is
+    # surfaced by `pending outbox --lead` (which only enumerates markers whose
+    # path sits under the lead's repos/ tree). Idempotent w.r.t. any prior
+    # registration step for the same name in this scenario.
+    _nn5f_register_bc(bc_name, tmp_path, context, request)
+
+    # Deposit a REAL request_completion_journal_response outbox row via the
+    # production respond verb (routes through insert_bc_response, creating both
+    # the BC-outbox marker and the lead-inbox row).
+    _run(
+        [
+            "shop-msg", "respond", "request_completion_journal",
+            "--bc", bc_name,
+            "--work-id", work_id,
+        ],
+        context,
+        check=True,
+    )
+
+    # Confirm the precondition empirically: the row is listed as unconsumed.
+    out = _run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name], context
+    ).stdout
+    assert work_id in out and "request_completion_journal_response" in out, (
+        f"expected unconsumed request_completion_journal_response row for "
+        f"{work_id} in pending outbox --lead {lead_name}; got:\n{out}"
+    )
+    context["ay7j_work_id"] = work_id
+
+
+@when(
+    parsers.parse(
+        'I run "shop-msg consume outbox --bc {bc_name} --work-id {work_id} '
+        '--message-type {message_type}"'
+    )
+)
+def ay7j_when_run_consume_outbox(
+    bc_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    _run(
+        [
+            "shop-msg", "consume", "outbox",
+            "--bc", bc_name,
+            "--work-id", work_id,
+            "--message-type", message_type,
+        ],
+        context,
+    )
+
+
+@then(
+    parsers.parse(
+        '"shop-msg pending outbox --lead {lead_name}" no longer lists work-id '
+        '"{work_id}" with message_type "{message_type}"'
+    )
+)
+def ay7j_then_no_longer_listed(
+    lead_name: str, work_id: str, message_type: str, context: dict
+) -> None:
+    out = _run(
+        ["shop-msg", "pending", "outbox", "--lead", lead_name], context
+    ).stdout
+    # The (work_id, message_type) pair must no longer co-occur as a pending row.
+    for line in out.splitlines():
+        if work_id in line and message_type in line:
+            raise AssertionError(
+                f"expected pending outbox --lead {lead_name} to NOT list "
+                f"{work_id} with message_type {message_type}; offending line:\n"
+                f"{line}\nfull output:\n{out}"
+            )
