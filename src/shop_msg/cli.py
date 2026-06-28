@@ -90,6 +90,7 @@ import argparse
 import os
 import subprocess
 import sys
+import typing
 from pathlib import Path
 
 import yaml
@@ -149,6 +150,22 @@ from shop_msg.storage import (
 
 _response_adapter = TypeAdapter(BCResponse)
 _lead_adapter = TypeAdapter(LeadMessage)
+
+# The BC->lead OUTBOX-response message_type set, derived authoritatively from
+# the catalog's BCResponse union so it tracks the schema and auto-includes any
+# future BC->lead `*_response` type (lead-ay7j). A `nudge` is auxiliary
+# both-directions signaling stored at direction='nudge' (OUTSIDE the outbox
+# partial unique index) — it is never deposited as a direction='outbox' marker
+# and so is never surfaced by `pending outbox` nor drainable by `consume
+# outbox`; it is therefore excluded from the consume-outbox enum. The remaining
+# members (clarify, work_done, mechanism_observation,
+# request_completion_journal_response, and any sibling BC->lead `*_response`)
+# are the consumable outbox responses.
+_CONSUME_OUTBOX_MESSAGE_TYPES = [
+    typing.get_args(member.model_fields["message_type"].annotation)[0]
+    for member in typing.get_args(BCResponse)
+    if member is not Nudge
+]
 
 # ---------------------------------------------------------------------------
 # Migration guards for removed flags
@@ -3136,7 +3153,7 @@ def build_parser() -> argparse.ArgumentParser:
     consume_outbox.add_argument(
         "--message-type",
         required=True,
-        choices=["clarify", "work_done", "mechanism_observation"],
+        choices=_CONSUME_OUTBOX_MESSAGE_TYPES,
         help="message_type of the outbox row to consume",
     )
     consume_outbox.set_defaults(func=_cmd_consume_outbox)
