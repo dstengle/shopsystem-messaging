@@ -12618,6 +12618,212 @@ def rcj_response_validates(context: dict) -> None:
 
 
 # ===========================================================================
+# request_scenario_register (lead-cl1u) — request + response message type
+# ===========================================================================
+#
+# A request_scenario_register asks a target BC for its scenario register: each
+# pinned scenario's block-only canonical hash, title and step text, features/
+# file location, and live-or-retired status. Unlike the completion journal
+# (which is a bare set of hashes), every register entry carries the per-entry
+# metadata REQUIRED to locate/import/supersede the pinned scenario from the
+# response alone. Step defs below drive the two assigned scenarios (hashes
+# 5b13b13d2205459b request, 9b12f88736c6964f response).
+#
+# The shared "Then construction succeeds" / "Then no schema validation error
+# is raised" steps (defined for the bd-decoupling scenarios above) read from
+# context["bd_decoupling_error"] / context["bd_decoupling_instance"]. Both
+# construction scenarios reuse those shared Then steps by populating the SAME
+# context keys in their When steps, so we do NOT redefine them here.
+
+# --- Behavior A: request schema minimal valid construction -----------------
+
+@given(
+    "the RequestScenarioRegister request schema from the shop-msg catalog",
+    target_fixture="rsr_request_cls",
+)
+def rsr_request_schema():
+    from catalog.schemas import RequestScenarioRegister
+    return RequestScenarioRegister
+
+
+@when(
+    "I construct a RequestScenarioRegister request instance supplying only the "
+    "fields the schema marks as required, naming the target bounded context "
+    "whose scenario register is sought, and supplying no narrowing selector"
+)
+def rsr_construct_request_minimal(rsr_request_cls, context: dict) -> None:
+    try:
+        instance = rsr_request_cls(
+            message_type="request_scenario_register",
+            work_id="lead-rsr-min",
+            target_bc="shopsystem-scenarios",
+        )
+        context["bd_decoupling_error"] = None
+        context["bd_decoupling_instance"] = instance
+    except Exception as exc:  # noqa: BLE001
+        context["bd_decoupling_error"] = exc
+        context["bd_decoupling_instance"] = None
+
+
+@then(
+    "the constructed request carries the named target bounded context and no "
+    "register entry of its own"
+)
+def rsr_request_carries_target_no_entries(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    assert instance.target_bc == "shopsystem-scenarios"
+    # The request schema must NOT carry a register-entries field at all: it is
+    # a request for the register, not a carrier of register state.
+    assert not hasattr(instance, "register_entries")
+
+
+@then(
+    "the omitted narrowing selector denotes the target bounded context's full "
+    "register rather than any subset"
+)
+def rsr_omitted_selector_denotes_full_register(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    # The narrowing selector is OPTIONAL and was omitted: it defaults to None,
+    # which denotes the target BC's FULL register (not a subset).
+    assert instance.narrowing is None
+
+
+@then(
+    "the schema also permits an optional narrowing selector that confines the "
+    "request to a named feature-area surface or to an explicit set of "
+    "block-only canonical hashes"
+)
+def rsr_schema_permits_optional_narrowing(rsr_request_cls, context: dict) -> None:
+    from catalog.schemas import RegisterNarrowing
+    # The schema PERMITS an optional narrowing selector. Confining to a named
+    # feature-area surface:
+    by_area = rsr_request_cls(
+        message_type="request_scenario_register",
+        work_id="lead-rsr-area",
+        target_bc="shopsystem-scenarios",
+        narrowing=RegisterNarrowing(feature_area="messaging"),
+    )
+    assert by_area.narrowing is not None
+    assert by_area.narrowing.feature_area == "messaging"
+    # Or confining to an explicit set of block-only canonical hashes:
+    by_hashes = rsr_request_cls(
+        message_type="request_scenario_register",
+        work_id="lead-rsr-hashes",
+        target_bc="shopsystem-scenarios",
+        narrowing=RegisterNarrowing(hashes={"h1", "h2"}),
+    )
+    assert by_hashes.narrowing is not None
+    assert by_hashes.narrowing.hashes == {"h1", "h2"}
+
+
+# --- Behavior B: response schema with required per-entry register fields ----
+
+@given(
+    "the RequestScenarioRegister response schema from the shop-msg catalog",
+    target_fixture="rsr_response_cls",
+)
+def rsr_response_schema():
+    from catalog.schemas import RequestScenarioRegisterResponse
+    return RequestScenarioRegisterResponse
+
+
+@when(
+    "I construct a RequestScenarioRegister response instance whose "
+    "register-entries field holds two entries, each carrying a block-only "
+    "canonical hash, the scenario's title and step text, the scenario's file "
+    "location within the target bounded context's features/ tree, and a "
+    "status of either live or retired/superseded"
+)
+def rsr_construct_response_two_entries(rsr_response_cls, context: dict) -> None:
+    from catalog.schemas import ScenarioRegisterEntry
+    try:
+        instance = rsr_response_cls(
+            message_type="request_scenario_register_response",
+            work_id="lead-rsr-resp",
+            register_entries=[
+                ScenarioRegisterEntry(
+                    hash="5b13b13d2205459b",
+                    title="A minimal valid request_scenario_register request",
+                    text=(
+                        "Given the RequestScenarioRegister request schema\n"
+                        "When I construct a minimal request\n"
+                        "Then construction succeeds"
+                    ),
+                    file_location="features/request_scenario_register.feature",
+                    status="live",
+                ),
+                ScenarioRegisterEntry(
+                    hash="9b12f88736c6964f",
+                    title="A request_scenario_register response carries each entry",
+                    text=(
+                        "Given the RequestScenarioRegister response schema\n"
+                        "When I construct a response with two entries\n"
+                        "Then construction succeeds"
+                    ),
+                    file_location="features/request_scenario_register.feature",
+                    status="retired",
+                ),
+            ],
+        )
+        context["bd_decoupling_error"] = None
+        context["bd_decoupling_instance"] = instance
+    except Exception as exc:  # noqa: BLE001
+        context["bd_decoupling_error"] = exc
+        context["bd_decoupling_instance"] = None
+
+
+@then(
+    "the constructed response carries, for each register entry, its block-only "
+    "canonical hash together with its scenario title and step text, its "
+    "features/ file location, and its live-or-retired/superseded status"
+)
+def rsr_response_carries_per_entry_fields(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    assert len(instance.register_entries) == 2
+    e0, e1 = instance.register_entries
+    assert e0.hash == "5b13b13d2205459b"
+    assert e0.title and e0.text
+    assert e0.file_location == "features/request_scenario_register.feature"
+    assert e0.status == "live"
+    assert e1.hash == "9b12f88736c6964f"
+    assert e1.title and e1.text
+    assert e1.file_location == "features/request_scenario_register.feature"
+    assert e1.status == "retired"
+
+
+@then(
+    "these per-entry fields let the requester locate, import, or supersede the "
+    "pinned scenario from the response alone"
+)
+def rsr_per_entry_fields_self_sufficient(context: dict) -> None:
+    instance = context["bd_decoupling_instance"]
+    # Every entry exposes the full per-entry record — hash, title, text, file
+    # location, status — so the requester can locate/import/supersede each
+    # pinned scenario from the response alone, with no out-of-band lookup.
+    for entry in instance.register_entries:
+        assert entry.hash
+        assert entry.title
+        assert entry.text
+        assert entry.file_location
+        assert entry.status in ("live", "retired")
+
+
+@then(
+    "a register entry supplying only a bare block-only canonical hash, with no "
+    "title, step text, file location, or status, is rejected as schema-invalid"
+)
+def rsr_bare_hash_entry_rejected(context: dict) -> None:
+    import pydantic
+    from catalog.schemas import ScenarioRegisterEntry
+    # The per-entry fields beyond the hash are REQUIRED: a register entry that
+    # supplies ONLY a bare hash (no title, text, file location, or status) is
+    # rejected as schema-invalid. This is the teeth that distinguishes the
+    # scenario register from the bare-hash completion journal.
+    with pytest.raises(pydantic.ValidationError):
+        ScenarioRegisterEntry(hash="5b13b13d2205459b")
+
+
+# ===========================================================================
 # clarify_response — in-band answer that re-opens the original dispatch
 # (lead-ox8). Step definitions for features/clarify_response_in_band_answer.feature.
 #
