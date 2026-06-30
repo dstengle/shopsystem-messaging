@@ -14220,3 +14220,162 @@ def then_stored_work_done_carries_nonempty_no_empty(
     assert "" not in hashes, (
         f"expected NO empty-string member in scenario_hashes; got {hashes!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# scenario 38 (@scenario_hash:7bc14b8a649e1868) — lead-i1we
+# shop-msg send request_scenario_register deposits a well-formed request naming
+# the target bounded context with optional narrowing.
+# ---------------------------------------------------------------------------
+def _run_send_request_scenario_register(
+    bc_root: Path, work_id: str, target_bc: str, feature_area: str | None
+) -> subprocess.CompletedProcess:
+    argv = [
+        "shop-msg",
+        "send",
+        "request_scenario_register",
+        "--bc", _get_or_register_bc_name(bc_root),
+        "--work-id", work_id,
+        "--target-bc", target_bc,
+    ]
+    if feature_area is not None:
+        argv += ["--feature-area", feature_area]
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+@when(
+    parsers.re(
+        r'shop-msg send request_scenario_register is run for work-id '
+        r'"(?P<work_id>[^"]*)" naming target bounded context '
+        r'"(?P<target_bc>[^"]*)" and supplying a narrowing selector confining '
+        r'the request to feature-area surface "(?P<feature_area>[^"]*)"$'
+    )
+)
+def run_send_rsr_with_narrowing(
+    bc_root: Path, work_id: str, target_bc: str, feature_area: str, context: dict
+) -> None:
+    result = _run_send_request_scenario_register(
+        bc_root, work_id, target_bc, feature_area
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    context["rsr_target_bc"] = target_bc
+    context["rsr_feature_area"] = feature_area
+
+
+@then(
+    parsers.re(
+        r'the inbox holds exactly one unprocessed request_scenario_register '
+        r'message for work_id "(?P<work_id>[^"]*)"$'
+    )
+)
+def inbox_holds_exactly_one_rsr(bc_root: Path, work_id: str, context: dict) -> None:
+    rc = context.get("cli_returncode")
+    assert rc == 0, (
+        f"shop-msg send request_scenario_register exited {rc}; "
+        f"stderr:\n{context.get('cli_stderr', '')}"
+    )
+    rows = [
+        r
+        for r in _fetch_inbox_rows(bc_root)
+        if r["message_type"] == "request_scenario_register"
+    ]
+    assert len(rows) == 1, (
+        f"expected exactly one request_scenario_register inbox row; "
+        f"got {len(rows)}: {[r['work_id'] for r in rows]}"
+    )
+    assert rows[0]["work_id"] == work_id, (
+        f"expected the row's work_id to be {work_id!r}; got {rows[0]['work_id']!r}"
+    )
+    context["rsr_deposited_payload"] = rows[0]["payload"]
+
+
+@then(
+    parsers.re(
+        r'that deposited message validates against the RequestScenarioRegister '
+        r'request schema and names target bounded context "(?P<target_bc>[^"]*)"$'
+    )
+)
+def rsr_validates_and_names_target(
+    bc_root: Path, target_bc: str, context: dict
+) -> None:
+    from catalog.schemas import RequestScenarioRegister
+
+    payload = context["rsr_deposited_payload"]
+    msg = RequestScenarioRegister(**payload)
+    assert msg.message_type == "request_scenario_register"
+    assert msg.target_bc == target_bc, (
+        f"expected target_bc {target_bc!r}; got {msg.target_bc!r}"
+    )
+
+
+@then(
+    "the deposited message carries the supplied narrowing selector and no "
+    "register entry of its own"
+)
+def rsr_carries_narrowing_no_register_entry(bc_root: Path, context: dict) -> None:
+    from catalog.schemas import RequestScenarioRegister
+
+    payload = context["rsr_deposited_payload"]
+    msg = RequestScenarioRegister(**payload)
+    # narrowing selector is carried and confines to the supplied feature area.
+    assert msg.narrowing is not None, (
+        "expected the deposited message to carry the supplied narrowing selector"
+    )
+    assert msg.narrowing.feature_area == context["rsr_feature_area"], (
+        f"expected narrowing.feature_area {context['rsr_feature_area']!r}; "
+        f"got {msg.narrowing.feature_area!r}"
+    )
+    # No register entry of its own: the request schema has no register_entries
+    # field at all, so the raw payload must not smuggle one in.
+    assert "register_entries" not in payload, (
+        "a request_scenario_register must carry NO register entry of its own; "
+        f"payload had register_entries={payload.get('register_entries')!r}"
+    )
+
+
+@then(
+    "shop-msg send request_scenario_register run with no narrowing selector "
+    "instead deposits a valid request denoting the target bounded context's "
+    "full register"
+)
+def rsr_no_narrowing_denotes_full_register(
+    bc_root: Path, tmp_path: Path, context: dict
+) -> None:
+    from catalog.schemas import RequestScenarioRegister
+
+    # A fresh, separately-registered BC so its inbox starts empty.
+    fresh = tmp_path / "rsr_no_narrowing_bc"
+    (fresh / "inbox").mkdir(parents=True)
+    (fresh / "outbox").mkdir()
+
+    result = _run_send_request_scenario_register(
+        fresh,
+        context.get("rsr_work_id_no_narrowing", "lead-401"),
+        context["rsr_target_bc"],
+        None,
+    )
+    assert result.returncode == 0, (
+        f"shop-msg send request_scenario_register (no narrowing) exited "
+        f"{result.returncode}; stderr:\n{result.stderr}"
+    )
+    rows = [
+        r
+        for r in _fetch_inbox_rows(fresh)
+        if r["message_type"] == "request_scenario_register"
+    ]
+    assert len(rows) == 1, (
+        f"expected exactly one request_scenario_register inbox row; got {len(rows)}"
+    )
+    payload = rows[0]["payload"]
+    msg = RequestScenarioRegister(**payload)
+    assert msg.target_bc == context["rsr_target_bc"]
+    # Omitted narrowing denotes the FULL register: narrowing is None / absent.
+    assert msg.narrowing is None, (
+        "expected an omitted narrowing selector to denote the target BC's full "
+        f"register (narrowing None); got {msg.narrowing!r}"
+    )
+    assert payload.get("narrowing") in (None, {}), (
+        f"expected no narrowing in the raw payload; got {payload.get('narrowing')!r}"
+    )
