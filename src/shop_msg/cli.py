@@ -109,6 +109,8 @@ from catalog.schemas import (
     RequestCompletionJournal,
     RequestCompletionJournalResponse,
     RequestMaintenance,
+    RequestScenarioRegister,
+    RegisterNarrowing,
     ScenarioPayload,
     WorkDone,
     _nudge_payload_rejects_scenario_state,
@@ -1038,6 +1040,7 @@ def _load_payload_file(path_str: str, message_type: str, work_id: str) -> dict:
         "request_bugfix": RequestBugfix,
         "assign_scenarios": AssignScenarios,
         "request_completion_journal": RequestCompletionJournal,
+        "request_scenario_register": RequestScenarioRegister,
     }[message_type]
     message = model_cls(**data)
     return message.model_dump(exclude_none=True)
@@ -1129,6 +1132,74 @@ def _cmd_send_request_completion_journal(args: argparse.Namespace) -> int:
         bc_name=args.bc,
         work_id=args.work_id,
         message_type="request_completion_journal",
+        payload=payload,
+        scenario_hashes_pinned=None,
+        depends_on_dispatch=getattr(args, "depends_on", None),
+        bc_origin_main_commit=_bc_origin_main_commit(str(_bc_clone_context())),
+        payload_ref=getattr(args, "payload", None),
+        queue_on_dependency=getattr(args, "queue_on_dependency", False),
+    )
+
+
+def _cmd_send_request_scenario_register(args: argparse.Namespace) -> int:
+    """`shop-msg send request_scenario_register` (lead-i1we, scenario 38).
+
+    Deposits exactly one well-formed request_scenario_register inbox message
+    naming the target BC whose scenario register is sought. Modeled on the
+    sibling `send request_completion_journal` send subcommand (both name a
+    target_bc and carry no answer-side entry of their own), it runs through
+    the same bd-first send protocol.
+
+    The narrowing selector is OPTIONAL (RequestScenarioRegister.narrowing):
+
+      - `--feature-area <surface>` confines the request to a named
+        feature-area surface, OR
+      - `--hash <h>` (repeatable) confines it to an explicit set of
+        block-only canonical hashes.
+
+    Omitting narrowing entirely (no --feature-area and no --hash) leaves
+    ``narrowing`` None, which the schema documents as denoting the target
+    BC's FULL register rather than any subset. The request carries NO
+    register entry of its own — RequestScenarioRegister has no
+    register_entries field at all.
+    """
+    bc_root = _resolve_bc(args)
+
+    if getattr(args, "payload", None):
+        payload = _load_payload_file(
+            args.payload, "request_scenario_register", args.work_id
+        )
+    else:
+        if args.target_bc is None:
+            print(
+                "shop-msg send request_scenario_register: --target-bc is "
+                "required unless --payload is supplied",
+                file=sys.stderr,
+            )
+            return 2
+        narrowing = None
+        feature_area = getattr(args, "feature_area", None)
+        hashes = list(getattr(args, "hash", None) or [])
+        if feature_area is not None or hashes:
+            narrowing = RegisterNarrowing(
+                feature_area=feature_area,
+                hashes=set(hashes) or None,
+            )
+        message = RequestScenarioRegister(
+            message_type="request_scenario_register",
+            work_id=args.work_id,
+            target_bc=args.target_bc,
+            narrowing=narrowing,
+            from_shop=_resolve_send_sender(),
+        )
+        payload = message.model_dump(exclude_none=True)
+
+    return _bd_first_send(
+        command="request_scenario_register",
+        bc_root=bc_root,
+        bc_name=args.bc,
+        work_id=args.work_id,
+        message_type="request_scenario_register",
         payload=payload,
         scenario_hashes_pinned=None,
         depends_on_dispatch=getattr(args, "depends_on", None),
@@ -2929,6 +3000,75 @@ def build_parser() -> argparse.ArgumentParser:
     )
     request_completion_journal.set_defaults(
         func=_cmd_send_request_completion_journal
+    )
+
+    request_scenario_register = send_sub.add_parser(
+        "request_scenario_register",
+        help="write a request_scenario_register message (lead-i1we)",
+    )
+    request_scenario_register.add_argument(
+        "--bc", required=True, help="canonical BC name (resolved via registry)"
+    )
+    _add_removed_flag(request_scenario_register, "--bc-root")
+    request_scenario_register.add_argument(
+        "--work-id", required=True, help="work_id identifying this request"
+    )
+    request_scenario_register.add_argument(
+        "--target-bc",
+        default=None,
+        help=(
+            "the bounded context whose scenario register is sought "
+            "(required unless --payload)"
+        ),
+    )
+    request_scenario_register.add_argument(
+        "--feature-area",
+        default=None,
+        help=(
+            "OPTIONAL narrowing selector: confine the request to a named "
+            "feature-area surface. Omit all narrowing flags to request the "
+            "target BC's full register"
+        ),
+    )
+    request_scenario_register.add_argument(
+        "--hash",
+        action="append",
+        default=None,
+        metavar="HASH",
+        help=(
+            "OPTIONAL narrowing selector: confine the request to an explicit "
+            "block-only canonical hash (repeatable). Omit all narrowing flags "
+            "to request the target BC's full register"
+        ),
+    )
+    request_scenario_register.add_argument(
+        "--payload",
+        default=None,
+        help=(
+            "path to a YAML/JSON file pinning the complete message body; when "
+            "supplied it is the authoritative content source and --target-bc "
+            "is not required"
+        ),
+    )
+    request_scenario_register.add_argument(
+        "--depends-on",
+        default=None,
+        help=(
+            "work_id of a prior dispatch this one depends on; recorded on the "
+            "lead bd entry as depends_on_dispatch metadata"
+        ),
+    )
+    request_scenario_register.add_argument(
+        "--queue-on-dependency",
+        action="store_true",
+        help=(
+            "when a bd depends-on predecessor is not yet at "
+            "dispatch_state=closed, defer the postgres deposit (PDR-010 / "
+            "ADR-013 decision 4)"
+        ),
+    )
+    request_scenario_register.set_defaults(
+        func=_cmd_send_request_scenario_register
     )
 
     send_nudge = send_sub.add_parser(
