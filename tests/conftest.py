@@ -14089,3 +14089,134 @@ def ay7j_then_no_longer_listed(
                 f"{work_id} with message_type {message_type}; offending line:\n"
                 f"{line}\nfull output:\n{out}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 35 (@scenario_hash:a2d05a918db02efd) — respond work_done rejects a
+# blank scenario-hash and confirms a valid emit on stdout (work_id: lead-7w0w)
+# ---------------------------------------------------------------------------
+
+@when(
+    parsers.parse(
+        'shop-msg respond work_done is called for work-id "{work_id}" with '
+        'status "{status}" and a single --scenario-hash whose value is the '
+        "empty string"
+    )
+)
+def when_respond_work_done_empty_scenario_hash(
+    bc_root: Path, work_id: str, status: str, context: dict
+) -> None:
+    """Drive the REAL CLI with a single empty-string --scenario-hash value."""
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", _get_or_register_bc_name(bc_root),
+            "--work-id", work_id,
+            "--status", status,
+            "--scenario-hash", "",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then("stderr names the rejected blank scenario-hash value")
+def then_stderr_names_rejected_blank_hash(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    # The diagnostic must name the offending flag and make clear an empty/blank
+    # scenario-hash value was rejected.
+    assert "scenario-hash" in stderr, (
+        f"expected stderr to name the rejected --scenario-hash; got:\n{stderr}"
+    )
+    assert ("empty" in stderr.lower() or "blank" in stderr.lower()), (
+        f"expected stderr to name the value as empty/blank; got:\n{stderr}"
+    )
+
+
+@then(
+    parsers.parse(
+        'no work_done response is stored for work-id "{work_id}"'
+    )
+)
+def then_no_work_done_stored(bc_root: Path, work_id: str) -> None:
+    rows = [
+        r for r in _fetch_outbox_rows(bc_root)
+        if r["work_id"] == work_id and r["message_type"] == "work_done"
+    ]
+    assert not rows, (
+        f"expected NO stored work_done response for work-id {work_id!r}; "
+        f"found: {rows!r}"
+    )
+
+
+@when(
+    parsers.parse(
+        'shop-msg respond work_done is called again for work-id "{work_id}" '
+        'with status "{status}" and a single non-empty scenario hash'
+    )
+)
+def when_respond_work_done_nonempty_scenario_hash(
+    bc_root: Path, work_id: str, status: str, context: dict
+) -> None:
+    """Drive the REAL CLI with a single non-empty --scenario-hash value."""
+    context["nonempty_scenario_hash"] = "a2d05a918db02efd"
+    result = subprocess.run(
+        [
+            "shop-msg", "respond", "work_done",
+            "--bc", _get_or_register_bc_name(bc_root),
+            "--work-id", work_id,
+            "--status", status,
+            "--scenario-hash", context["nonempty_scenario_hash"],
+        ],
+        capture_output=True,
+        text=True,
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then(
+    parsers.parse(
+        'stdout confirms the emit, naming work-id "{work_id}" and status '
+        '"{status}"'
+    )
+)
+def then_stdout_confirms_emit(context: dict, work_id: str, status: str) -> None:
+    stdout = context.get("cli_stdout", "")
+    assert work_id in stdout, (
+        f"expected stdout confirmation to name work-id {work_id!r}; "
+        f"got:\n{stdout!r}"
+    )
+    assert status in stdout, (
+        f"expected stdout confirmation to name status {status!r}; "
+        f"got:\n{stdout!r}"
+    )
+
+
+@then(
+    "the stored work_done response carries the non-empty scenario hash and "
+    "no empty-string member"
+)
+def then_stored_work_done_carries_nonempty_no_empty(
+    bc_root: Path, context: dict
+) -> None:
+    expected_hash = context["nonempty_scenario_hash"]
+    rows = [
+        r for r in _fetch_outbox_rows(bc_root)
+        if r["message_type"] == "work_done"
+    ]
+    assert rows, "expected a stored work_done response; found none"
+    # Most-recent work_done row.
+    payload = rows[-1]["payload"]
+    hashes = payload.get("scenario_hashes", [])
+    assert expected_hash in hashes, (
+        f"expected stored work_done to carry {expected_hash!r}; "
+        f"scenario_hashes={hashes!r}"
+    )
+    assert "" not in hashes, (
+        f"expected NO empty-string member in scenario_hashes; got {hashes!r}"
+    )
