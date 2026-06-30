@@ -405,6 +405,123 @@ class RequestCompletionJournalResponse(BaseModel):
     completed_entries: set[str] = Field(default_factory=set)
 
 
+class RegisterNarrowing(BaseModel):
+    """Optional narrowing selector on a ``RequestScenarioRegister`` (lead-cl1u).
+
+    A scenario-register request defaults to the target BC's FULL register: when
+    the request omits its ``narrowing`` field entirely (it is ``None``), the
+    request denotes the whole register, not a subset. This model is the OPTIONAL
+    selector that confines the request to a narrower surface — either:
+
+      - a named feature-area surface (``feature_area``), or
+      - an explicit set of block-only canonical hashes (``hashes``).
+
+    Both fields are individually optional so a caller may narrow by area, by an
+    explicit hash set, or (degenerately) by neither; the meaningful confinement
+    is supplied by whichever field the caller populates. Set semantics on
+    ``hashes`` de-duplicate and drop ordering, matching the bare-hash set form
+    used elsewhere in the catalog (RequestCompletionJournalResponse).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    # A named feature-area surface to confine the request to. Optional.
+    feature_area: str | None = Field(default=None, min_length=1)
+    # An explicit set of block-only canonical hashes to confine the request to.
+    # A set (not a list): order is not significant and duplicates collapse.
+    hashes: set[str] | None = Field(default=None)
+
+
+class RequestScenarioRegister(BaseModel):
+    """Lead -> BC request for a target BC's scenario register (lead-cl1u).
+
+    A request_scenario_register asks the named target bounded context for its
+    scenario register — the set of pinned scenarios, each described by its
+    block-only canonical hash, title and step text, features/ file location, and
+    live-or-retired status. The register itself travels back on the paired
+    ``RequestScenarioRegisterResponse``; THIS message is purely the *request*.
+
+    It names the target BC whose register is sought and carries NO register
+    entry of its own (deliberately no ``register_entries`` field here — a request
+    that carried register state would conflate the ask with the answer, exactly
+    as RequestCompletionJournal avoids carrying ``completed_entries``).
+
+    The ``narrowing`` selector is OPTIONAL. Omitting it (``None``) denotes the
+    target BC's FULL register rather than any subset; supplying a
+    ``RegisterNarrowing`` confines the request to a named feature-area surface or
+    to an explicit set of block-only canonical hashes.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    message_type: Literal["request_scenario_register"]
+    work_id: WorkId
+    # The bounded context whose scenario register is sought. Required: a
+    # scenario-register request is meaningless without naming its target.
+    target_bc: str = Field(min_length=1)
+    # The OPTIONAL narrowing selector. None (the default) denotes the target
+    # BC's FULL register; a RegisterNarrowing confines it to a subset.
+    narrowing: RegisterNarrowing | None = None
+    # See RequestMaintenance.from_shop. Populated by `shop-msg send` when the
+    # sender is resolved implicitly from CWD (PDR-008).
+    from_shop: str | None = None
+
+
+class ScenarioRegisterEntry(BaseModel):
+    """One per-scenario entry in a scenario register (lead-cl1u).
+
+    Unlike the bare-hash completion journal — where a completed scenario is
+    identified by hash ALONE — a scenario-register entry carries the full
+    per-entry record the requester needs to LOCATE, IMPORT, or SUPERSEDE the
+    pinned scenario from the response alone, with no out-of-band lookup:
+
+      - ``hash``          the scenario's block-only canonical hash
+      - ``title``         the scenario's title
+      - ``text``          the scenario's step text
+      - ``file_location`` the scenario's features/ file location within the
+                          target BC's tree
+      - ``status``        whether the scenario is ``live`` or ``retired``
+                          (superseded)
+
+    Every one of these fields is REQUIRED — that is the teeth. An entry supplying
+    ONLY a bare hash, with no title, step text, file location, or status, is
+    rejected as schema-invalid. ``extra="forbid"`` additionally rejects unknown
+    keys so a malformed entry cannot smuggle metadata past the contract.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    hash: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    file_location: str = Field(min_length=1)
+    status: Literal["live", "retired"]
+
+
+class RequestScenarioRegisterResponse(BaseModel):
+    """BC -> requester response carrying a scenario register (lead-cl1u).
+
+    The paired response to ``RequestScenarioRegister``. It carries the target
+    BC's scenario register back to the requester as a LIST of per-entry records
+    (``register_entries``) — NOT a bare set of hashes. Each entry is a
+    ``ScenarioRegisterEntry`` exposing the scenario's hash, title, step text,
+    features/ file location, and live-or-retired status, so the requester can
+    locate / import / supersede each pinned scenario from the response alone.
+
+    This is the per-entry richness that distinguishes the scenario register from
+    the bare-hash completion journal: a register entry supplying ONLY a bare hash
+    is rejected at construction because every per-entry field beyond the hash is
+    required (see ``ScenarioRegisterEntry``).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    message_type: Literal["request_scenario_register_response"]
+    work_id: WorkId
+    # The register entries, as a list of per-entry records. A list (not a bare
+    # set of hashes): the register is a sequence of full ScenarioRegisterEntry
+    # records, each carrying the metadata required to act on the pinned scenario
+    # from the response alone. Defaults to empty: a target BC whose register is
+    # empty returns an empty register.
+    register_entries: list[ScenarioRegisterEntry] = Field(default_factory=list)
+
+
 # A nudge is auxiliary signaling that flows BOTH directions: lead -> BC
 # (`shop-msg send nudge`) and BC -> lead (`shop-msg nudge`). It is therefore
 # a member of both message unions. It is NOT a dispatch (no lifecycle) and
@@ -414,6 +531,7 @@ LeadMessage = Union[
     AssignScenarios,
     RequestBugfix,
     RequestCompletionJournal,
+    RequestScenarioRegister,
     ClarifyResponse,
     Nudge,
 ]
@@ -422,5 +540,6 @@ BCResponse = Union[
     WorkDone,
     MechanismObservation,
     RequestCompletionJournalResponse,
+    RequestScenarioRegisterResponse,
     Nudge,
 ]
