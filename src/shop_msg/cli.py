@@ -625,6 +625,22 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
 
     bc_root = _resolve_bc(args)
 
+    # Reject blank (empty-string / whitespace-only) --scenario-hash values
+    # BEFORE any storage write. A fat-fingered `--scenario-hash ""` must NOT
+    # land a malformed-but-schema-valid work_done carrying a blank list member
+    # (lead-7w0w; mechanism_observation lead-37zx). Validate first so no
+    # work_done response is stored on rejection.
+    for raw_hash in (args.scenario_hash or []):
+        if not raw_hash.strip():
+            print(
+                f"shop-msg respond work_done: refusing blank --scenario-hash "
+                f"value {raw_hash!r} (empty or whitespace-only); a "
+                f"scenario-hash must be a non-empty value. No work_done "
+                f"response was stored.",
+                file=sys.stderr,
+            )
+            return 1
+
     lead_root = _resolve_registered_lead()
     if lead_root is None:
         print(
