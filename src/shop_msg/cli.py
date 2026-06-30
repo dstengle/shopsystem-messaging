@@ -688,6 +688,12 @@ def _cmd_respond_work_done(args: argparse.Namespace) -> int:
         status=args.status,
         op_name="respond work_done",
     )
+    # Stdout confirmation on success: the operator gets explicit feedback that
+    # the emit landed, naming the work-id and status (lead-7w0w). Without this
+    # a successful respond printed nothing, so a fat-fingered emit was silent.
+    print(
+        f"work_done {args.status} recorded for work-id {args.work_id}"
+    )
     return 0
 
 
