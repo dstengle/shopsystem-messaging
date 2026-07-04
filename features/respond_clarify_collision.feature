@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-e9x
 Feature: shop-msg respond clarify — refuse on lead-inbox collision
 
-  @scenario_hash:9c9c6f7f49e4be0b @bc:shop-msg
+  @scenario_hash:9c9c6f7f49e4be0b
   Scenario: Refuse to overwrite an existing clarify for the same work_id
     Given an empty BC at a temporary path
     And the lead's inbox already contains a response named "lead-col2-clarify.yaml"

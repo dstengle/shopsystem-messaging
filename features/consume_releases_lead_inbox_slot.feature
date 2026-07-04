@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-nn5f @service:postgres
 Feature: shop-msg respond --force and consume-outbox-releases-lead-inbox-slot recovery contract
 
   # lead-nn5f: close the recovery-surface asymmetry between
@@ -9,7 +10,7 @@ Feature: shop-msg respond --force and consume-outbox-releases-lead-inbox-slot re
   # carried (Feature-wrapped canonicalization) per the known lead-ji28
   # wire/disk divergence.
 
-  @scenario_hash:a540ae54e7d58284 @bc:shopsystem-messaging
+  @scenario_hash:a540ae54e7d58284
   Scenario: shop-msg consume outbox on a BC-emitted response also releases the lead-inbox row for the same (bc, work_id, message_type) triple so the BC can re-emit without --force
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -21,7 +22,7 @@ Feature: shop-msg respond --force and consume-outbox-releases-lead-inbox-slot re
     And a subsequent "shop-msg respond work_done --bc shopsystem-messaging --work-id lead-n01 --status complete" WITHOUT --force exits zero rather than raising CollisionError, because there is no surviving lead-inbox row to collide against
     And the rationale that pins this behavior is single-source-of-truth: a consumed response is no longer authoritative, so the BC may re-emit cleanly under the original verb without escalating to the --force recovery affordance
 
-  @scenario_hash:8c614e845d7b6a01 @bc:shopsystem-messaging
+  @scenario_hash:8c614e845d7b6a01
   Scenario: shop-msg consume outbox releases only the matching (bc, work_id, message_type) triple and leaves other message_types on the same work_id intact on both surfaces
     Given a lead shop "shopsystem-product" and a BC "shopsystem-messaging" registered in the messaging registry
     And the BC has emitted two responses for work-id "lead-n02": one "clarify" and one "work_done"
@@ -32,7 +33,7 @@ Feature: shop-msg respond --force and consume-outbox-releases-lead-inbox-slot re
     And the (work_id='lead-n02', message_type='clarify') BC-outbox marker AND the (work_id='lead-n02', message_type='clarify') lead-inbox row are BOTH intact and still surfaced on their respective pending queries
     And the release scoping rule is identical to the --force scoping rule in respond_force_scoped_per_triple.feature: both DELETEs key on the full (bc, work_id, message_type) triple, so the two recovery paths compose without cross-talk
 
-  @scenario_hash:54553a9c377e5287 @bc:shopsystem-messaging
+  @scenario_hash:54553a9c377e5287
   Scenario: shop-msg respond --force on a (bc, work_id, message_type) triple that has NO prior lead-inbox row succeeds and behaves identically to a fresh respond without --force (empty-case idempotency)
     Given a lead shop "shopsystem-product" and a BC "shopsystem-messaging" registered in the messaging registry
     And a request_maintenance inbox message with work-id "lead-n03" has been sent to "shopsystem-messaging"
@@ -44,7 +45,7 @@ Feature: shop-msg respond --force and consume-outbox-releases-lead-inbox-slot re
     And "shop-msg read inbox --lead shopsystem-product --work-id lead-n03" returns the first-emit payload byte-for-byte
     And the load-bearing property pinned here is that --force does NOT become a "respond only if a prior row exists" precondition; --force is the recovery affordance for the collision case AND a no-op DELETE on the empty case, never a guard against the empty case
 
-  @scenario_hash:d0c3fa2ea91e45e9 @bc:shopsystem-messaging
+  @scenario_hash:d0c3fa2ea91e45e9
   Scenario: shop-msg respond --force re-emit by a BC is visible to the lead's next pending-inbox and pending-outbox reads even if the lead has interleaved its own reconciliation work between the original emit and the --force replacement (no silent swap behind reconciliation in progress)
     Given a lead shop "shopsystem-product" and a BC "shopsystem-messaging" registered in the messaging registry
     And the BC has previously called "shop-msg respond work_done --bc shopsystem-messaging --work-id lead-n04 --status complete --summary degraded-original" producing both a lead-inbox row and a BC-outbox marker carrying the degraded-original payload
@@ -56,7 +57,7 @@ Feature: shop-msg respond --force and consume-outbox-releases-lead-inbox-slot re
     And "shop-msg read inbox --lead shopsystem-product --work-id lead-n04" returns the reviewer-approved-real payload (NOT the degraded-original payload)
     And the load-bearing property pinned here is that --force is observable to the lead on its next read regardless of any reconciliation state the lead is carrying in-process; the lead's reconciliation is a per-turn read, not a row-level lease that --force has to wait on
 
-  @scenario_hash:54d23d628d33d9e5 @bc:shopsystem-messaging
+  @scenario_hash:54d23d628d33d9e5
   Scenario: after shop-msg consume outbox releases the lead-inbox slot, a subsequent BC re-emit (without --force) fires a fresh NOTIFY on the lead's inbox channel so the lead's watch Monitor wakes on the re-emit
     Given a lead shop "shopsystem-product" and a BC "shopsystem-messaging" registered in the messaging registry
     And the BC has previously called "shop-msg respond work_done" for work-id "lead-n05" producing a lead-inbox row and a BC-outbox marker

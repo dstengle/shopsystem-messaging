@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:adr-014 @service:postgres
 Feature: Presence heartbeat collapsed into shop-msg watch (PDR-010 ADR-014)
 
-  @scenario_hash:c4b41c39d58ee2ef @bc:shopsystem-messaging
+  @scenario_hash:c4b41c39d58ee2ef
   Scenario: shop-msg watch --bc <name> UPSERTs a row in bc_presence on the default 30-second cadence carrying the BC name, current timestamp, and a per-process session UUID
   Given a messaging postgres database with a bc_presence table at schema (bc_name TEXT PRIMARY KEY, last_seen_at TIMESTAMPTZ NOT NULL, watch_session_id UUID NOT NULL)
   And NO existing bc_presence row for bc_name "shopsystem-messaging"
@@ -11,7 +12,7 @@ Feature: Presence heartbeat collapsed into shop-msg watch (PDR-010 ADR-014)
   And the UPSERT is keyed on bc_name (PRIMARY KEY), so the row count for bc_name='shopsystem-messaging' remains exactly one regardless of how many ticks have fired
   And the load-bearing property pinned here is that liveness is emitted by the SAME process that holds the LISTEN connection: a wedged watch loop (LISTEN intact but tick loop stalled) is detectable by the lack of recent last_seen_at, which is what the lead's stale/offline classification surfaces
 
-  @scenario_hash:3efb5c9d29f645d9 @bc:shopsystem-messaging
+  @scenario_hash:3efb5c9d29f645d9
   Scenario: shop-msg bc-status reads bc_presence and classifies each BC by age of last_seen_at — online under 90 seconds, stale between 90 seconds and 5 minutes, offline beyond 5 minutes
   Given a messaging postgres database with a bc_presence table containing three rows: (bc_name='bc-fresh', last_seen_at=<now minus 15 seconds>, watch_session_id=<uuid1>); (bc_name='bc-laggy', last_seen_at=<now minus 3 minutes>, watch_session_id=<uuid2>); (bc_name='bc-gone', last_seen_at=<now minus 10 minutes>, watch_session_id=<uuid3>)
   When the lead operator runs "shop-msg bc-status"
@@ -22,7 +23,7 @@ Feature: Presence heartbeat collapsed into shop-msg watch (PDR-010 ADR-014)
   And the threshold boundaries are exact per ADR-014 decision 3: <90s is online (90 itself is NOT online); 90s-5min is stale (300 itself is NOT stale; it is offline); >5min is offline
   And the load-bearing property pinned here is that the lead's session-start drain block can call "shop-msg bc-status" to surface offline BCs BEFORE accepting user work, closing failure mode B from PDR-010
 
-  @scenario_hash:3ff862feef699480 @bc:shopsystem-messaging
+  @scenario_hash:3ff862feef699480
   Scenario: shop-msg watch reconnect after a LISTEN drop resumes ticking on the same cadence and the next tick UPSERTs last_seen_at = now(), with no backfill of missed ticks (gap is informational)
   Given a messaging postgres database with a bc_presence row at (bc_name='shopsystem-messaging', last_seen_at=<now minus 45 seconds>, watch_session_id=<uuid1>)
   And a "shop-msg watch --bc shopsystem-messaging" process whose postgres LISTEN connection has dropped (e.g., postgres restarted, network blip, transient unavailability) and is reconnecting per the lead-tsj reconnect mechanism
@@ -33,7 +34,7 @@ Feature: Presence heartbeat collapsed into shop-msg watch (PDR-010 ADR-014)
   And during the drop interval, the lead's "shop-msg bc-status" classification for shopsystem-messaging may transition from online to stale (and back to online once the tick fires); this transient transition is the expected behavior and is NOT a flap that downstream tooling must specially handle
   And the load-bearing property pinned here is that reconnect-resumes-ticking, no backfill, is the simplest contract that preserves the classification's load-bearing property: <90s online is always derivable from the most recent tick, regardless of gap history
 
-  @scenario_hash:f6488ec56aefa35e @bc:shopsystem-messaging
+  @scenario_hash:f6488ec56aefa35e
   Scenario: when two shop-msg watch processes are running for the same BC, both UPSERT the same bc_presence row keyed on bc_name; watch_session_id records the most recent ticker but is informational; last_seen_at always wins for classification
   Given a messaging postgres database with NO existing bc_presence row for bc_name "shopsystem-messaging"
   And two concurrent "shop-msg watch --bc shopsystem-messaging" processes started independently (e.g., a launcher transition where an old watch has not yet exited and a new one has started), with session UUIDs <uuid-old> and <uuid-new> respectively
@@ -44,7 +45,7 @@ Feature: Presence heartbeat collapsed into shop-msg watch (PDR-010 ADR-014)
   And the lead's "shop-msg bc-status" classifies shopsystem-messaging as "online" based on T2's age, regardless of which watch session ticked it
   And the load-bearing property pinned here is per ADR-014 decision 6: the lead cares only whether ANYONE is watching, not how many; multi-watcher races resolve to "the most recent tick wins" without any flapping or classification ambiguity
 
-  @scenario_hash:1d6a55d8636ccb1d @bc:shopsystem-messaging
+  @scenario_hash:1d6a55d8636ccb1d
   Scenario: shop-msg bc-status --bc <name> returns just that BC's classification and seconds-since-last-seen, with a clear handling for the case where no bc_presence row exists for that BC
   Given a messaging postgres database with bc_presence rows for "bc-one" (last_seen_at=<now minus 20 seconds>) and "bc-two" (last_seen_at=<now minus 4 minutes>)
   And NO bc_presence row exists for "bc-never-watched"

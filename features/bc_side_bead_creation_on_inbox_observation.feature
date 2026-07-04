@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:adr-017
 Feature: BC-side bead creation on inbox observation (PDR-010 ADR-017)
 
-  @scenario_hash:ccffbe96781cd62e @bc:shopsystem-messaging
+  @scenario_hash:ccffbe96781cd62e
   Scenario: shop-msg pending inbox --bc <name> on FIRST observation of an unprocessed inbox row creates a paired BC-side bead whose title is derived from the inbox payload's subject and whose type is derived from the inbox message_type
   Given a BC "shopsystem-messaging" with its own bd registry
   And a lead shop "shopsystem-product" has dispatched a request_bugfix to shopsystem-messaging via shop-msg send, producing a postgres inbox row at (bc=shopsystem-messaging, direction='inbox', work_id='lead-aaa', message_type='request_bugfix') carrying a payload whose description begins with "Fix the consume-asymmetry recovery for lead-nn5f"
@@ -13,7 +14,7 @@ Feature: BC-side bead creation on inbox observation (PDR-010 ADR-017)
   And the BC-side bead's notes contain the cross-reference line "Lead work_id: lead-aaa" per ADR-017 decision 2
   And the load-bearing property pinned here is bead-creation-as-CLI-side-effect per ADR-017's 2026-05-29 revision and ADR-016 decision 2: the agent did NOT run "bd create" by hand; the shop-msg CLI did it as a side effect of pending-inbox observation
 
-  @scenario_hash:217fb948804b29a3 @bc:shopsystem-messaging
+  @scenario_hash:217fb948804b29a3
   Scenario: the BC-side bead's id is in the BC's local bd namespace (NOT keyed on the lead's work_id) and the only cross-reference to the lead is the note "Lead work_id: <lead-X>"
   Given a BC "shopsystem-scenarios" with its own bd registry whose id prefix is "shopsystem-scenarios-"
   And a lead shop "shopsystem-product" has dispatched an assign_scenarios to shopsystem-scenarios producing a postgres inbox row at (bc=shopsystem-scenarios, direction='inbox', work_id='lead-bbb', message_type='assign_scenarios')
@@ -24,7 +25,7 @@ Feature: BC-side bead creation on inbox observation (PDR-010 ADR-017)
   And the BC-side bead's notes do NOT contain any other lead-bd field (no dispatched_to_bc, no scenario_hashes_pinned, no bc_origin_main_commit_at_dispatch — those are lead-side projection per ADR-011 and stay in the lead's bd, not mirrored to the BC bead)
   And the load-bearing property pinned here is per ADR-017 decision 3: the cross-reference between shops is by lead's work_id (carried in the BC bead's notes), NOT by BC bd id; the lead never learns the BC bead id and never needs to
 
-  @scenario_hash:a7ec899eea0f970a @bc:shopsystem-messaging
+  @scenario_hash:a7ec899eea0f970a
   Scenario: re-observation of the same inbox row is idempotent — "shop-msg pending inbox --bc <name>" called multiple times on a row whose BC-side bead has already been created does NOT create a duplicate bead
   Given a BC "shopsystem-messaging" with its own bd registry
   And a postgres inbox row at (bc=shopsystem-messaging, direction='inbox', work_id='lead-ccc', message_type='request_maintenance') has previously been observed by "shop-msg pending inbox --bc shopsystem-messaging", creating a paired BC-side bead with id "shopsystem-messaging-xyz" carrying the cross-reference "Lead work_id: lead-ccc"
@@ -36,7 +37,7 @@ Feature: BC-side bead creation on inbox observation (PDR-010 ADR-017)
   And a third, fourth, fifth observation of the same inbox row similarly leave the bead count and bead state unchanged
   And the load-bearing property pinned here is idempotency on re-observation per ADR-017 decision 1 and ADR-016 decision 2: the CLI's side-effect is bead-creation-on-first-observation-only, with first-observation determined by the presence or absence of an existing BC-side bead carrying the matching "Lead work_id: <work_id>" cross-reference
 
-  @scenario_hash:4dbddc9c5863ebe8 @bc:shopsystem-messaging
+  @scenario_hash:4dbddc9c5863ebe8
   Scenario: shop-msg respond clarify on the BC side updates the BC-side bead's status to blocked with an appended note summarizing the question raised, as a CLI-layer side effect of the same transactional boundary as the outbound emission
   Given a BC "shopsystem-messaging" with its own bd registry
   And a BC-side bead "shopsystem-messaging-xyz" exists with status="open" and cross-reference "Lead work_id: lead-ddd" (created on first observation of the inbox row for work_id="lead-ddd")
@@ -52,7 +53,7 @@ Feature: BC-side bead creation on inbox observation (PDR-010 ADR-017)
   Then the command exits zero and the BC-side bead with cross-reference "Lead work_id: lead-fff" has its status unchanged but a note appended recording the observation per ADR-017 decision 4's mapping (mechanism_observation → unchanged + note)
   And the load-bearing property pinned here is the status-transition contract from ADR-017 decision 4 realized mechanically via ADR-016: clarify→blocked, work_done(complete)→closed, work_done(blocked)→blocked, mechanism_observation→unchanged-with-note; the agent does not run bd update by hand
 
-  @scenario_hash:ad1054bc18951fec @bc:shopsystem-messaging
+  @scenario_hash:ad1054bc18951fec
   Scenario: the lead's bd does NOT acquire any reference to the BC bead's local id; the lead can grep its own bd for "shopsystem-messaging-{nanoid}" and find no matches, because loose cross-shop visibility (PDR-010 decision 4) is preserved
   Given a lead shop "shopsystem-product" with its own bd registry
   And a BC "shopsystem-messaging" with its own bd registry whose id prefix is "shopsystem-messaging-"

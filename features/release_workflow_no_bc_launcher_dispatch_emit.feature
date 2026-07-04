@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:adr-022
 Feature: shopsystem-messaging release workflow declares NO repository_dispatch emit to bc-launcher (ADR-022)
 
   Register parity with shopsystem-scenarios: the no-emit guarantee that
@@ -11,7 +12,7 @@ Feature: shopsystem-messaging release workflow declares NO repository_dispatch e
   comment block contaminated the hash to the wrong 974ee value; the correct
   clean-block register value is fd28deb48a7c75f4.)
 
-  @scenario_hash:fd28deb48a7c75f4 @bc:shopsystem-messaging
+  @scenario_hash:fd28deb48a7c75f4
   Scenario: shopsystem-messaging release workflow declares NO repository_dispatch emit to shopsystem-bc-launcher and references NO BC_LAUNCHER_DISPATCH_TOKEN
     Given the shopsystem-messaging release workflow at ".github/workflows/release.yml"
     And bc-base rebuilds are driven by shopsystem-bc-launcher's own centralized scheduled poll per ADR-022, not by a per-repo repository_dispatch emit

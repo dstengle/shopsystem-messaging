@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:brief-014
 Feature: shop-msg send request_scenario_register — deposit a scenario-register request into a target BC's inbox
 
   The send-vehicle family already deposits lead->BC dispatches into a target
@@ -9,7 +10,7 @@ Feature: shop-msg send request_scenario_register — deposit a scenario-register
   schema — carrying no register entry of its own, and treating omitted
   narrowing as the target BC's full register.
 
-  @scenario_hash:7bc14b8a649e1868 @bc:shopsystem-messaging
+  @scenario_hash:7bc14b8a649e1868
   Scenario: shop-msg send request_scenario_register deposits a well-formed request naming the target bounded context with optional narrowing
     Given an empty BC at a temporary path with no unprocessed inbox messages
     When shop-msg send request_scenario_register is run for work-id "lead-400" naming target bounded context "shopsystem-templates" and supplying a narrowing selector confining the request to feature-area surface "approve-claude"

@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-r8di @service:postgres
 Feature: shop-msg send consults the LIVE bd depends-on graph at send time (PDR-010 / ADR-013 / ADR-018 — lead-r8di regression teeth)
 
-  @scenario_hash:d57229bc3d2de283 @bc:shopsystem-messaging
+  @scenario_hash:d57229bc3d2de283
   Scenario: shop-msg send consults the LIVE bd depends-on graph at send time, so a removed or reclassified edge no longer gates even while the predecessor bead is still open
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -14,7 +15,7 @@ Feature: shop-msg send consults the LIVE bd depends-on graph at send time (PDR-0
     And the command does NOT refuse citing lead-pred, even though lead-pred is still open, because the live depends-on edge that would have gated the send no longer exists
     And the load-bearing property pinned here is that the gate is a function of the LIVE bd dep graph at send time, never a stale persisted dependency snapshot — this is the behavior already required by scenario 48ade065ce073a54 (strict-mode consults bd depends-on edges) extended to the edge-removal / reclassification path
 
-  @scenario_hash:2bb889fc1fe2e4bb @bc:shopsystem-messaging
+  @scenario_hash:2bb889fc1fe2e4bb
   Scenario: the documented bd dep remove cure works end-to-end — removing the depends-on edge then sending deposits the postgres row even though the predecessor bead is never closed
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry

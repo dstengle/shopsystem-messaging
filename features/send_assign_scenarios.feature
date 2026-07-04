@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:brief-001
 Feature: shop-msg send assign_scenarios — lead-side CLI for assigning scenarios
 
-  @scenario_hash:42d2d64c4e45ca7d @bc:shop-msg
+  @scenario_hash:42d2d64c4e45ca7d
   Scenario: Send assign_scenarios with one scenario
     Given an empty BC at a temporary path
     And a scenario body file containing the text "Scenario: Boiling water in Fahrenheit\n    Given a temperature of 100 degrees Celsius\n    When I convert it to Fahrenheit\n    Then I get 212 degrees Fahrenheit"
@@ -8,7 +9,7 @@ Feature: shop-msg send assign_scenarios — lead-side CLI for assigning scenario
     Then the BC's inbox contains a file named "lead-A.yaml"
     And the file parses as a valid AssignScenarios with work_id "lead-A" and one scenario whose hash equals the scenarios-hash of the body
 
-  @scenario_hash:2580fb1745b16844 @bc:shop-msg
+  @scenario_hash:2580fb1745b16844
   Scenario: --scenario-file is repeatable for multi-scenario messages
     Given an empty BC at a temporary path
     And a scenario body file containing the text "Scenario: First\n    Given a\n    When b\n    Then c"
@@ -17,7 +18,7 @@ Feature: shop-msg send assign_scenarios — lead-side CLI for assigning scenario
     Then the BC's inbox contains a file named "lead-B.yaml"
     And the file parses as a valid AssignScenarios with work_id "lead-B" and two scenarios whose hashes are distinct
 
-  @scenario_hash:e8d8c791ce0e0d49 @bc:shop-msg
+  @scenario_hash:e8d8c791ce0e0d49
   Scenario: Refuse to overwrite an existing inbox file for the same work_id
     Given an empty BC at a temporary path
     And the BC's inbox already contains a file named "lead-C.yaml"

@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:brief-014
 Feature: request_scenario_register — request and response message types
 
   A request_scenario_register asks a target bounded context for its scenario
@@ -7,7 +8,7 @@ Feature: request_scenario_register — request and response message types
   explicit set of hashes; the response carries the full per-entry register
   back, unlike the bare-hash completion journal.
 
-  @scenario_hash:5b13b13d2205459b @bc:shopsystem-messaging
+  @scenario_hash:5b13b13d2205459b
   Scenario: A minimal valid request_scenario_register request names the target bounded context and omits narrowing to request that BC's full register
     Given the RequestScenarioRegister request schema from the shop-msg catalog
     When I construct a RequestScenarioRegister request instance supplying only the fields the schema marks as required, naming the target bounded context whose scenario register is sought, and supplying no narrowing selector
@@ -17,7 +18,7 @@ Feature: request_scenario_register — request and response message types
     And the omitted narrowing selector denotes the target bounded context's full register rather than any subset
     And the schema also permits an optional narrowing selector that confines the request to a named feature-area surface or to an explicit set of block-only canonical hashes
 
-  @scenario_hash:9b12f88736c6964f @bc:shopsystem-messaging
+  @scenario_hash:9b12f88736c6964f
   Scenario: A request_scenario_register response carries each register entry's hash, title and text, features/ file location, and live-or-retired status, unlike the bare-hash completion journal
     Given the RequestScenarioRegister response schema from the shop-msg catalog
     When I construct a RequestScenarioRegister response instance whose register-entries field holds two entries, each carrying a block-only canonical hash, the scenario's title and step text, the scenario's file location within the target bounded context's features/ tree, and a status of either live or retired/superseded

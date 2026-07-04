@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-e9x
 Feature: shop-msg respond mechanism_observation — write to lead inbox
 
   # Scenario 950f7c76478e81c9 ("Reply with a mechanism_observation message")

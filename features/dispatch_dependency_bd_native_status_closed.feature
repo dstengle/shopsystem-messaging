@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-fnj5
 Feature: depends-on dispatch gate reads bd-native issue status as authoritative (lead-fnj5)
 
   The depends-on dispatch gate (PDR-010 / ADR-013) decides whether a
@@ -10,7 +11,7 @@ Feature: depends-on dispatch gate reads bd-native issue status as authoritative 
   would queue forever. Cure (a): a predecessor is SATISFIED when its
   bd-native status is "closed", independent of its dispatch_state value.
 
-  @scenario_hash:201cdde6d7a904f8 @bc:shopsystem-messaging
+  @scenario_hash:201cdde6d7a904f8
   Scenario: strict-mode send PASSES against a predecessor that is a closed bd issue but whose dispatch_state was never advanced past consumed
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -23,7 +24,7 @@ Feature: depends-on dispatch gate reads bd-native issue status as authoritative 
     And NO queued lead bd entry "lead-uvw" carrying pending_dependency is created
     And the load-bearing property pinned here is that bd-native status=closed is the authoritative satisfaction signal for the depends-on gate, independent of the dispatch_state metadata projection
 
-  @scenario_hash:633d89099ae58022 @bc:shopsystem-messaging
+  @scenario_hash:633d89099ae58022
   Scenario: --queue-on-dependency does NOT queue against a closed bd issue predecessor whose dispatch_state was never advanced past consumed; it dispatches normally
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry

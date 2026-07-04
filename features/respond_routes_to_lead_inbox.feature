@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-e9x
 Feature: BC responses route to the lead inbox — Brief 006 scope C, D, E (lead-e9x)
 
-  @scenario_hash:f182b6f7d5de6662 @bc:shopsystem-messaging
+  @scenario_hash:f182b6f7d5de6662
   Scenario: BC respond work_done delivers the response to the lead inbox
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry
@@ -9,7 +10,7 @@ Feature: BC responses route to the lead inbox — Brief 006 scope C, D, E (lead-
     Then the command exits zero
     And shop-msg pending inbox --lead shopsystem-product includes work-id "lead-901"
 
-  @scenario_hash:1de11038b968b967 @bc:shopsystem-messaging
+  @scenario_hash:1de11038b968b967
   Scenario: BC respond work_done response appears in the lead inbox via read inbox --lead
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry
@@ -19,7 +20,7 @@ Feature: BC responses route to the lead inbox — Brief 006 scope C, D, E (lead-
     Then the command exits zero
     And stdout includes message_type "work_done" and work_id "lead-902"
 
-  @scenario_hash:58af16b95c5fd8f8 @bc:shopsystem-messaging
+  @scenario_hash:58af16b95c5fd8f8
   Scenario: shop-msg watch --lead fires when a BC executes shop-msg respond
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry

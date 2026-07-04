@@ -1,10 +1,11 @@
+@bc:shopsystem-messaging @origin:lead-2id
 Feature: shop-msg respond --force makes the new payload the surviving response (lead-2id fidelity)
 
   # The defect that motivated lead-2id was that the degraded response stayed
   # delivered and the real one never landed. --force must invert that: after
   # --force, `shop-msg read inbox --lead` returns the NEW payload, not the old.
 
-  @scenario_hash:33663625b12f56fd @bc:shopsystem-messaging
+  @scenario_hash:33663625b12f56fd
   Scenario: respond work_done --force replacement is what read inbox --lead returns
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry

@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-bppa @service:postgres
 Feature: bc-status reads a live heartbeating watch as online end-to-end
 
-  @scenario_hash:e7c14f54c3100ce5 @bc:shopsystem-messaging
+  @scenario_hash:e7c14f54c3100ce5
   Scenario: a live connected shop-msg watch whose heartbeat tick is current is reported online by shop-msg bc-status end-to-end, and offline only when no current heartbeat exists
   Given a messaging postgres database with a bc_presence table at schema (bc_name TEXT PRIMARY KEY, last_seen_at TIMESTAMPTZ NOT NULL, watch_session_id UUID NOT NULL)
   And NO existing bc_presence row for bc_name "shopsystem-live"

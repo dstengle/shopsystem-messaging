@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-2id
 Feature: shop-msg respond --force replaces an existing lead-inbox response (lead-2id recovery path)
 
   # lead-2id: a BC that emitted a degraded response and tried to recover via
@@ -6,7 +7,7 @@ Feature: shop-msg respond --force replaces an existing lead-inbox response (lead
   # the existing (bc=lead_root, direction='inbox', work_id, message_type) row in
   # the same transaction as the replacement INSERT.
 
-  @scenario_hash:608873365b92b50d @bc:shopsystem-messaging
+  @scenario_hash:608873365b92b50d
   Scenario: respond work_done --force succeeds when a prior work_done lead-inbox row exists
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry
@@ -15,7 +16,7 @@ Feature: shop-msg respond --force replaces an existing lead-inbox response (lead
     When shop-msg respond work_done --force is run by "shopsystem-messaging" for work-id "lead-f01" with summary "forced-replacement"
     Then the command exits zero
 
-  @scenario_hash:399c36167e10f471 @bc:shopsystem-messaging
+  @scenario_hash:399c36167e10f471
   Scenario: respond clarify --force succeeds when a prior clarify lead-inbox row exists
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry
@@ -24,7 +25,7 @@ Feature: shop-msg respond --force replaces an existing lead-inbox response (lead
     When shop-msg respond clarify --force is run by "shopsystem-messaging" for work-id "lead-f02" with question "second question"
     Then the command exits zero
 
-  @scenario_hash:3d85417a21ba4db0 @bc:shopsystem-messaging
+  @scenario_hash:3d85417a21ba4db0
   Scenario: respond mechanism_observation --force succeeds when a prior mechanism_observation lead-inbox row exists
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry
