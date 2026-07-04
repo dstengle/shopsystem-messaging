@@ -12706,14 +12706,16 @@ def rsr_schema_permits_optional_narrowing(rsr_request_cls, context: dict) -> Non
     assert by_area.narrowing is not None
     assert by_area.narrowing.feature_area == "messaging"
     # Or confining to an explicit set of block-only canonical hashes:
+    # RegisterNarrowing.hashes is a JSON-serializable ORDERED LIST, not a set
+    # (a set crashes insert_message's json.dumps on the wire — lead-jo9p).
     by_hashes = rsr_request_cls(
         message_type="request_scenario_register",
         work_id="lead-rsr-hashes",
         target_bc="shopsystem-scenarios",
-        narrowing=RegisterNarrowing(hashes={"h1", "h2"}),
+        narrowing=RegisterNarrowing(hashes=["h1", "h2"]),
     )
     assert by_hashes.narrowing is not None
-    assert by_hashes.narrowing.hashes == {"h1", "h2"}
+    assert by_hashes.narrowing.hashes == ["h1", "h2"]
 
 
 # --- Behavior B: response schema with required per-entry register fields ----
@@ -14228,7 +14230,11 @@ def then_stored_work_done_carries_nonempty_no_empty(
 # the target bounded context with optional narrowing.
 # ---------------------------------------------------------------------------
 def _run_send_request_scenario_register(
-    bc_root: Path, work_id: str, target_bc: str, feature_area: str | None
+    bc_root: Path,
+    work_id: str,
+    target_bc: str,
+    feature_area: str | None,
+    hashes: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     argv = [
         "shop-msg",
@@ -14240,6 +14246,8 @@ def _run_send_request_scenario_register(
     ]
     if feature_area is not None:
         argv += ["--feature-area", feature_area]
+    for h in hashes or []:
+        argv += ["--hash", h]
     return subprocess.run(argv, capture_output=True, text=True)
 
 
@@ -14262,6 +14270,36 @@ def run_send_rsr_with_narrowing(
     context["cli_stderr"] = result.stderr
     context["rsr_target_bc"] = target_bc
     context["rsr_feature_area"] = feature_area
+
+
+@when(
+    parsers.re(
+        r'shop-msg send request_scenario_register is run for work-id '
+        r'"(?P<work_id>[^"]*)" naming target bounded context '
+        r'"(?P<target_bc>[^"]*)" and supplying a narrowing selector confining '
+        r'the request to an explicit set of three block-only canonical hashes '
+        r'"(?P<h1>[^"]*)", "(?P<h2>[^"]*)" and "(?P<h3>[^"]*)"$'
+    )
+)
+def run_send_rsr_with_hash_set_narrowing(
+    bc_root: Path,
+    work_id: str,
+    target_bc: str,
+    h1: str,
+    h2: str,
+    h3: str,
+    context: dict,
+) -> None:
+    hashes = [h1, h2, h3]
+    result = _run_send_request_scenario_register(
+        bc_root, work_id, target_bc, None, hashes=hashes
+    )
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    context["rsr_target_bc"] = target_bc
+    context["rsr_feature_area"] = None
+    context["rsr_expected_hashes"] = hashes
 
 
 @then(
@@ -14329,6 +14367,75 @@ def rsr_carries_narrowing_no_register_entry(bc_root: Path, context: dict) -> Non
     )
     # No register entry of its own: the request schema has no register_entries
     # field at all, so the raw payload must not smuggle one in.
+    assert "register_entries" not in payload, (
+        "a request_scenario_register must carry NO register entry of its own; "
+        f"payload had register_entries={payload.get('register_entries')!r}"
+    )
+
+
+@then(
+    parsers.re(
+        r'that deposited message serialized without error and validates against '
+        r'the RequestScenarioRegister request schema and names target bounded '
+        r'context "(?P<target_bc>[^"]*)"$'
+    )
+)
+def rsr_serialized_without_error_validates_names_target(
+    bc_root: Path, target_bc: str, context: dict
+) -> None:
+    import json
+
+    from catalog.schemas import RequestScenarioRegister
+
+    # The row exists at all only if `shop-msg send` did not crash on the
+    # set-serialization TypeError at insert_message's json.dumps(payload). Assert
+    # the deposited payload is itself JSON-serializable (the bug's fingerprint).
+    payload = context["rsr_deposited_payload"]
+    try:
+        json.dumps(payload)
+    except TypeError as exc:  # pragma: no cover - failure path is the bug
+        raise AssertionError(
+            "the deposited request_scenario_register payload must be "
+            f"JSON-serializable without error; json.dumps raised: {exc}"
+        ) from exc
+    msg = RequestScenarioRegister(**payload)
+    assert msg.message_type == "request_scenario_register"
+    assert msg.target_bc == target_bc, (
+        f"expected target_bc {target_bc!r}; got {msg.target_bc!r}"
+    )
+
+
+@then(
+    "the deposited message carries the supplied narrowing selector as a "
+    "JSON-serializable list of exactly those three block-only canonical hashes "
+    "and no register entry of its own"
+)
+def rsr_carries_narrowing_hash_list_no_register_entry(
+    bc_root: Path, context: dict
+) -> None:
+    from catalog.schemas import RequestScenarioRegister
+
+    payload = context["rsr_deposited_payload"]
+    msg = RequestScenarioRegister(**payload)
+    assert msg.narrowing is not None, (
+        "expected the deposited message to carry the supplied narrowing selector"
+    )
+    # The narrowing selector must carry the three hashes as a JSON-serializable
+    # LIST (not a set) preserving the supplied order.
+    raw_hashes = payload["narrowing"]["hashes"]
+    assert isinstance(raw_hashes, list), (
+        "expected the deposited narrowing selector's hashes to be a "
+        f"JSON-serializable list; got {type(raw_hashes).__name__}: {raw_hashes!r}"
+    )
+    assert raw_hashes == context["rsr_expected_hashes"], (
+        "expected the narrowing selector to carry exactly the three supplied "
+        f"hashes in order {context['rsr_expected_hashes']!r}; got {raw_hashes!r}"
+    )
+    assert msg.narrowing.hashes == context["rsr_expected_hashes"], (
+        "expected the model's narrowing.hashes to be the three supplied hashes "
+        f"in order {context['rsr_expected_hashes']!r}; got {msg.narrowing.hashes!r}"
+    )
+    # No register entry of its own.
     assert "register_entries" not in payload, (
         "a request_scenario_register must carry NO register entry of its own; "
         f"payload had register_entries={payload.get('register_entries')!r}"
