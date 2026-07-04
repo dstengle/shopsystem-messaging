@@ -1,4 +1,4 @@
-@bc:shopsystem-messaging @origin:adr-019
+@bc_internal @bc:shopsystem-messaging @origin:adr-019
 Feature: shop-msg computes scenario-block-only canonical hashes (ADR-019)
 
   The canonical hash text for a scenario block is scenario-block-only: the
