@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-e9x
 Feature: shop-msg pending outbox — superseded under lead-e9x
 
   # Scenarios b98f9d7c3f61435f and e6be1372adadc5e3 asserted that

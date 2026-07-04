@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-ox8
 Feature: clarify_response — in-band answer that re-opens the original dispatch (lead-ox8)
 
-  @scenario_hash:f5819af74da50561 @bc:shopsystem-messaging
+  @scenario_hash:f5819af74da50561
   Scenario: shop-msg send clarify_response delivers an in-band answer that re-opens the original dispatch on the SAME work_id for the BC's gated loop to consume
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -12,7 +13,7 @@ Feature: clarify_response — in-band answer that re-opens the original dispatch
     And the original assign_scenarios dispatch for work_id "lead-700" is RE-OPENED for the BC's gated loop to resume on the SAME work_id "lead-700" — no new work_id and no new bead are created
     And the resolution text "use BROKER_HOST" is readable by the BC via "shop-msg pending inbox" against work_id "lead-700"
 
-  @scenario_hash:eb96e352471ffd35 @bc:shopsystem-messaging
+  @scenario_hash:eb96e352471ffd35
   Scenario: the clarify_response row COEXISTS with the original dispatch row on the same (bc, work_id) and does NOT overwrite it (allow_multi_type)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -25,7 +26,7 @@ Feature: clarify_response — in-band answer that re-opens the original dispatch
     And both the request_bugfix row and the clarify_response row are independently present at direction='inbox' for the same (bc=shopsystem-messaging, work_id="lead-701"), distinguished by their message_type discriminator
     And the load-bearing property pinned here is that clarify_response opts into allow_multi_type so it COEXISTS with the dispatch row rather than colliding against the one-row-per-(bc,work_id,message_type) invariant
 
-  @scenario_hash:6c23bb777bab93df @bc:shopsystem-messaging
+  @scenario_hash:6c23bb777bab93df
   Scenario: shop-msg send clarify_response is REFUSED when no prior BC clarify exists on that (bc, work_id) — a clarify_response with nothing to answer is operator error
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -37,7 +38,7 @@ Feature: clarify_response — in-band answer that re-opens the original dispatch
     And the original assign_scenarios dispatch for work_id "lead-702" is unchanged and is NOT re-opened
     And the load-bearing property pinned here is that clarify_response is valid ONLY as the answer to an outstanding clarify; the precondition is enforced at the CLI surface
 
-  @scenario_hash:460c5e0cc666fef8 @bc:shopsystem-messaging
+  @scenario_hash:460c5e0cc666fef8
   Scenario: shop-msg send clarify_response carries NO scenario payload — the absence of scenario state mechanically forces scope-changing answers to re-dispatch (the bounding constraint)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry

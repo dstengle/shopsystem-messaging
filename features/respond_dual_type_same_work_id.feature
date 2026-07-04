@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-e9x
 Feature: BC emits cross-type multi-response for same work_id
 
-  @scenario_hash:6a248f3acc515bb3 @bc:shopsystem-messaging
+  @scenario_hash:6a248f3acc515bb3
   Scenario: A BC emitting both work_done and mechanism_observation for the same work_id delivers both responses to the lead inbox
   Given "shopsystem-product" is registered as the lead shop
   And "shopsystem-messaging" is registered in the messaging registry

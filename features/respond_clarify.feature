@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-e9x
 Feature: shop-msg respond — write a clarify response to the lead inbox
 
   # Scenario b9ed9c63b8ccb208 ("Reply to lead with a clarify message") previously

@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-7w0w
 Feature: shop-msg respond work_done — reject a blank scenario-hash and confirm a valid emit on stdout
 
-  @scenario_hash:a2d05a918db02efd @bc:shopsystem-messaging
+  @scenario_hash:a2d05a918db02efd
   Scenario: shop-msg respond work_done rejects a blank scenario-hash and confirms a valid emit on stdout
     Given an empty BC at a temporary path
     And an inbox message with work-id "lead-300" has been sent to that BC

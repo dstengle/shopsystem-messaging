@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-9xrd
 Feature: shop-msg retract inbox
 
-  @scenario_hash:79bc74e7e730bb67 @bc:shopsystem-messaging
+  @scenario_hash:79bc74e7e730bb67
 Scenario: Retracting a still-pending inbox dispatch removes it so the BC will not process it
   Given "shopsystem-product" is registered in the messaging registry as the lead shop
   And a BC "shopsystem-messaging" is registered in the messaging registry
@@ -14,7 +15,7 @@ Scenario: Retracting a still-pending inbox dispatch removes it so the BC will no
   And a re-run of shop-msg retract inbox --bc shopsystem-messaging --work-id lead-r01 --message-type request_maintenance exits zero leaving "lead-r01" absent from shop-msg pending inbox --bc shopsystem-messaging
   And the retraction is recorded against the (bc=shopsystem-messaging, work_id=lead-r01, message_type=request_maintenance) triple in the messaging audit trail
 
-  @scenario_hash:bbe6bda4dacb9633 @bc:shopsystem-messaging
+  @scenario_hash:bbe6bda4dacb9633
 Scenario: Retracting an inbox dispatch the BC has already consumed is refused and leaves the consumed deposit intact
   Given "shopsystem-product" is registered in the messaging registry as the lead shop
   And a BC "shopsystem-messaging" is registered in the messaging registry

@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:adr-013
 Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR-013)
 
-  @scenario_hash:48ade065ce073a54 @bc:shopsystem-messaging
+  @scenario_hash:48ade065ce073a54
   Scenario: shop-msg send in strict mode (default) consults bd depends-on edges before deposit and refuses the send when a predecessor is not at dispatch_state=closed
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -13,7 +14,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And NO lead bd entry "lead-bbb" is created (no bd-side dispatch_state mutation; no partial state at all)
     And the load-bearing property pinned here is total refusal — strict-mode rejection MUST leave no postgres artifact and no bd artifact, so re-running after the predecessor closes is the same as running for the first time
 
-  @scenario_hash:e7b04e158d78c858 @bc:shopsystem-messaging
+  @scenario_hash:e7b04e158d78c858
   Scenario: shop-msg send with --queue-on-dependency writes a lead bd entry at dispatch_state=outbox_pending with pending_dependency=<predecessor_work_id> and does NOT deposit a postgres row
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -27,7 +28,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And the bd entry's queued-mode write is a single atomic unit per ADR-012's atomicity protocol: the bd metadata is written via "bd create --metadata" with all fields in one payload
     And the load-bearing property pinned here is that the queued intent is durable in bd alone, survives /compact and session boundaries, and is observable via "bd show lead-ddd"
 
-  @scenario_hash:0aa568d27fe0a04a @bc:shopsystem-messaging
+  @scenario_hash:0aa568d27fe0a04a
   Scenario: closing a predecessor bead via bd close triggers a promote scan that deposits the queued dependent's postgres row and flips its dispatch_state from outbox_pending to dispatched
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -40,7 +41,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And the promote scan clears the pending_dependency field via "bd update --unset-metadata pending_dependency"
     And the load-bearing property pinned here is that closure of a predecessor is the trigger event for promote; the queued dispatch does NOT need a separate operator step to fire after the predecessor closes
 
-  @scenario_hash:7da5c251f049ccd5 @bc:shopsystem-messaging
+  @scenario_hash:7da5c251f049ccd5
   Scenario: the promote scan is idempotent — repeated invocations on the same closing bead leave the same final state (no double-deposit, no spurious bd flip on already-promoted entries)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -52,7 +53,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And a queued dependent "lead-iii" whose other depends-on edges are still NOT all closed (e.g., depends on lead-ggg AND lead-jjj where lead-jjj remains open) is NOT promoted on this scan, and remains at dispatch_state="outbox_pending" with pending_dependency cleared for lead-ggg but still set for any other open predecessor
     And the load-bearing property pinned here is idempotency under ADR-013 decision 6: multiple promote invocations leave the same final state — each queued dispatch either becomes live (exactly once) or remains queued (if other predecessors are still open)
 
-  @scenario_hash:947050ad4f0c42ba @bc:shopsystem-messaging
+  @scenario_hash:947050ad4f0c42ba
   Scenario: cross-BC dispatch dependencies are first-class — lead-X dispatched to BC A may depend on lead-Y dispatched to BC B, with both edges living in lead bd and both legs visible to shop-msg send and to the promote scan
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And two BCs "shopsystem-scenarios" and "shopsystem-messaging" registered in the messaging registry
@@ -66,7 +67,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And when "lead-kkk" later closes, the promote scan deposits the postgres outbox row for "lead-lll" against the BC "shopsystem-messaging" (the BC named on the queued entry, NOT the BC of the predecessor)
     And the load-bearing property pinned here is that cross-BC sequencing is FIRST-CLASS per ADR-013 decision 7: both edges live in lead bd, no BC-side coordination is required, and the lead remains the sole holder of the cross-BC sequence (per PDR-010 decision 4's loose-cross-shop-visibility model)
 
-  @scenario_hash:09e59dc534b1b4dd @bc:shopsystem-messaging
+  @scenario_hash:09e59dc534b1b4dd
   Scenario: bd dep add rejects a cycle — if adding a depends-on edge would close a cycle in the depends-on graph (e.g., lead-X depends on lead-Y, lead-Y depends on lead-X), the operation is refused (adversarial — graph acyclicity enforcement)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a lead bd entry "lead-mmm" exists
@@ -81,7 +82,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And per ADR-013 decision 8, acyclicity is enforced on the bd side; shop-msg send does NOT need to re-check at dispatch time, because the depends-on graph is invariantly acyclic by construction
     And the load-bearing property pinned here is that the bd-side cycle-rejection contract is what makes shop-msg send's introspection step safe from infinite-loop pathology: shop-msg send walks the graph trusting it is a DAG — the participant-naming detail in bd's error text is UX, NOT the architectural property pinned here
 
-  @scenario_hash:6b3559d0bf3141ff @bc:shopsystem-messaging
+  @scenario_hash:6b3559d0bf3141ff
   Scenario: a parent-child epic-container edge to an open epic does NOT gate dispatch — only true depends-on / blocks edges gate (PDR-010 ADR-013 decision 4 tightening)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -93,7 +94,7 @@ Feature: Dispatch dependencies via bd dep, honored by shop-msg send (PDR-010 ADR
     And a postgres outbox row at (bc=shopsystem-messaging, direction='outbox', work_id='lead-rch', message_type='request_bugfix') IS inserted
     And the load-bearing property pinned here is that a parent-child epic-container edge is EXCLUDED from the gating-predecessor set: an epic is open by design for its whole work-stream, so gating on its parent-child edge would make every child permanently undispatchable
 
-  @scenario_hash:a326c2f50eeceed4 @bc:shopsystem-messaging
+  @scenario_hash:a326c2f50eeceed4
   Scenario: shop-msg sweep does NOT promote a queued bead whose predecessor is still open
     Given a lead bd entry "lead-ppp" at dispatch_state=outbox_pending with pending_dependency="lead-qqq" and an outbox_pending_at older than the sweep threshold
     And lead-qqq is NOT at dispatch_state=closed

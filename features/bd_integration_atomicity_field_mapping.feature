@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:pdr-010
 Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 foundation, ADR-011 + ADR-012 + ADR-016)
 
   # lead-tuu5: shop-msg owns the bd integration (field mapping, atomicity,
@@ -8,7 +9,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
   # wire/disk divergence. Scenario bodies are reproduced verbatim from the
   # lead-tuu5 dispatch.
 
-  @scenario_hash:e73037244a92b1a4 @bc:shopsystem-messaging
+  @scenario_hash:e73037244a92b1a4
   Scenario: shop-msg send creates a lead bd entry carrying the canonical field set encoded as bd structured metadata, not as free-form notes
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry with a clone at "repos/shopsystem-messaging/" whose origin/main HEAD SHA is "b14b0ba"
@@ -20,7 +21,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And no "## Dispatch state" prose block has been written to the bead's notes (ADR-011 explicitly removes this prose fallback)
     And the load-bearing property pinned here is that strategic queries against the lead bd ("what is in-flight to shopsystem-messaging right now") read structured metadata and do NOT need to parse prose
 
-  @scenario_hash:8edfb82fc6a07184 @bc:shopsystem-messaging
+  @scenario_hash:8edfb82fc6a07184
   Scenario: shop-msg send follows the bd-first 3-step protocol — bd entry written at outbox_pending with fsync, then postgres deposit, then bd flip to dispatched
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -32,7 +33,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And the command exits zero only after Step 3 succeeds; observable to the caller as the report-complete signal
     And the load-bearing property pinned here is that the bd intent at Step 1 is durable on disk (via fsync) BEFORE any postgres write happens, so a crash between Steps 1 and 2 leaves a recoverable bd record of intent — the recovery premise the sweeper depends on
 
-  @scenario_hash:ea2d453f88110e82 @bc:shopsystem-messaging
+  @scenario_hash:ea2d453f88110e82
   Scenario: shop-msg send records dispatch state onto an already-existing work_id bead as a strict additive metadata-and-notes-only patch, never overwriting the bead's title, type, priority, or description
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -44,7 +45,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And the only changes applied to "lead-xyz" are additive: dispatch metadata keys dispatched_to_bc="shopsystem-messaging", dispatch_message_type="request_bugfix", dispatch_state="dispatched", and scenario_hashes_pinned="abc123def456abcd" are added or updated, and dispatch notes are appended, with no other field mutated
     And the load-bearing property pinned here is that when the work_id bead pre-exists (the normal lead-shop case, since the work_id is a pre-existing lead bead), the shop-msg bd write is a strict additive metadata/notes-only patch — the Step-1 write detects the existing bead and patches it rather than clobbering identity fields via an upserting "bd create --metadata"
 
-  @scenario_hash:9b96bf9183d8e899 @bc:shopsystem-messaging
+  @scenario_hash:9b96bf9183d8e899
   Scenario: shop-msg sweep recovers a lead bd entry stuck at dispatch_state=outbox_pending by reconciling against the actual postgres state (deposit-already-landed case becomes a bd-flip-only recovery)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -58,7 +59,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And a second invocation of "shop-msg sweep --shop shopsystem-product" leaves the bd state and the postgres state byte-for-byte unchanged (idempotency)
     And the load-bearing property pinned here is that the sweeper's reconciliation rule is shop-msg-wins for "was the message sent" (per PDR-010 decision 3): the postgres row's existence is the authoritative answer, and bd is corrected to match
 
-  @scenario_hash:e357dd49f591da22 @bc:shopsystem-messaging
+  @scenario_hash:e357dd49f591da22
   Scenario: shop-msg sweep recovers a lead bd entry stuck at dispatch_state=outbox_pending by retrying the postgres deposit (deposit-never-landed case becomes a re-deposit recovery)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -72,7 +73,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And the deposit retry is guarded against double-write by the postgres schema's uniqueness constraint on (work_id, direction, shop): if a concurrent sweep had already deposited, the second deposit fails the uniqueness check and the sweeper proceeds to the bd flip without error
     And the load-bearing property pinned here is that bd intent at Step 1 carries enough information to reconstruct the postgres deposit, so a crash before Step 2 is fully recoverable
 
-  @scenario_hash:fcdd854bfba8f2a2 @bc:shopsystem-messaging
+  @scenario_hash:fcdd854bfba8f2a2
   Scenario: shop-msg consume outbox transitions the lead bd entry's dispatch_state to consumed as a CLI-layer side effect, with no separate agent step required
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry
@@ -85,7 +86,7 @@ Feature: shop-msg owns bd integration with atomicity and field mapping (PDR-010 
     And the agent who ran "shop-msg consume outbox" did NOT need to also run "bd update --set-metadata dispatch_state=consumed lead-mno" as a follow-up: the CLI handled both the messaging-layer release and the bd-layer status flip under a single atomicity boundary
     And the load-bearing property pinned here is the ADR-016 principle: integration logic lives in the shop-msg CLI, not in agent procedure; the agent invokes one command and the CLI performs both the messaging action and the paired bd update
 
-  @scenario_hash:ae6de8a9b312aada @bc:shopsystem-messaging
+  @scenario_hash:ae6de8a9b312aada
   Scenario: when shop-msg send's postgres deposit fails after the bd write at Step 1 succeeds, the lead bd entry remains at dispatch_state=outbox_pending (NOT silently flipped to dispatched) so the sweeper can recover (adversarial — atomicity protocol enforcement)
     Given a lead shop "shopsystem-product" registered as the lead in the messaging registry
     And a BC "shopsystem-messaging" registered in the messaging registry

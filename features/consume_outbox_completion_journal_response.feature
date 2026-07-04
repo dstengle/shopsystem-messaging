@@ -1,6 +1,7 @@
+@bc:shopsystem-messaging @origin:lead-ay7j
 Feature: shop-msg consume outbox drains a request_completion_journal_response row
 
-  @scenario_hash:e45c01a40e4e4cbe @bc:shopsystem-messaging
+  @scenario_hash:e45c01a40e4e4cbe
   Scenario: shop-msg consume outbox accepts message-type request_completion_journal_response and drains the matching outbox row from pending outbox
     Given "shopsystem-product" is registered as the lead shop in the messaging registry
     And "bc-launcher" is registered in the messaging registry

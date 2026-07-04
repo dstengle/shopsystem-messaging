@@ -1,3 +1,4 @@
+@bc:shopsystem-messaging @origin:lead-b3z
 Feature: shop-msg respond collision error names the existing message_type and mentions --force (lead-b3z)
 
   # lead-b3z: the prior collision error named only the work_id. A BC seeing it
@@ -5,7 +6,7 @@ Feature: shop-msg respond collision error names the existing message_type and me
   # the recovery path. The upgraded error names the existing row's message_type
   # and references --force.
 
-  @scenario_hash:bebe85d1da935657 @bc:shopsystem-messaging
+  @scenario_hash:bebe85d1da935657
   Scenario: collision without --force names the existing message_type and mentions --force
     Given "shopsystem-product" is registered as the lead shop
     And "shopsystem-messaging" is registered in the messaging registry
