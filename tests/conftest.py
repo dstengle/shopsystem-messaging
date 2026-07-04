@@ -12706,14 +12706,16 @@ def rsr_schema_permits_optional_narrowing(rsr_request_cls, context: dict) -> Non
     assert by_area.narrowing is not None
     assert by_area.narrowing.feature_area == "messaging"
     # Or confining to an explicit set of block-only canonical hashes:
+    # RegisterNarrowing.hashes is a JSON-serializable ORDERED LIST, not a set
+    # (a set crashes insert_message's json.dumps on the wire — lead-jo9p).
     by_hashes = rsr_request_cls(
         message_type="request_scenario_register",
         work_id="lead-rsr-hashes",
         target_bc="shopsystem-scenarios",
-        narrowing=RegisterNarrowing(hashes={"h1", "h2"}),
+        narrowing=RegisterNarrowing(hashes=["h1", "h2"]),
     )
     assert by_hashes.narrowing is not None
-    assert by_hashes.narrowing.hashes == {"h1", "h2"}
+    assert by_hashes.narrowing.hashes == ["h1", "h2"]
 
 
 # --- Behavior B: response schema with required per-entry register fields ----

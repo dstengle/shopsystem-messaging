@@ -417,18 +417,22 @@ class RegisterNarrowing(BaseModel):
       - an explicit set of block-only canonical hashes (``hashes``).
 
     Both fields are individually optional so a caller may narrow by area, by an
-    explicit hash set, or (degenerately) by neither; the meaningful confinement
-    is supplied by whichever field the caller populates. Set semantics on
-    ``hashes`` de-duplicate and drop ordering, matching the bare-hash set form
-    used elsewhere in the catalog (RequestCompletionJournalResponse).
+    explicit list of hashes, or (degenerately) by neither; the meaningful
+    confinement is supplied by whichever field the caller populates.
+
+    ``hashes`` is an ORDERED LIST, not a set: the wire form of this message is
+    JSON (deposited via ``insert_message``'s ``json.dumps(payload)``), and a
+    Python ``set`` is not JSON-serializable — a set field crashes the send path
+    with ``TypeError: Object of type set is not JSON serializable`` (lead-jo9p).
+    A list serializes cleanly and preserves the caller's supplied order.
     """
     model_config = ConfigDict(extra="forbid")
 
     # A named feature-area surface to confine the request to. Optional.
     feature_area: str | None = Field(default=None, min_length=1)
-    # An explicit set of block-only canonical hashes to confine the request to.
-    # A set (not a list): order is not significant and duplicates collapse.
-    hashes: set[str] | None = Field(default=None)
+    # An explicit list of block-only canonical hashes to confine the request to.
+    # A list (not a set): JSON-serializable on the wire and order-preserving.
+    hashes: list[str] | None = Field(default=None)
 
 
 class RequestScenarioRegister(BaseModel):

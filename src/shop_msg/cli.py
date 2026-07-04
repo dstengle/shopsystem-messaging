@@ -1183,7 +1183,9 @@ def _cmd_send_request_scenario_register(args: argparse.Namespace) -> int:
         if feature_area is not None or hashes:
             narrowing = RegisterNarrowing(
                 feature_area=feature_area,
-                hashes=set(hashes) or None,
+                # A JSON-serializable list preserving the supplied --hash order;
+                # a set would crash insert_message's json.dumps (lead-jo9p).
+                hashes=hashes or None,
             )
         message = RequestScenarioRegister(
             message_type="request_scenario_register",
