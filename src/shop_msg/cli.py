@@ -110,7 +110,9 @@ from catalog.schemas import (
     RequestCompletionJournalResponse,
     RequestMaintenance,
     RequestScenarioRegister,
+    RequestScenarioRegisterResponse,
     RegisterNarrowing,
+    ScenarioRegisterEntry,
     ScenarioPayload,
     WorkDone,
     _nudge_payload_rejects_scenario_state,
@@ -824,6 +826,95 @@ def _cmd_respond_request_completion_journal(args: argparse.Namespace) -> int:
         ) or "request_completion_journal_response"
         print(
             f"shop-msg respond request_completion_journal: refusing to "
+            f"overwrite existing {existing} response for "
+            f"work_id={args.work_id!r} (use --force to replace)",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
+def _cmd_respond_request_scenario_register(args: argparse.Namespace) -> int:
+    """`shop-msg respond request_scenario_register` (lead-d5oj).
+
+    The BC's response to a request_scenario_register: it carries the target
+    BC's scenario register back to the requester as a LIST of per-entry
+    records. Unlike the bare-hash completion-journal respond, each register
+    entry carries five fields — block-only canonical hash, scenario title,
+    step text, features/ file location, and live-or-retired status — supplied
+    as one repeatable ``--entry`` flag whose value is a JSON object. Delivered
+    into the requester (lead) inbox via insert_bc_response under the
+    ``request_scenario_register_response`` message_type.
+    """
+    refusal = _refuse_lead_side_respond("request_scenario_register")
+    if refusal is not None:
+        return refusal
+
+    bc_root = _resolve_bc(args)
+
+    if "/" in args.work_id or ".." in args.work_id or not args.work_id:
+        print(
+            f"shop-msg respond request_scenario_register: refusing unsafe "
+            f"work_id {args.work_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    lead_root = _resolve_registered_lead()
+    if lead_root is None:
+        print(
+            "shop-msg respond request_scenario_register: no lead shop is "
+            "registered in the registry. Run 'shop-msg registry add "
+            "--lead-shop' to register the lead first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    import json
+
+    entries: list[ScenarioRegisterEntry] = []
+    for raw in args.entry or []:
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(
+                f"shop-msg respond request_scenario_register: --entry is not "
+                f"valid JSON: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            entries.append(ScenarioRegisterEntry(**obj))
+        except ValidationError as exc:
+            print(
+                f"shop-msg respond request_scenario_register: invalid register "
+                f"entry: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    message = RequestScenarioRegisterResponse(
+        message_type="request_scenario_register_response",
+        work_id=args.work_id,
+        register_entries=entries,
+    )
+
+    try:
+        insert_bc_response(
+            lead_root,
+            bc_root,
+            args.work_id,
+            "request_scenario_register_response",
+            message.model_dump(mode="json"),
+            force=getattr(args, "force", False),
+        )
+    except CollisionError:
+        existing = existing_lead_inbox_message_type(
+            lead_root, args.work_id, "request_scenario_register_response"
+        ) or "request_scenario_register_response"
+        print(
+            f"shop-msg respond request_scenario_register: refusing to "
             f"overwrite existing {existing} response for "
             f"work_id={args.work_id!r} (use --force to replace)",
             file=sys.stderr,
@@ -2750,6 +2841,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rcj_resp.set_defaults(
         func=_cmd_respond_request_completion_journal, _cwd_resolves=True
+    )
+
+    rsr_resp = respond_sub.add_parser(
+        "request_scenario_register",
+        help=(
+            "write a request_scenario_register response carrying the BC's "
+            "scenario register as a list of per-entry records (lead-d5oj)"
+        ),
+    )
+    _rsr_resp_mode = rsr_resp.add_mutually_exclusive_group(required=False)
+    _rsr_resp_mode.add_argument(
+        "--bc", default=None,
+        help=(
+            "canonical BC name. Optional: when omitted the shop is resolved "
+            "from CWD via .claude/shop/ marker walk-up (PDR-008)."
+        ),
+    )
+    _add_removed_flag(rsr_resp, "--bc-root")
+    rsr_resp.add_argument(
+        "--work-id", required=True,
+        help="work_id of the request_scenario_register being responded to",
+    )
+    rsr_resp.add_argument(
+        "--entry", action="append", default=None,
+        help=(
+            "one register entry as a JSON object (repeatable). Each entry must "
+            "carry five fields: hash, title, text, file_location, status. The "
+            "collected entries form the response's register_entries list."
+        ),
+    )
+    rsr_resp.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace an existing same-message_type lead-inbox response for this "
+            "work_id (recovery path; lead-2id). Without --force the command "
+            "refuses on collision."
+        ),
+    )
+    rsr_resp.set_defaults(
+        func=_cmd_respond_request_scenario_register, _cwd_resolves=True
     )
 
     send = sub.add_parser("send", help="write a lead-to-BC message into a BC's inbox")
