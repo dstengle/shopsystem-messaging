@@ -12825,6 +12825,144 @@ def rsr_bare_hash_entry_rejected(context: dict) -> None:
         ScenarioRegisterEntry(hash="5b13b13d2205459b")
 
 
+# --- Behavior C: respond request_scenario_register -> requester reads back --
+#
+# The respond round-trip (work_id lead-d5oj, scenario 2c8501835cf1f5f8). Unlike
+# the bare-hash completion-journal respond, the register response carries a LIST
+# of per-entry records back over the wire: each entry exposes its block-only
+# canonical hash, the scenario's title and step text, its features/ file
+# location, and a live-or-retired status. The CLI carries each entry as one
+# repeatable --entry flag whose value is a JSON object of those five fields;
+# the deposited response is a request_scenario_register_response the requester
+# reads back out of its inbox.
+
+_RSR_RESP_ENTRIES = [
+    {
+        "hash": "5b13b13d2205459b",
+        "title": "A minimal valid request_scenario_register request",
+        "text": (
+            "Given the RequestScenarioRegister request schema\n"
+            "When I construct a minimal request\n"
+            "Then construction succeeds"
+        ),
+        "file_location": "features/request_scenario_register.feature",
+        "status": "live",
+    },
+    {
+        "hash": "9b12f88736c6964f",
+        "title": "A request_scenario_register response carries each entry",
+        "text": (
+            "Given the RequestScenarioRegister response schema\n"
+            "When I construct a response with two entries\n"
+            "Then construction succeeds"
+        ),
+        "file_location": "features/request_scenario_register.feature",
+        "status": "retired",
+    },
+]
+
+
+@given(
+    parsers.parse(
+        'an inbox holding an unprocessed request_scenario_register request '
+        'for work_id "{work_id}" naming target bounded context "{target_bc}"'
+    ),
+    target_fixture="bc_root",
+)
+def rsr_given_inbox_request(
+    tmp_path: Path, work_id: str, target_bc: str, context: dict
+) -> Path:
+    bc_root = tmp_path
+    (bc_root / "inbox").mkdir(exist_ok=True)
+    (bc_root / "outbox").mkdir(exist_ok=True)
+    payload = {
+        "message_type": "request_scenario_register",
+        "work_id": work_id,
+        "target_bc": target_bc,
+    }
+    insert_message(
+        _bc_address(bc_root), work_id, "inbox",
+        "request_scenario_register", payload,
+    )
+    context["rsr_request_work_id"] = work_id
+    context["rsr_request_target_bc"] = target_bc
+    return bc_root
+
+
+@when(
+    parsers.parse(
+        'shop-msg responds to request_scenario_register for work_id '
+        '"{work_id}" with two register entries, each carrying a block-only '
+        'canonical scenario hash, the scenario\'s title and step text, the '
+        "scenario's features/ file location, and a status of either live or "
+        'retired'
+    )
+)
+def rsr_respond(bc_root: Path, work_id: str, context: dict) -> None:
+    cmd = [
+        "shop-msg", "respond", "request_scenario_register",
+        "--bc", _get_or_register_bc_name(bc_root),
+        "--work-id", work_id,
+    ]
+    for entry in _RSR_RESP_ENTRIES:
+        cmd += ["--entry", json.dumps(entry)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+    context["rsr_sent_entries"] = _RSR_RESP_ENTRIES
+    assert result.returncode == 0, (
+        f"respond request_scenario_register failed: {result.stderr}"
+    )
+
+
+@then(
+    parsers.parse(
+        'the requester can read a request_scenario_register response for '
+        'work_id "{work_id}" whose register-entries field reproduces those two '
+        'entries, each carrying its block-only canonical hash together with its '
+        'scenario title and step text, its features/ file location, and its '
+        'live-or-retired status'
+    )
+)
+def rsr_requester_reads_response(work_id: str, context: dict) -> None:
+    lead_root = get_session_lead_root()
+    payload = _fetch_lead_inbox_payload(
+        lead_root, work_id, "request_scenario_register_response"
+    )
+    assert payload is not None, (
+        f"no request_scenario_register_response delivered to the requester "
+        f"for work_id {work_id!r}"
+    )
+    got = payload["register_entries"]
+    sent = context["rsr_sent_entries"]
+    assert len(got) == len(sent) == 2, (
+        f"expected 2 register entries, got {len(got)}: {got!r}"
+    )
+    for want, have in zip(sent, got):
+        for field in ("hash", "title", "text", "file_location", "status"):
+            assert have[field] == want[field], (
+                f"register entry field {field!r}: expected {want[field]!r}, "
+                f"got {have.get(field)!r}"
+            )
+    context["rsr_response_payload"] = payload
+
+
+@then(
+    "that response validates against the RequestScenarioRegister response "
+    "schema"
+)
+def rsr_response_validates(context: dict) -> None:
+    from catalog.schemas import RequestScenarioRegisterResponse
+    payload = context["rsr_response_payload"]
+    model = RequestScenarioRegisterResponse(**payload)
+    assert model.message_type == "request_scenario_register_response"
+    assert len(model.register_entries) == 2
+    for entry in model.register_entries:
+        assert entry.hash and entry.title and entry.text
+        assert entry.file_location and entry.status in ("live", "retired")
+
+
 # ===========================================================================
 # clarify_response — in-band answer that re-opens the original dispatch
 # (lead-ox8). Step definitions for features/clarify_response_in_band_answer.feature.
