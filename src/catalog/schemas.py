@@ -3,24 +3,35 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Delegate the canonical scenario-hash to the scenarios package. The
-# rule's true home is `scenarios.hash.compute_scenario_hash`; we re-
-# export it under the local name `_canonical_scenario_hash` because
-# (a) ScenarioPayload's validator below still calls it under that
-# name and (b) the cross-package agreement test in
-# tests/integration/test_catalog_scenarios_agreement.py imports it
-# from `catalog.schemas` and asserts it matches the `scenarios hash`
-# CLI output. Keeping the export name stable lets that test continue
-# to pin the catalog-side contract — what changes is that the
-# implementation is now imported rather than duplicated.
+# canonical rule is SCENARIO-BLOCK-ONLY (ADR-019 D1/D2, scenario 117):
+# exactly one canonical hash text per scenario block — the Scenario /
+# Scenario Outline keyword line through its steps / Examples, with NO
+# surrounding @-tag lines and NO `Feature:` header line. Its true home is
+# `scenarios.outstanding.parse_then_block_only_hash` (the SAME in-process
+# entry point the `scenarios hash` CLI delegates to since it was reconciled
+# to parse-then-block-only, ADR-056 D5). We re-export it under the local
+# name `_canonical_scenario_hash` because (a) ScenarioPayload's validator
+# below still calls it under that name and (b) the cross-package agreement
+# test in tests/integration/test_catalog_scenarios_agreement.py imports it
+# from `catalog.schemas` and asserts it matches the `scenarios hash` CLI
+# output. Keeping the export name stable lets that test continue to pin the
+# catalog-side contract — what changes is that the implementation is now
+# imported rather than duplicated.
 #
-# History: while messaging and scenarios shared a monorepo, this
-# function was an inline duplicate of the canonicalization rule (five
-# lines of normalization plus a sha256 truncation), to avoid catalog
-# importing from scenarios in the same prototype directory. Per
-# ADR-001, the BC-of-the-shopsystem layout puts the canonicalization
-# rule in the scenarios package and lets messaging depend on it
-# cleanly, so the duplicate is gone.
-from scenarios.hash import compute_scenario_hash as _canonical_scenario_hash
+# History: this re-export previously bound `scenarios.hash.compute_scenario_hash`,
+# which canonicalizes WHOLE-TEXT — it strips blank and `@scenario_hash:`
+# lines but RETAINS a standalone `@bc:`/`@origin:` tag line and any
+# `Feature:` line. That violated the block-only rule (ADR-019 D2) and
+# diverged from the block-only on-disk `@scenario_hash:` pins for any body
+# whose @bc/@origin/Feature sat on a separate line; it agreed with the old
+# whole-text CLI only by coincidence, masked because the agreement test's
+# sample bodies were pure scenario blocks (block-only == whole-text). Per
+# ADR-019 D2 / ADR-060 messaging must DELEGATE to the scenarios block-only
+# entry point, never re-enact canonicalization; this re-export is that
+# delegation.
+from scenarios.outstanding import (
+    parse_then_block_only_hash as _canonical_scenario_hash,
+)
 
 
 # Canonical work_id grammar, shared by EVERY message-type schema (lead-4wy).

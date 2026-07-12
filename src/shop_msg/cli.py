@@ -26,9 +26,9 @@ Subcommands:
                           --bc-tag NAME --scenario-file PATH ...
         Writes an AssignScenarios message to the Postgres messages table.
         Each --scenario-file becomes one ScenarioPayload. The hash for
-        each scenario is computed in-process via
-        scenarios.hash.compute_scenario_hash (the canonicalization rule
-        lives in the scenarios package, not here).
+        each scenario is computed in-process, SCENARIO-BLOCK-ONLY, via
+        scenarios.outstanding.parse_then_block_only_hash (the
+        canonicalization rule lives in the scenarios package, not here).
     send request_bugfix --bc-root PATH --work-id ID --description TEXT
                         [--feature-title TEXT --bc-tag NAME
                          --scenario-file PATH ...]
@@ -117,7 +117,9 @@ from catalog.schemas import (
     WorkDone,
     _nudge_payload_rejects_scenario_state,
 )
-from scenarios.hash import compute_scenario_hash as _canonical_scenario_hash
+from scenarios.outstanding import (
+    parse_then_block_only_hash as _canonical_scenario_hash,
+)
 from shop_msg import bd_facade
 from shop_msg.storage import (
     CollisionError,
@@ -480,16 +482,21 @@ def _resolve_registered_lead() -> str | None:
 
 
 def _compute_scenario_hash(gherkin_body: str) -> str:
-    """Canonicalize and hash a scenario body in-process.
+    """Canonicalize (SCENARIO-BLOCK-ONLY) and hash a scenario body in-process.
 
-    Delegates to ``scenarios.hash.compute_scenario_hash`` directly rather
-    than shelling out to the ``scenarios`` binary. The canonicalization
+    Delegates to ``scenarios.outstanding.parse_then_block_only_hash``
+    directly rather than shelling out to the ``scenarios`` binary — the
+    SAME in-process entry point the ``scenarios hash`` CLI uses since it was
+    reconciled to parse-then-block-only (ADR-056 D5). The canonicalization
     rule belongs to the scenarios package, which this distribution already
     Requires; importing it in-process makes the CLI's computed hash and the
     catalog ``ScenarioPayload`` validator (which delegates to the same
-    function) agree by construction, and removes the PATH dependency that
-    a ``subprocess.run(["scenarios", "hash"])`` shell-out carried (ADR-019,
-    defect lead-pw41(b)).
+    function) agree by construction, removes the PATH dependency that a
+    ``subprocess.run(["scenarios", "hash"])`` shell-out carried, and — per
+    ADR-019 D2 / ADR-060 — canonicalizes block-only (never a
+    ``Feature:``-line- or surrounding-@-tag-wrapped string), matching the
+    block-only ``@scenario_hash:`` pins on disk (ADR-019, defect
+    lead-pw41(b)).
     """
     return _canonical_scenario_hash(gherkin_body)
 
@@ -1314,9 +1321,9 @@ def _build_scenario_payload(
     the scenario block alone — its tags, the Scenario/Scenario Outline
     keyword line, steps, and any Examples — with NO `Feature:` header
     line. The earlier shape wrapped the body in `Feature: {title}\\n...`
-    before hashing; because the canonicalization rule
-    (`scenarios.hash.compute_scenario_hash`) drops blank lines and
-    `@scenario_hash:` lines but does NOT drop the `Feature:` line, that
+    before hashing; because the earlier whole-text canonicalization rule
+    (`scenarios.hash.compute_scenario_hash`) dropped blank lines and
+    `@scenario_hash:` lines but did NOT drop the `Feature:` line, that
     line survived into the canonical hash text and made the dispatched
     `scenarios[].hash` diverge from the scenario-block-only
     `@scenario_hash:` tag written on disk for the same block (defect

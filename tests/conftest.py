@@ -11644,18 +11644,50 @@ def then_pw41_no_scenarios_subprocess() -> None:
 
 
 @then(
-    "the shop_msg cli module imports compute_scenario_hash from scenarios.hash"
+    "the shop_msg cli module imports parse_then_block_only_hash from "
+    "scenarios.outstanding"
 )
 def then_pw41_imports_in_process() -> None:
     from shop_msg import cli as _cli
 
-    # The in-process delegate must be the one used by _compute_scenario_hash.
-    from scenarios.hash import compute_scenario_hash as canonical
+    # The block-only canonicalizer the migration binds (ADR-060): the SAME
+    # in-process entry point the `scenarios hash` CLI delegates to.
+    from scenarios.outstanding import parse_then_block_only_hash as canonical
 
-    body = "@bc:shop-msg\nScenario: probe\n    Given a\n    When b\n    Then c\n"
-    assert _cli._compute_scenario_hash(body) == canonical(body), (
-        "shop_msg.cli._compute_scenario_hash does not delegate to "
-        "scenarios.hash.compute_scenario_hash in-process"
+    # 1. IMPORT identity: the cli's canonicalizer binding IS
+    #    scenarios.outstanding.parse_then_block_only_hash — not the legacy
+    #    scenarios.hash.compute_scenario_hash it previously bound.
+    assert _cli._canonical_scenario_hash is canonical, (
+        "shop_msg.cli._canonical_scenario_hash is not "
+        "scenarios.outstanding.parse_then_block_only_hash — the migration "
+        "did not rebind the in-process canonicalizer"
+    )
+
+    # 2. GENUINE USE on a DIVERGENT tag/Feature-wrapped body: block-only and
+    #    the legacy whole-text canonicalization DISAGREE here, so matching the
+    #    block-only value (and NOT the legacy one) proves the cli's
+    #    _compute_scenario_hash actually USES parse_then_block_only_hash as its
+    #    canonicalizer — importing-but-not-using would fail this.
+    from scenarios.hash import compute_scenario_hash as _legacy
+
+    body = (
+        "@bc:shop-msg @origin:probe\n"
+        "Feature: wrapper\n"
+        "\n"
+        "  Scenario: probe\n"
+        "    Given a\n"
+        "    When b\n"
+        "    Then c\n"
+    )
+    block_only = canonical(body)
+    assert _legacy(body) != block_only, (
+        "test precondition: chosen body must DIVERGE between block-only and "
+        "legacy whole-text canonicalization to prove genuine use"
+    )
+    assert _cli._compute_scenario_hash(body) == block_only, (
+        "shop_msg.cli._compute_scenario_hash does not USE "
+        "scenarios.outstanding.parse_then_block_only_hash (block-only) as its "
+        "canonicalizer — it retained the legacy whole-text behavior"
     )
 
 
