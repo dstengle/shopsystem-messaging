@@ -13,7 +13,7 @@ dependencies = [
     "pydantic>=2",
     "pyyaml",
     "psycopg[binary]>=3.0",
-    "scenarios @ git+https://github.com/dstengle/shopsystem-scenarios@v0.2.0",
+    "scenarios @ git+https://github.com/dstengle/shopsystem-scenarios@v0.3.1",
 ]
 
 [project.optional-dependencies]
