@@ -14656,3 +14656,50 @@ def rsr_no_narrowing_denotes_full_register(
     assert payload.get("narrowing") in (None, {}), (
         f"expected no narrowing in the raw payload; got {payload.get('narrowing')!r}"
     )
+
+
+# ============================================================================
+# NEW STEPS for testing pending inbox masking fix (lead-br6q)
+# ============================================================================
+
+@given(
+    parsers.parse(
+        'there is a fresh inbox message with work-id "{work_id}" for {mtype}'
+    )
+)
+def given_fresh_inbox_message(bc_root: Path, work_id: str, mtype: str) -> None:
+    """Directly write an inbox message via shop-msg CLI."""
+    _shop_msg_send_inbox(bc_root, mtype, work_id)
+
+
+@given(
+    parsers.parse(
+        'there is a stale consumed outbox response with the same work-id "{work_id}"'
+    )
+)
+def given_stale_consumed_outbox(bc_root: Path, work_id: str) -> None:
+    """
+    Create a consumed (stale) outbox response for this work_id.
+    This tests the bug: pending inbox should NOT be masked by consumed outbox rows.
+    """
+    import json
+    import psycopg
+    from shop_msg.storage import _bc_id, _get_dsn
+    
+    bc = _bc_id(str(bc_root))
+    dsn = _get_dsn()
+    
+    payload_json = json.dumps({"status": "blocked", "summary": "stale test response"})
+    
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            # Insert an outbox row with consumed=TRUE
+            cur.execute(
+                """
+                INSERT INTO messages 
+                  (bc, work_id, direction, message_type, payload, consumed)
+                VALUES (%s, %s, %s, %s, %s::jsonb, TRUE)
+                """,
+                (bc, work_id, "outbox", "work_done", payload_json),
+            )
+        conn.commit()

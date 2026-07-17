@@ -767,6 +767,7 @@ def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
                       WHERE o.bc = i.bc
                         AND o.work_id = i.work_id
                         AND o.direction = 'outbox'
+                        AND o.consumed = FALSE
                     )
                     OR (
                       i.message_type = 'clarify_response'
@@ -775,6 +776,7 @@ def query_pending_inbox(bc_root: str) -> list[tuple[str, str]]:
                         WHERE o2.bc = i.bc
                           AND o2.work_id = i.work_id
                           AND o2.direction = 'outbox'
+                          AND o2.consumed = FALSE
                       )
                     )
                   )

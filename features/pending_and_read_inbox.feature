@@ -61,3 +61,12 @@ Feature: shop-msg CLI surface — pending enumeration and inbox read
     When I run shop-msg read inbox with work-id "lead-499"
     Then the command exits non-zero
     And stderr explains schema validation failed
+
+  @scenario_hash:063b6d526646cad9
+  Scenario: A fresh inbox message is pending even if the work_id previously had a stale consumed outbox response
+    Given an empty BC at a temporary path
+    And there is a fresh inbox message with work-id "lead-stale-reopened" for request_bugfix
+    And there is a stale consumed outbox response with the same work-id "lead-stale-reopened"
+    When I run the shop-msg subcommand that enumerates pending unprocessed inbox messages, with no filter
+    Then the command exits zero
+    And stdout includes an entry for work_id "lead-stale-reopened" with message_type "request_bugfix"
