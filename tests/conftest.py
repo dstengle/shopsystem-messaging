@@ -14846,3 +14846,46 @@ def then_xp2nc_error_names_missing(context: dict) -> None:
         f"expected the rejection to flag the missing inline @scenario_hash tag; "
         f"stderr:\n{stderr}"
     )
+
+
+@given(
+    'a ScenarioPayload envelope "hash" field whose value differs from that '
+    'inline "<hex>"'
+)
+def given_xp2nc_envelope_differs_from_inline(tmp_path: Path, context: dict) -> None:
+    # Envelope stays the block-only canonical hash (so the schema-level
+    # hash-matches-body invariant still constructs the payload), while the
+    # inline tag carries a DIFFERENT hex — the case the block-only invariant
+    # is blind to because it strips the tag line before hashing.
+    canonical = context["xp2nc_canonical_hash"]
+    inline = "0000000000000000"
+    assert inline != canonical, (
+        f"chosen inline hex {inline!r} collided with the canonical hash; "
+        "pick another"
+    )
+    gherkin = f"@scenario_hash:{inline} @bc:demo\n{context['xp2nc_body']}"
+    context["xp2nc_gherkin"] = gherkin
+    context["xp2nc_tags"] = [f"@scenario_hash:{inline}", "@bc:demo"]
+    context["xp2nc_inline_hex_used"] = inline
+    context["xp2nc_envelope_hash"] = canonical
+    _xp2nc_write_payload(tmp_path, context)
+
+
+@then(
+    'the rejection error names the scenario and reports both the inline-tag '
+    '"<hex>" value and the disagreeing envelope "hash" value'
+)
+def then_xp2nc_error_reports_both_hexes(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "Sample widget behavior" in stderr, (
+        f"expected the rejection to name the offending scenario by title; "
+        f"stderr:\n{stderr}"
+    )
+    assert context["xp2nc_inline_hex_used"] in stderr, (
+        f"expected the rejection to report the inline-tag hex "
+        f"{context['xp2nc_inline_hex_used']!r}; stderr:\n{stderr}"
+    )
+    assert context["xp2nc_envelope_hash"] in stderr, (
+        f"expected the rejection to report the disagreeing envelope hash "
+        f"{context['xp2nc_envelope_hash']!r}; stderr:\n{stderr}"
+    )

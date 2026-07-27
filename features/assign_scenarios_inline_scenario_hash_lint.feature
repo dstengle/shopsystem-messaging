@@ -24,3 +24,11 @@ Feature: assign_scenarios pre-send inline @scenario_hash lint over ScenarioPaylo
     When the assign_scenarios ScenarioPayload for that scenario is validated before send
     Then validation rejects the payload and no AssignScenarios message is written to the BC inbox
     And the rejection error names the scenario whose gherkin block is missing its inline "@scenario_hash" tag
+
+  @scenario_hash:c51c32eea3d60066 @bc:shopsystem-messaging
+  Scenario: assign_scenarios ScenarioPayload validation rejects a scenario whose inline @scenario_hash tag does not match the envelope hash, naming that scenario
+    Given a scenario gherkin block whose text carries an inline "@scenario_hash:<hex>" tag line directly above its "Scenario:" line
+    And a ScenarioPayload envelope "hash" field whose value differs from that inline "<hex>"
+    When the assign_scenarios ScenarioPayload for that scenario is validated before send
+    Then validation rejects the payload and no AssignScenarios message is written to the BC inbox
+    And the rejection error names the scenario and reports both the inline-tag "<hex>" value and the disagreeing envelope "hash" value
