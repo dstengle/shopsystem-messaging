@@ -14656,3 +14656,193 @@ def rsr_no_narrowing_denotes_full_register(
     assert payload.get("narrowing") in (None, {}), (
         f"expected no narrowing in the raw payload; got {payload.get('narrowing')!r}"
     )
+
+
+# =====================================================================
+# lead-xp2nc: assign_scenarios pre-send inline @scenario_hash lint over
+# ScenarioPayload. The lint additively requires each dispatched
+# ScenarioPayload's gherkin to carry an inline @scenario_hash:<hex> tag
+# whose hex equals the envelope hash — a gap the block-only
+# hash-matches-body invariant cannot see, because canonicalization strips
+# the @scenario_hash: tag line before hashing.
+# =====================================================================
+
+_XP2NC_SAMPLE_BODY = (
+    "  Scenario: Sample widget behavior\n"
+    "    Given a widget\n"
+    "    When I poke it\n"
+    "    Then it wobbles"
+)
+
+
+def _xp2nc_bc_root(tmp_path: Path) -> Path:
+    root = tmp_path / "bc"
+    (root / "inbox").mkdir(parents=True, exist_ok=True)
+    (root / "outbox").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _xp2nc_write_payload(tmp_path: Path, context: dict) -> None:
+    """Materialize the --payload YAML from the gherkin + envelope hash the
+    Given steps assembled in context. One ScenarioPayload, exercising the
+    assign_scenarios --payload send path end-to-end."""
+    payload = {
+        "scenarios": [
+            {
+                "hash": context["xp2nc_envelope_hash"],
+                "tags": context.get("xp2nc_tags", []),
+                "gherkin": context["xp2nc_gherkin"],
+            }
+        ],
+    }
+    p = tmp_path / "xp2nc_assign_payload.yaml"
+    p.write_text(yaml.safe_dump(payload, sort_keys=False))
+    context["xp2nc_payload_file"] = p
+
+
+@given(
+    'a scenario gherkin block whose text carries an inline '
+    '"@scenario_hash:<hex>" tag line directly above its "Scenario:" line'
+)
+def given_xp2nc_gherkin_with_inline_tag(context: dict) -> None:
+    body = _XP2NC_SAMPLE_BODY
+    # Canonicalization strips the tag line, so the block-only hash equals
+    # the hash of the tag-free body regardless of the inline hex.
+    canonical = _scenario_hash_via_cli("@bc:demo\n" + body)
+    context["xp2nc_body"] = body
+    context["xp2nc_canonical_hash"] = canonical
+    context["xp2nc_has_inline"] = True
+
+
+@given(
+    'a scenario gherkin block whose text contains no "@scenario_hash:" tag line'
+)
+def given_xp2nc_gherkin_without_inline_tag(context: dict) -> None:
+    body = _XP2NC_SAMPLE_BODY
+    canonical = _scenario_hash_via_cli("@bc:demo\n" + body)
+    context["xp2nc_body"] = body
+    context["xp2nc_canonical_hash"] = canonical
+    context["xp2nc_has_inline"] = False
+
+
+@given(
+    'a ScenarioPayload envelope "hash" field whose value equals that inline "<hex>"'
+)
+def given_xp2nc_envelope_equals_inline(tmp_path: Path, context: dict) -> None:
+    inline = context["xp2nc_canonical_hash"]
+    gherkin = f"@scenario_hash:{inline} @bc:demo\n{context['xp2nc_body']}"
+    context["xp2nc_gherkin"] = gherkin
+    context["xp2nc_tags"] = [f"@scenario_hash:{inline}", "@bc:demo"]
+    context["xp2nc_envelope_hash"] = inline
+    _xp2nc_write_payload(tmp_path, context)
+
+
+@given(
+    'a ScenarioPayload envelope "hash" field equal to the scenario-block-only '
+    "canonical hash of that gherkin, so the strip-then-hash invariant alone "
+    "would accept the block"
+)
+def given_xp2nc_envelope_canonical_no_inline(tmp_path: Path, context: dict) -> None:
+    gherkin = f"@bc:demo\n{context['xp2nc_body']}"
+    canonical = _scenario_hash_via_cli(gherkin)
+    context["xp2nc_gherkin"] = gherkin
+    context["xp2nc_tags"] = ["@bc:demo"]
+    context["xp2nc_envelope_hash"] = canonical
+    _xp2nc_write_payload(tmp_path, context)
+
+
+@when(
+    "the assign_scenarios ScenarioPayload for that scenario is validated before send"
+)
+def when_xp2nc_send_assign_scenarios(tmp_path: Path, context: dict) -> None:
+    bc_root = _xp2nc_bc_root(tmp_path)
+    context["xp2nc_bc_root"] = bc_root
+    work_id = "lead-xp2nc-inl"
+    context["xp2nc_work_id"] = work_id
+    cmd = [
+        "shop-msg",
+        "send",
+        "assign_scenarios",
+        "--bc",
+        _get_or_register_bc_name(bc_root),
+        "--work-id",
+        work_id,
+        "--payload",
+        str(context["xp2nc_payload_file"]),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    context["cli_returncode"] = result.returncode
+    context["cli_stdout"] = result.stdout
+    context["cli_stderr"] = result.stderr
+
+
+@then("validation accepts the payload")
+def then_xp2nc_accepts(context: dict) -> None:
+    rc = context.get("cli_returncode")
+    assert rc == 0, (
+        f"expected the assign_scenarios send to succeed (rc 0); got rc={rc}; "
+        f"stderr:\n{context.get('cli_stderr', '')}"
+    )
+
+
+@then(
+    "the scenario is carried into the dispatched AssignScenarios message unchanged"
+)
+def then_xp2nc_carried_unchanged(context: dict) -> None:
+    bc_root = context["xp2nc_bc_root"]
+    rows = [
+        r
+        for r in _fetch_inbox_rows(bc_root)
+        if r["work_id"] == context["xp2nc_work_id"]
+    ]
+    assert rows, "expected an assign_scenarios inbox row for the accepted payload"
+    payload = rows[-1]["payload"]
+    msg = AssignScenarios(**payload)
+    assert len(msg.scenarios) == 1, (
+        f"expected exactly one carried scenario; got {len(msg.scenarios)}"
+    )
+    assert msg.scenarios[0].gherkin == context["xp2nc_gherkin"], (
+        "dispatched gherkin differs from the submitted block:\n"
+        f"submitted:\n{context['xp2nc_gherkin']!r}\n"
+        f"dispatched:\n{msg.scenarios[0].gherkin!r}"
+    )
+    assert msg.scenarios[0].hash == context["xp2nc_envelope_hash"], (
+        "dispatched envelope hash differs from the submitted hash"
+    )
+
+
+@then(
+    "validation rejects the payload and no AssignScenarios message is written "
+    "to the BC inbox"
+)
+def then_xp2nc_rejects_no_inbox(context: dict) -> None:
+    rc = context.get("cli_returncode")
+    assert rc != 0, (
+        f"expected the assign_scenarios send to be rejected (non-zero rc); got "
+        f"rc={rc}; stdout:\n{context.get('cli_stdout', '')}"
+    )
+    bc_root = context["xp2nc_bc_root"]
+    rows = [
+        r
+        for r in _fetch_inbox_rows(bc_root)
+        if r["work_id"] == context.get("xp2nc_work_id")
+    ]
+    assert not rows, (
+        f"expected NO assign_scenarios inbox row after rejection; got {len(rows)}"
+    )
+
+
+@then(
+    'the rejection error names the scenario whose gherkin block is missing its '
+    'inline "@scenario_hash" tag'
+)
+def then_xp2nc_error_names_missing(context: dict) -> None:
+    stderr = context.get("cli_stderr", "")
+    assert "Sample widget behavior" in stderr, (
+        f"expected the rejection to name the offending scenario by title; "
+        f"stderr:\n{stderr}"
+    )
+    assert "@scenario_hash" in stderr and "missing" in stderr.lower(), (
+        f"expected the rejection to flag the missing inline @scenario_hash tag; "
+        f"stderr:\n{stderr}"
+    )
