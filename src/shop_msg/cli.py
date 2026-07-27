@@ -1381,6 +1381,13 @@ def _lint_assign_scenarios_inline_hash(scenarios: list[dict]) -> None:
                 "gherkin block must carry an inline '@scenario_hash:<hex>' tag "
                 "matching the envelope hash."
             )
+        envelope = scen.get("hash", "") if isinstance(scen, dict) else ""
+        if inline != envelope:
+            raise _AssignScenarioLintError(
+                f"scenario {title!r} inline '@scenario_hash:' tag disagrees "
+                f"with the envelope hash: inline-tag={inline!r} but envelope "
+                f"hash={envelope!r}."
+            )
 
 
 def _build_scenario_payload(
