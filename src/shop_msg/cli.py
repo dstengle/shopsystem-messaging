@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import typing
@@ -1309,6 +1310,86 @@ def _cmd_send_request_scenario_register(args: argparse.Namespace) -> int:
     )
 
 
+class _AssignScenarioLintError(ValueError):
+    """Raised by the assign_scenarios pre-send inline-@scenario_hash lint
+    (lead-xp2nc) when a ScenarioPayload's gherkin lacks an inline
+    @scenario_hash tag or its inline tag disagrees with the envelope hash.
+    The send command catches this and returns a non-zero exit BEFORE any
+    inbox write, so a rejected payload leaves no AssignScenarios on the wire.
+    """
+
+
+# An "@scenario_hash:<hex>" token where <hex> is one or more non-space
+# characters. Anchored (^...$) because it is applied to whitespace-split
+# tokens of a single line, mirroring _gherkin_has_bc_tag_line in
+# catalog.schemas — an @scenario_hash: substring buried inside a quoted
+# step phrase is NOT the tag line and must not be mistaken for one.
+_INLINE_SCENARIO_HASH_TOKEN_RE = re.compile(r"^@scenario_hash:(\S+)$")
+
+
+def _inline_scenario_hash(gherkin: str) -> str | None:
+    """Return the hex from an inline ``@scenario_hash:<hex>`` tag token in
+    ``gherkin``, or None when no such tag line is present. A "token" is what
+    ``str.split()`` yields on a line — a whitespace-bounded run — so a
+    quoted ``"@scenario_hash:<hex>"`` inside a step phrase does not count.
+    """
+    for line in gherkin.splitlines():
+        for token in line.split():
+            m = _INLINE_SCENARIO_HASH_TOKEN_RE.match(token)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _scenario_block_title(gherkin: str) -> str:
+    """Return the title text following the first ``Scenario:`` /
+    ``Scenario Outline:`` keyword line, used to NAME the offending scenario
+    in a lint error. Falls back to a placeholder when no keyword line exists.
+    """
+    for line in gherkin.splitlines():
+        stripped = line.strip()
+        for kw in ("Scenario Outline:", "Scenario:"):
+            if stripped.startswith(kw):
+                return stripped[len(kw):].strip() or "<unnamed scenario>"
+    return "<unnamed scenario>"
+
+
+def _lint_assign_scenarios_inline_hash(scenarios: list[dict]) -> None:
+    """Pre-send lint (lead-xp2nc): every assign_scenarios ScenarioPayload's
+    gherkin block MUST carry an inline ``@scenario_hash:<hex>`` tag whose hex
+    equals the envelope ``hash``.
+
+    This is ADDITIVE over the schema-level hash-matches-body invariant. That
+    invariant canonicalizes SCENARIO-BLOCK-ONLY, which strips the
+    ``@scenario_hash:`` tag line before hashing — so it cannot see a MISSING
+    inline tag (a tag-less block whose envelope equals the block-only hash
+    passes it) nor a DISAGREEING inline tag (the tag line is stripped, so its
+    hex never enters the canonical text). This lint closes both gaps.
+
+    Raises :class:`_AssignScenarioLintError` naming the offending scenario.
+    Callers run it BEFORE any inbox write, so a rejected payload writes no
+    AssignScenarios message.
+    """
+    for scen in scenarios:
+        gherkin = scen.get("gherkin", "") if isinstance(scen, dict) else ""
+        title = _scenario_block_title(gherkin)
+        inline = _inline_scenario_hash(gherkin)
+        if inline is None:
+            raise _AssignScenarioLintError(
+                f"scenario {title!r} is missing its inline '@scenario_hash:' "
+                "tag line; every dispatched assign_scenarios scenario's "
+                "gherkin block must carry an inline '@scenario_hash:<hex>' tag "
+                "matching the envelope hash."
+            )
+        envelope = scen.get("hash", "") if isinstance(scen, dict) else ""
+        if inline != envelope:
+            raise _AssignScenarioLintError(
+                f"scenario {title!r} inline '@scenario_hash:' tag disagrees "
+                f"with the envelope hash: inline-tag={inline!r} but envelope "
+                f"hash={envelope!r}."
+            )
+
+
 def _build_scenario_payload(
     path_str: str, feature_title: str, bc_tag: str
 ) -> ScenarioPayload:
@@ -1429,6 +1510,14 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
 
     if getattr(args, "payload", None):
         payload = _load_payload_file(args.payload, "assign_scenarios", args.work_id)
+        try:
+            _lint_assign_scenarios_inline_hash(payload.get("scenarios") or [])
+        except _AssignScenarioLintError as exc:
+            print(
+                f"shop-msg send assign_scenarios: {exc}",
+                file=sys.stderr,
+            )
+            return 2
         return _bd_first_send(
             command="assign_scenarios",
             bc_root=bc_root,
@@ -1456,6 +1545,17 @@ def _cmd_send_assign_scenarios(args: argparse.Namespace) -> int:
         _build_scenario_payload(path_str, args.feature_title, args.bc_tag)
         for path_str in scenario_files
     ]
+
+    try:
+        _lint_assign_scenarios_inline_hash(
+            [s.model_dump() for s in scenarios_payload]
+        )
+    except _AssignScenarioLintError as exc:
+        print(
+            f"shop-msg send assign_scenarios: {exc}",
+            file=sys.stderr,
+        )
+        return 2
 
     message = AssignScenarios(
         message_type="assign_scenarios",
